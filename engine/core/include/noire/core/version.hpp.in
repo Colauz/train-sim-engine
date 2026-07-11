@@ -1,0 +1,14 @@
+#pragma once
+
+// Fichier généré par CMake (configure_file) — ne pas éditer à la main.
+#include <cstdint>
+#include <string_view>
+
+namespace noire::version {
+
+inline constexpr std::uint32_t major = @PROJECT_VERSION_MAJOR@;
+inline constexpr std::uint32_t minor = @PROJECT_VERSION_MINOR@;
+inline constexpr std::uint32_t patch = @PROJECT_VERSION_PATCH@;
+inline constexpr std::string_view string = "@PROJECT_VERSION@";
+
+}  // namespace noire::version

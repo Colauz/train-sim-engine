@@ -1,0 +1,35 @@
+# Répertoires de build
+/build/
+/out/
+/cmake-build-*/
+
+# Artefacts de compilation
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.pdb
+
+# CMake (au cas où quelqu'un configure hors de build/)
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+compile_commands.json
+_deps/
+
+# IDE / éditeurs
+/.vs/
+/.vscode/
+/.idea/
+*.user
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
