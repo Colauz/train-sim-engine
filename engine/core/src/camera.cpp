@@ -33,6 +33,17 @@ void Camera::add_yaw_pitch(float delta_yaw, float delta_pitch) {
     pitch_ = glm::clamp(pitch_ + delta_pitch, -limit, limit);
 }
 
+void Camera::look_at(const WorldPosition& target) {
+    const glm::vec3 dir = glm::vec3(target - position_);
+    const float len = glm::length(dir);
+    if (len < 1e-6f) {
+        return;
+    }
+    const glm::vec3 d = dir / len;
+    pitch_ = std::asin(glm::clamp(d.y, -0.9999f, 0.9999f));
+    yaw_ = std::atan2(d.z, d.x);
+}
+
 glm::mat4 Camera::view_matrix() const {
     // Eye à l'origine : on ne conserve QUE l'orientation. Toute la translation est
     // reportée dans les matrices Model relatives (origine flottante).

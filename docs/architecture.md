@@ -70,5 +70,8 @@ descendante : le moteur ne connaît pas le jeu.
   distance d'arc, LUT arc-longueur), génération procédurale des rails (`scene`, sommets
   relatifs à l'origine de voie, calculée une seule fois), `Bogie` cinématique (`physics`)
   aligné sur la tangente, avancé dans `fixed_update`. Courbe en S de ~500 m.
-- **M4 — Streaming** : chargement/déchargement tuilé sur longue distance.
-- **M5 — Réalisme** : adhérence dynamique, météo, audio Doppler.
+- **M4 — Physique multi-corps** *(fait)* : `Wagon` (2 bogies + caisse), dynamique
+  `F = m·a`, gravité projetée sur la pente, adhérence acier/acier (patinage si effort
+  > μ·N), suspension 1D ressort/amortisseur (pilonnement + tangage). Bogie devenu passif.
+- **M5 — Streaming** : chargement/déchargement tuilé sur longue distance.
+- **M6 — Réalisme** : adhérence dynamique avancée (pluie/feuilles), météo, audio Doppler.

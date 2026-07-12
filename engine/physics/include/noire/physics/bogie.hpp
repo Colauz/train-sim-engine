@@ -5,31 +5,24 @@
 
 namespace noire::physics {
 
-// Bogie CINÉMATIQUE (M3) : contraint sur une voie (Spline), il avance à vitesse
-// constante et s'oriente sur la tangente de la courbe. C'est la base de la future
-// dynamique ferroviaire (efforts d'attelage, adhérence, suspensions — M+).
-//
-// Position en double (origine flottante) ; matrice d'orientation en float.
+// Bogie : point de contact contraint sur la voie. Depuis le M4 il est PASSIF :
+// le Wagon lui impose une abscisse curviligne et il en déduit sa position (double)
+// et son orientation (alignée sur la tangente). Toute la dynamique (forces, masse,
+// adhérence) est portée par le Wagon.
 class Bogie {
 public:
-    void attach(const Spline* track) { track_ = track; }
-    void set_distance(double s) { distance_ = s; }
-    void set_speed(double meters_per_second) { speed_ = meters_per_second; }
-
-    // Appelé dans la boucle fixed_update (pas de temps déterministe).
-    void update(double dt);
+    // Place le bogie à l'abscisse `distance` le long de la voie.
+    void follow(const Spline& track, double distance);
 
     [[nodiscard]] const WorldPosition& position() const { return position_; }
+    [[nodiscard]] const glm::dvec3& tangent() const { return tangent_; }
     [[nodiscard]] const glm::mat4& orientation() const { return orientation_; }
     [[nodiscard]] double distance() const { return distance_; }
-    [[nodiscard]] double speed() const { return speed_; }
 
 private:
-    const Spline* track_ = nullptr;  // non-possédant
-    double distance_ = 0.0;          // abscisse curviligne le long de la voie (m)
-    double speed_ = 0.0;             // m/s (signe = sens de marche)
-
+    double distance_ = 0.0;
     WorldPosition position_{0.0, 0.0, 0.0};
+    glm::dvec3 tangent_{0.0, 0.0, 1.0};
     glm::mat4 orientation_{1.0f};
 };
 

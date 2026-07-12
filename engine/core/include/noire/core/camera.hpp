@@ -22,6 +22,8 @@ public:
         yaw_ = yaw;
         pitch_ = pitch;
     }
+    // Oriente la caméra pour viser un point monde (utile pour une caméra qui suit).
+    void look_at(const WorldPosition& target);
     [[nodiscard]] const WorldPosition& position() const { return position_; }
     [[nodiscard]] glm::vec3 forward() const;
     [[nodiscard]] glm::vec3 right() const;

@@ -1,5 +1,6 @@
 #include "noire/app/application.hpp"
 
+#include <cmath>
 #include <utility>
 #include <vector>
 
@@ -8,7 +9,7 @@
 #include "noire/core/log.hpp"
 #include "noire/core/math.hpp"
 #include "noire/core/spline.hpp"
-#include "noire/physics/bogie.hpp"
+#include "noire/physics/wagon.hpp"
 #include "noire/platform/window.hpp"
 #include "noire/render/renderer.hpp"
 #include "noire/render/vertex.hpp"
@@ -18,11 +19,9 @@ namespace noire {
 
 namespace {
 
-// Origine de la voie, volontairement à ~1000 km de l'origine absolue : démontre
-// que l'origine flottante tient (mesh rails et bogie restent nets, sans jittering).
+// Origine de la voie à ~1000 km : l'origine flottante reste indispensable.
 constexpr WorldPosition kTrackOrigin{1000000.0, 0.0, 1000000.0};
 
-// Cube unité (±0.5) coloré uniformément, avec un léger ombrage par face pour la 3D.
 std::vector<render::Vertex> make_box_vertices(const glm::vec3& base_color) {
     const glm::vec3 c[8] = {
         {-0.5f, -0.5f, -0.5f}, {0.5f, -0.5f, -0.5f}, {0.5f, 0.5f, -0.5f}, {-0.5f, 0.5f, -0.5f},
@@ -48,11 +47,10 @@ std::vector<render::Vertex> make_box_vertices(const glm::vec3& base_color) {
     return vertices;
 }
 
-// Grille au sol (y = 0) en lignes ; axes X (rouge) et Z (bleu) mis en valeur.
 std::vector<render::Vertex> make_grid_vertices(int half_lines, float step) {
-    const glm::vec3 gray{0.22f, 0.22f, 0.25f};
-    const glm::vec3 axis_x{0.55f, 0.20f, 0.20f};
-    const glm::vec3 axis_z{0.20f, 0.35f, 0.60f};
+    const glm::vec3 gray{0.20f, 0.20f, 0.23f};
+    const glm::vec3 axis_x{0.50f, 0.20f, 0.20f};
+    const glm::vec3 axis_z{0.20f, 0.32f, 0.55f};
     const float extent = static_cast<float>(half_lines) * step;
 
     std::vector<render::Vertex> vertices;
@@ -82,13 +80,21 @@ struct Application::Impl {
     Engine engine;
     Camera camera;
 
-    Spline track;              // la voie ferrée (double)
-    physics::Bogie bogie;      // le bogie cinématique contraint dessus
+    Spline track;
+    physics::Wagon wagon;
 
     render::MeshId grid_mesh = 0;
     render::MeshId rails_mesh = 0;
-    render::MeshId bogie_mesh = 0;
+    render::MeshId bogie_mesh = 0;  // cube rouge
+    render::MeshId body_mesh = 0;   // caisse (parallélépipède)
     WorldPosition grid_center{kTrackOrigin};
+
+    // Caméra orbitale autour du wagon.
+    float orbit_yaw = 3.14159f;
+    float orbit_pitch = 0.32f;
+    float orbit_distance = 38.0f;
+
+    std::uint64_t telemetry_ticks = 0;
 
     bool initialize() {
         if (!window.initialize()) {
@@ -110,72 +116,72 @@ struct Application::Impl {
             return false;
         }
 
-        // --- La voie : une courbe en S d'environ 500 m (points de contrôle en double) ---
+        // --- Voie en S avec dénivelé (une vallée) : la gravité pourra agir ---
         track.set_control_points({
             kTrackOrigin + WorldPosition{0.0, 0.0, 0.0},
-            kTrackOrigin + WorldPosition{100.0, 0.0, 0.0},
-            kTrackOrigin + WorldPosition{200.0, 0.0, 35.0},
-            kTrackOrigin + WorldPosition{300.0, 0.0, -35.0},
-            kTrackOrigin + WorldPosition{400.0, 0.0, 0.0},
+            kTrackOrigin + WorldPosition{100.0, -4.0, 0.0},
+            kTrackOrigin + WorldPosition{200.0, -9.0, 35.0},
+            kTrackOrigin + WorldPosition{300.0, -9.0, -35.0},
+            kTrackOrigin + WorldPosition{400.0, -4.0, 0.0},
             kTrackOrigin + WorldPosition{500.0, 0.0, 0.0},
         });
         log::info("Voie générée : longueur ~{:.1f} m", track.length());
 
-        // --- Maillages créés UNE SEULE FOIS (jamais recalculés par frame) ---
+        // --- Maillages générés UNE SEULE FOIS ---
         rails_mesh = renderer.create_mesh(scene::generate_rail_mesh(track, kTrackOrigin, {}),
                                           render::Topology::Triangles);
-        grid_mesh = renderer.create_mesh(make_grid_vertices(60, 5.0f), render::Topology::Lines);
+        grid_mesh = renderer.create_mesh(make_grid_vertices(70, 5.0f), render::Topology::Lines);
         bogie_mesh = renderer.create_mesh(make_box_vertices(glm::vec3(0.85f, 0.15f, 0.15f)),
                                           render::Topology::Triangles);
-        grid_center = kTrackOrigin + WorldPosition{250.0, 0.0, 0.0};
+        body_mesh = renderer.create_mesh(make_box_vertices(glm::vec3(0.20f, 0.38f, 0.58f)),
+                                         render::Topology::Triangles);
+        grid_center = kTrackOrigin + WorldPosition{250.0, -5.0, 0.0};
 
-        // --- Le bogie posé sur la voie, à vitesse constante ---
-        bogie.attach(&track);
-        bogie.set_distance(0.0);
-        bogie.set_speed(18.0);  // ~65 km/h
-
-        // Caméra derrière le début de la voie, regardant le long des rails (+X).
-        camera.set_position(kTrackOrigin + WorldPosition{-25.0, 18.0, 14.0});
-        camera.set_orientation(0.08f, -0.25f);
+        // --- Le wagon posé en haut de la première pente ---
+        wagon.attach(&track);
+        wagon.place_at(25.0);
         window.set_cursor_captured(true);
 
         EngineHooks hooks;
         hooks.poll_events = [this] { window.poll_events(); };
         hooks.should_stop = [this] { return window.should_close(); };
         hooks.variable_update = [this](double dt) { update_input(dt); };
-        hooks.fixed_update = [this](double dt) {
-            bogie.update(dt);  // avancement déterministe le long de la spline
-        };
+        hooks.fixed_update = [this](double dt) { update_physics(dt); };
         hooks.render = [this](double /*interpolation*/) { render_frame(); };
         engine.set_hooks(std::move(hooks));
 
-        log::info("Contrôles : ZQSD/WASD = déplacement, Espace/Maj = haut/bas, souris = regard, Échap = quitter");
+        log::info("Commandes : W/Z = traction, S = frein | souris = orbite caméra, Espace/Maj = zoom | Échap = quitter");
         return engine.initialize();
     }
 
+    // Inputs (par frame) : commandes du TRAIN + caméra orbitale. Latché pour fixed_update.
     void update_input(double dt) {
         using platform::Key;
 
-        const platform::CursorDelta d = window.consume_cursor_delta();
-        const float sensitivity = camera.mouse_sensitivity;
-        camera.add_yaw_pitch(static_cast<float>(d.dx) * sensitivity,
-                             static_cast<float>(-d.dy) * sensitivity);
-
-        const double distance = static_cast<double>(camera.move_speed) * dt;
-        double forward = 0.0;
-        double strafe = 0.0;
-        double vertical = 0.0;
-        if (window.is_key_down(Key::W) || window.is_key_down(Key::Z)) forward += 1.0;
-        if (window.is_key_down(Key::S)) forward -= 1.0;
-        if (window.is_key_down(Key::D)) strafe += 1.0;
-        if (window.is_key_down(Key::A) || window.is_key_down(Key::Q)) strafe -= 1.0;
-        if (window.is_key_down(Key::Space)) vertical += 1.0;
-        if (window.is_key_down(Key::LeftShift) || window.is_key_down(Key::LeftControl))
-            vertical -= 1.0;
-        camera.move_local(forward * distance, strafe * distance, vertical * distance);
+        const double throttle = (window.is_key_down(Key::W) || window.is_key_down(Key::Z)) ? 1.0 : 0.0;
+        const double brake = window.is_key_down(Key::S) ? 1.0 : 0.0;
+        wagon.set_controls(throttle, brake);
 
         if (window.is_key_down(Key::Escape)) {
             window.request_close();
+        }
+
+        const platform::CursorDelta d = window.consume_cursor_delta();
+        orbit_yaw += static_cast<float>(d.dx) * 0.005f;
+        orbit_pitch = glm::clamp(orbit_pitch - static_cast<float>(d.dy) * 0.005f, -1.30f, 1.30f);
+        if (window.is_key_down(Key::Space)) orbit_distance += static_cast<float>(25.0 * dt);
+        if (window.is_key_down(Key::LeftShift)) orbit_distance -= static_cast<float>(25.0 * dt);
+        orbit_distance = glm::clamp(orbit_distance, 10.0f, 150.0f);
+    }
+
+    // Physique (pas fixe, déterministe).
+    void update_physics(double dt) {
+        wagon.update(dt);
+
+        if (++telemetry_ticks % 120 == 0) {  // ~1x/s
+            log::info("v={:5.1f} km/h | traction={:6.1f} kN | pente={:+5.1f}% | {}",
+                      wagon.speed() * 3.6, wagon.tractive_effort() / 1000.0, wagon.grade_percent(),
+                      wagon.slipping() ? "PATINE" : "adherence OK");
         }
     }
 
@@ -190,25 +196,38 @@ struct Application::Impl {
             renderer.notify_resized();
         }
 
-        const float aspect = static_cast<float>(size.width) / static_cast<float>(size.height);
+        // Caméra orbitale : positionnée autour du wagon, le regard fixé dessus.
+        const WorldPosition target = wagon.body_position();
+        const glm::vec3 dir(std::cos(orbit_yaw) * std::cos(orbit_pitch), std::sin(orbit_pitch),
+                            std::sin(orbit_yaw) * std::cos(orbit_pitch));
+        camera.set_position(target + WorldPosition(dir) * static_cast<double>(orbit_distance));
+        camera.look_at(target);
 
+        const float aspect = static_cast<float>(size.width) / static_cast<float>(size.height);
         render::FrameUniforms uniforms;
         uniforms.view = camera.view_matrix();
         uniforms.proj = camera.projection_matrix(aspect);
 
-        // ORIGINE FLOTTANTE : chaque Model = (position monde double - caméra double) -> float.
+        // ORIGINE FLOTTANTE : tous les Model = (monde double - caméra double) -> float.
         std::vector<render::DrawItem> items;
-        items.reserve(3);
-
-        // Grille (sommets locaux centrés) + rails (sommets locaux à kTrackOrigin).
+        items.reserve(5);
         items.push_back(render::DrawItem{camera.relative_model(grid_center), grid_mesh});
         items.push_back(render::DrawItem{camera.relative_model(kTrackOrigin), rails_mesh});
 
-        // Bogie : position (double) relevée de 0.6 m, orientée sur la tangente, mise à l'échelle.
-        const WorldPosition bogie_pos = bogie.position() + WorldPosition{0.0, 0.6, 0.0};
-        const glm::mat4 bogie_model = camera.relative_model(bogie_pos) * bogie.orientation() *
-                                      glm::scale(glm::mat4(1.0f), glm::vec3(1.4f, 0.9f, 2.6f));
-        items.push_back(render::DrawItem{bogie_model, bogie_mesh});
+        // Les deux bogies (cubes rouges), relevés pour poser sur les rails.
+        const glm::vec3 bogie_scale(2.2f, 0.7f, 2.6f);
+        for (const physics::Bogie* b : {&wagon.front_bogie(), &wagon.rear_bogie()}) {
+            const WorldPosition p = b->position() + WorldPosition{0.0, 0.4, 0.0};
+            const glm::mat4 model = camera.relative_model(p) * b->orientation() *
+                                    glm::scale(glm::mat4(1.0f), bogie_scale);
+            items.push_back(render::DrawItem{model, bogie_mesh});
+        }
+
+        // La caisse (grand parallélépipède) au-dessus, orientation issue des 2 bogies + suspension.
+        const glm::mat4 body_model = camera.relative_model(wagon.body_position()) *
+                                     wagon.body_orientation() *
+                                     glm::scale(glm::mat4(1.0f), glm::vec3(2.8f, 2.6f, 16.0f));
+        items.push_back(render::DrawItem{body_model, body_mesh});
 
         renderer.draw_frame(uniforms, items);
     }

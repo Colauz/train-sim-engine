@@ -1,4 +1,6 @@
-add_library(noire_physics src/bogie.cpp)
+add_library(noire_physics
+    src/bogie.cpp
+    src/wagon.cpp)
 add_library(noire::physics ALIAS noire_physics)
 
 target_include_directories(noire_physics PUBLIC
