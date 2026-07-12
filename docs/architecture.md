@@ -77,4 +77,9 @@ descendante : le moteur ne connaît pas le jeu.
   `ProceduralTrack`), tuiles de 2 km générées en asynchrone (`core::JobSystem` +
   `scene::WorldStreamer`), upload GPU budgété, destruction GPU différée, GC des
   tuiles lointaines. Origine flottante **par tuile**. Physique découplée du streaming.
-- **M6 — Réalisme** : adhérence dynamique avancée (pluie/feuilles), météo, audio Doppler.
+- **M6 — Réalisme sensoriel** *(fait)* : module `audio` (miniaudio) — spatialisation 3D
+  + Doppler, listener sur la caméra, émetteurs sur le train ; audio ferroviaire procédural
+  (joints « clac-clac » selon la vitesse, crissement selon la courbure, roulement) ;
+  météo dynamique (`wetness` → brouillard de distance + assombrissement via UBO global).
+- **M7 — Adhérence météo & assets** : coupler `wetness` à μ (pluie/feuilles), pipeline
+  d'assets (modèles/textures/sons réels), éclairage.

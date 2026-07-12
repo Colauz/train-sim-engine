@@ -32,7 +32,7 @@ enum class Key {
     W, A, S, D,      // QWERTY
     Z, Q,            // AZERTY (Z=avancer, Q=gauche)
     Space, LeftShift, LeftControl,
-    E,
+    E, M,
     Escape,
     Up, Down, Left, Right,
 };

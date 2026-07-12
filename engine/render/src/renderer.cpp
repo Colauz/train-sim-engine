@@ -513,7 +513,7 @@ void Renderer::record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
     vkBeginCommandBuffer(cmd, &begin);
 
     std::array<VkClearValue, 2> clears{};
-    clears[0].color = {{0.01f, 0.01f, 0.03f, 1.0f}};  // bleu nuit « Noire »
+    clears[0].color = {{background_color_.r, background_color_.g, background_color_.b, 1.0f}};
     clears[1].depthStencil = {1.0f, 0};
 
     VkRenderPassBeginInfo rp{};
@@ -587,6 +587,9 @@ void Renderer::draw_frame(const FrameUniforms& uniforms, const std::vector<DrawI
         log::error("Vulkan : acquisition d'image échouée");
         return;
     }
+
+    // Le fond suit la couleur du brouillard (cohérence visuelle par temps couvert).
+    background_color_ = glm::vec3(uniforms.fog_color_density);
 
     // Mise à jour de l'UBO de CETTE frame (mapping persistant).
     std::memcpy(uniform_buffers_[current_frame_].mapped, &uniforms, sizeof(FrameUniforms));

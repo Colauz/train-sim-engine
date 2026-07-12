@@ -1,12 +1,13 @@
 #version 450
 
-// UBO : matrices caméra (view + proj), identiques pour toute la frame.
-layout(set = 0, binding = 0) uniform CameraUBO {
+// UBO global : matrices caméra + paramètres météo.
+layout(set = 0, binding = 0) uniform GlobalUBO {
     mat4 view;
     mat4 proj;
-} camera;
+    vec4 fogColorDensity;  // rgb = couleur brouillard, a = densité
+    vec4 params;           // x = wetness
+} u;
 
-// Push constant : matrice Model de l'objet (déjà relative à la caméra, en float).
 layout(push_constant) uniform PushConstants {
     mat4 model;
 } object;
@@ -15,8 +16,12 @@ layout(location = 0) in vec3 inPosition;
 layout(location = 1) in vec3 inColor;
 
 layout(location = 0) out vec3 fragColor;
+layout(location = 1) out vec3 cameraRelPos;  // position relative caméra (pour le fog)
 
 void main() {
-    gl_Position = camera.proj * camera.view * object.model * vec4(inPosition, 1.0);
+    // model est déjà relatif à la caméra (origine flottante) => sa norme = distance caméra.
+    vec4 rel = object.model * vec4(inPosition, 1.0);
+    cameraRelPos = rel.xyz;
+    gl_Position = u.proj * u.view * rel;
     fragColor = inColor;
 }

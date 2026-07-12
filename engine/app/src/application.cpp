@@ -1,9 +1,12 @@
 #include "noire/app/application.hpp"
 
+#include <chrono>
 #include <cmath>
 #include <utility>
 #include <vector>
 
+#include "noire/audio/audio_engine.hpp"
+#include "noire/audio/rail_audio.hpp"
 #include "noire/core/camera.hpp"
 #include "noire/core/engine.hpp"
 #include "noire/core/job_system.hpp"
@@ -21,15 +24,13 @@ namespace noire {
 
 namespace {
 
-// Origine du monde à ~1000 km : l'origine flottante reste indispensable, y compris
-// au fil des chunks (chaque tuile a sa propre origine locale).
 constexpr WorldPosition kTrackOrigin{1000000.0, 0.0, 1000000.0};
 
 physics::WagonConfig make_loco_config() {
     physics::WagonConfig c;
-    c.mass = 80000.0;                 // 80 t (locomotive)
+    c.mass = 80000.0;
     c.wheelbase = 14.0;
-    c.max_tractive_effort = 300000.0;  // 300 kN
+    c.max_tractive_effort = 300000.0;
     c.max_brake_force = 350000.0;
     return c;
 }
@@ -86,10 +87,10 @@ struct Application::Impl {
 
     static scene::StreamerConfig make_streamer_config() {
         scene::StreamerConfig sc;
-        sc.chunk_length = 2000.0;  // tuiles de 2 km
+        sc.chunk_length = 2000.0;
         sc.chunks_ahead = 2;
         sc.chunks_behind = 1;
-        sc.max_uploads_per_update = 1;  // budget anti-pic
+        sc.max_uploads_per_update = 1;
         sc.rail_profile.sample_step = 2.0;
         return sc;
     }
@@ -100,10 +101,13 @@ struct Application::Impl {
     Engine engine;
     Camera camera;
 
-    ProceduralTrack track;       // voie INFINIE analytique
-    JobSystem jobs;              // pool de threads (génération async)
-    physics::Wagon wagon;        // dépend de `track`
-    scene::WorldStreamer streamer;  // dépend de `track` et `jobs`
+    ProceduralTrack track;
+    JobSystem jobs;
+    physics::Wagon wagon;
+    scene::WorldStreamer streamer;
+
+    audio::AudioEngine audio;
+    audio::RailAudio rail_audio;
 
     render::MeshId grid_mesh = 0;
     render::MeshId bogie_mesh = 0;
@@ -112,6 +116,15 @@ struct Application::Impl {
     float orbit_yaw = 3.14159f;
     float orbit_pitch = 0.30f;
     float orbit_distance = 42.0f;
+
+    float wetness = 0.0f;
+    float wetness_target = 0.0f;
+    bool prev_m_down = false;
+
+    WorldPosition prev_cam_world{};
+    bool prev_cam_valid = false;
+    std::chrono::steady_clock::time_point prev_render_time;
+    bool prev_render_valid = false;
     std::uint64_t telemetry_ticks = 0;
 
     bool initialize() {
@@ -134,8 +147,8 @@ struct Application::Impl {
             return false;
         }
 
-        // Workers pour la génération asynchrone du décor.
         jobs.start(2);
+        audio.initialize();  // non fatal : no-op si aucun périphérique audio
 
         grid_mesh = renderer.create_mesh(make_grid_vertices(80, 5.0f), render::Topology::Lines);
         bogie_mesh = renderer.create_mesh(make_box_vertices(glm::vec3(0.85f, 0.15f, 0.15f)),
@@ -145,7 +158,7 @@ struct Application::Impl {
 
         wagon.attach(&track);
         wagon.place_at(0.0);
-        wagon.set_speed(25.0);  // départ lancé (~90 km/h) : le streaming s'exerce d'emblée
+        wagon.set_speed(25.0);
         window.set_cursor_captured(true);
 
         EngineHooks hooks;
@@ -156,20 +169,28 @@ struct Application::Impl {
         hooks.render = [this](double /*interpolation*/) { render_frame(); };
         engine.set_hooks(std::move(hooks));
 
-        log::info("Commandes : W/Z = traction, S = frein | souris = orbite, Espace/Maj = zoom | Échap = quitter");
+        log::info("Commandes : W/Z=traction, S=frein, M=pluie | souris=orbite, Espace/Maj=zoom, Échap=quitter");
         return engine.initialize();
     }
 
     void update_input(double dt) {
         using platform::Key;
 
-        const double throttle = (window.is_key_down(Key::W) || window.is_key_down(Key::Z)) ? 1.0 : 0.0;
-        const double brake = window.is_key_down(Key::S) ? 1.0 : 0.0;
-        wagon.set_controls(throttle, brake);
-
+        wagon.set_controls((window.is_key_down(Key::W) || window.is_key_down(Key::Z)) ? 1.0 : 0.0,
+                           window.is_key_down(Key::S) ? 1.0 : 0.0);
         if (window.is_key_down(Key::Escape)) {
             window.request_close();
         }
+
+        // Pluie : bascule sur front montant de M, puis transition douce du wetness.
+        const bool m_down = window.is_key_down(Key::M);
+        if (m_down && !prev_m_down) {
+            wetness_target = (wetness_target > 0.5f) ? 0.0f : 1.0f;
+            log::info("Météo : {}", wetness_target > 0.5f ? "PLUIE" : "temps sec");
+        }
+        prev_m_down = m_down;
+        const float rate = static_cast<float>(dt) * 0.7f;
+        wetness += glm::clamp(wetness_target - wetness, -rate, rate);
 
         const platform::CursorDelta d = window.consume_cursor_delta();
         orbit_yaw += static_cast<float>(d.dx) * 0.005f;
@@ -180,18 +201,37 @@ struct Application::Impl {
     }
 
     void update_physics(double dt) {
-        wagon.update(dt);  // dynamique déterministe (jamais bloquée par le streaming)
+        wagon.update(dt);
 
-        if (++telemetry_ticks % 120 == 0) {  // ~1x/s
-            log::info("v={:6.1f} km/h | pente={:+5.1f}% | {} | chunks actifs={} | jobs={}",
+        // --- Audio ferroviaire procédural (piloté par l'état physique) ---
+        const glm::vec3 train_velocity =
+            glm::vec3(wagon.front_bogie().tangent()) * static_cast<float>(wagon.speed());
+        const glm::dvec3 tf = glm::normalize(wagon.front_bogie().tangent());
+        const glm::dvec3 tr = glm::normalize(wagon.rear_bogie().tangent());
+        const double curvature =
+            std::acos(glm::clamp(glm::dot(tf, tr), -1.0, 1.0)) / wagon.config().wheelbase;
+
+        audio::RailAudio::Input in;
+        in.front_chainage = wagon.front_bogie().chainage();
+        in.front_position = wagon.front_bogie().position();
+        in.rear_chainage = wagon.rear_bogie().chainage();
+        in.rear_position = wagon.rear_bogie().position();
+        in.body_position = wagon.body_position();
+        in.velocity = train_velocity;
+        in.speed = wagon.speed();
+        in.curvature = curvature;
+        rail_audio.update(audio, dt, in);
+
+        if (++telemetry_ticks % 120 == 0) {
+            log::info("v={:6.1f} km/h | pente={:+5.1f}% | {} | chunks={} | pluie={:.0f}%",
                       wagon.speed() * 3.6, wagon.grade_percent(),
                       wagon.slipping() ? "PATINE   " : "adherent ", streamer.active_chunk_count(),
-                      jobs.in_flight());
+                      wetness * 100.0f);
         }
     }
 
     void render_frame() {
-        // STREAMING (thread principal) : (dé)charge les tuiles selon la position du train.
+        // Streaming (thread principal), toujours exécuté (même minimisé).
         streamer.update(wagon.chainage(), renderer);
 
         const auto size = window.framebuffer_size();
@@ -204,33 +244,60 @@ struct Application::Impl {
             renderer.notify_resized();
         }
 
+        // Delta de temps réel pour la vitesse de la caméra (Doppler du listener).
+        const auto now = std::chrono::steady_clock::now();
+        double dt_render = 1.0 / 60.0;
+        if (prev_render_valid) {
+            dt_render = std::chrono::duration<double>(now - prev_render_time).count();
+        }
+        prev_render_time = now;
+        prev_render_valid = true;
+        if (dt_render < 1e-4) dt_render = 1e-4;
+
         // Caméra orbitale qui suit le wagon.
         const WorldPosition target = wagon.body_position();
         const glm::vec3 dir(std::cos(orbit_yaw) * std::cos(orbit_pitch), std::sin(orbit_pitch),
                             std::sin(orbit_yaw) * std::cos(orbit_pitch));
-        camera.set_position(target + WorldPosition(dir) * static_cast<double>(orbit_distance));
+        const WorldPosition cam_world = target + WorldPosition(dir) * static_cast<double>(orbit_distance);
+        camera.set_position(cam_world);
         camera.look_at(target);
 
+        // Listener audio = caméra ; vitesse par différence finie (pour le Doppler).
+        glm::vec3 cam_velocity(0.0f);
+        if (prev_cam_valid) {
+            cam_velocity = glm::vec3((cam_world - prev_cam_world) / dt_render);
+        }
+        prev_cam_world = cam_world;
+        prev_cam_valid = true;
+        audio.update_listener(cam_world, cam_velocity, camera.forward(), glm::vec3(0.0f, 1.0f, 0.0f));
+
+        // Uniforms globaux : caméra + météo.
         const float aspect = static_cast<float>(size.width) / static_cast<float>(size.height);
         render::FrameUniforms uniforms;
         uniforms.view = camera.view_matrix();
         uniforms.proj = camera.projection_matrix(aspect);
+        const glm::vec3 fog_dry(0.02f, 0.03f, 0.06f);
+        const glm::vec3 fog_wet(0.55f, 0.57f, 0.60f);
+        const glm::vec3 fog_color = glm::mix(fog_dry, fog_wet, wetness);
+        const float fog_density = glm::mix(0.0006f, 0.010f, wetness);
+        uniforms.fog_color_density = glm::vec4(fog_color, fog_density);
+        uniforms.params = glm::vec4(wetness, 0.0f, 0.0f, 0.0f);
 
         std::vector<render::DrawItem> items;
 
-        // Sol « infini » : la grille se recentre sous le train (accrochée au pas de grille).
+        // Sol infini (recentré sous le train).
         const WorldPosition wp = wagon.body_position();
         const double gs = 5.0;
         const WorldPosition grid_center(std::floor(wp.x / gs) * gs, wp.y - 3.0,
                                         std::floor(wp.z / gs) * gs);
         items.push_back(render::DrawItem{camera.relative_model(grid_center), grid_mesh});
 
-        // Rails : une entrée par tuile chargée, chacune avec SA propre origine (origine flottante).
+        // Rails streamés (une origine par tuile).
         for (const scene::ChunkRenderInfo& chunk : streamer.renderables()) {
             items.push_back(render::DrawItem{camera.relative_model(chunk.origin), chunk.mesh});
         }
 
-        // Les deux bogies (cubes rouges).
+        // Deux bogies (cubes rouges).
         const glm::vec3 bogie_scale(2.2f, 0.7f, 2.6f);
         for (const physics::Bogie* b : {&wagon.front_bogie(), &wagon.rear_bogie()}) {
             const WorldPosition p = b->position() + WorldPosition{0.0, 0.4, 0.0};
@@ -239,7 +306,7 @@ struct Application::Impl {
             items.push_back(render::DrawItem{model, bogie_mesh});
         }
 
-        // La caisse (parallélépipède) au-dessus.
+        // Caisse.
         const glm::mat4 body_model = camera.relative_model(wagon.body_position()) *
                                      wagon.body_orientation() *
                                      glm::scale(glm::mat4(1.0f), glm::vec3(2.8f, 2.6f, 18.0f));
@@ -249,9 +316,8 @@ struct Application::Impl {
     }
 
     void shutdown() {
-        // IMPORTANT : arrêter les workers AVANT tout le reste. stop() draine les jobs
-        // en cours (ils écrivent dans les chunks) => plus aucun accès concurrent ensuite.
-        jobs.stop();
+        jobs.stop();      // draine les workers avant toute destruction
+        audio.shutdown();
         renderer.wait_idle();
         renderer.shutdown();
         window.shutdown();

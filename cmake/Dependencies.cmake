@@ -47,7 +47,20 @@ FetchContent_Declare(VulkanMemoryAllocator
     GIT_TAG        v3.3.0
     GIT_SHALLOW    ON)
 
-FetchContent_MakeAvailable(spdlog glm glfw vk-bootstrap VulkanMemoryAllocator)
+# --- miniaudio : audio spatialisé + Doppler (header unique, backends via dlopen) --
+FetchContent_Declare(miniaudio
+    GIT_REPOSITORY https://github.com/mackron/miniaudio.git
+    GIT_TAG        0.11.21
+    GIT_SHALLOW    ON)
+
+FetchContent_MakeAvailable(spdlog glm glfw vk-bootstrap VulkanMemoryAllocator miniaudio)
+
+# miniaudio n'a pas de CMakeLists : on expose son include nous-mêmes (en SYSTEM
+# pour que ses warnings ne polluent pas notre build strict).
+if(NOT TARGET miniaudio)
+    add_library(miniaudio INTERFACE)
+    target_include_directories(miniaudio SYSTEM INTERFACE ${miniaudio_SOURCE_DIR})
+endif()
 
 # Conventions Vulkan pour glm, imposées à TOUS les consommateurs (cohérence des
 # matrices) : profondeur [0,1] et angles en radians.

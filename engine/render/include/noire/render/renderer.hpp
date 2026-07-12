@@ -23,11 +23,13 @@ struct RendererCreateInfo {
     std::function<VkExtent2D()> get_framebuffer_size;  // taille courante (redimensionnement)
 };
 
-// Matrices caméra envoyées au GPU via UBO (uniquement des float : l'origine
-// flottante est déjà résolue côté CPU).
+// UBO GLOBAL envoyé au GPU (uniquement des float : l'origine flottante est déjà
+// résolue côté CPU). Contient les matrices caméra + les paramètres météo.
 struct FrameUniforms {
     glm::mat4 view;
     glm::mat4 proj;
+    glm::vec4 fog_color_density;  // rgb = couleur du brouillard, a = densité
+    glm::vec4 params;             // x = wetness (humidité 0..1), reste = réserve
 };
 
 // Un objet à dessiner : sa matrice Model (déjà relative à la caméra, en float)
@@ -132,6 +134,9 @@ private:
     };
     std::vector<PendingDelete> pending_deletes_;
     std::uint64_t frame_index_ = 0;
+
+    // Couleur de fond = couleur du brouillard (mise à jour depuis les uniforms).
+    glm::vec3 background_color_{0.01f, 0.01f, 0.03f};
 
     std::uint32_t current_frame_ = 0;
     bool framebuffer_resized_ = false;
