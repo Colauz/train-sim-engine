@@ -82,6 +82,74 @@ bool VulkanContext::initialize(const ContextCreateInfo& info) {
     return true;
 }
 
+bool VulkanContext::create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, bool host_visible,
+                                  GpuBuffer& out) const {
+    VkBufferCreateInfo buffer_info{};
+    buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    buffer_info.size = size;
+    buffer_info.usage = usage;
+    buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    VmaAllocationCreateInfo alloc_create{};
+    alloc_create.usage = VMA_MEMORY_USAGE_AUTO;
+    if (host_visible) {
+        // Mapping persistant + écriture séquentielle CPU (UBO, vertex buffers du M2).
+        alloc_create.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                             VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    }
+
+    VmaAllocationInfo alloc_info{};
+    if (vmaCreateBuffer(allocator_, &buffer_info, &alloc_create, &out.buffer, &out.allocation,
+                        &alloc_info) != VK_SUCCESS) {
+        log::error("VMA : création d'un tampon échouée ({} octets)", size);
+        return false;
+    }
+    out.mapped = alloc_info.pMappedData;  // non-nul si host-visible + MAPPED
+    out.size = size;
+    return true;
+}
+
+void VulkanContext::destroy_buffer(GpuBuffer& buffer) const {
+    if (buffer.buffer != VK_NULL_HANDLE) {
+        vmaDestroyBuffer(allocator_, buffer.buffer, buffer.allocation);
+    }
+    buffer = GpuBuffer{};
+}
+
+bool VulkanContext::create_image(std::uint32_t width, std::uint32_t height, VkFormat format,
+                                 VkImageUsageFlags usage, VkImage& out_image,
+                                 VmaAllocation& out_allocation) const {
+    VkImageCreateInfo image_info{};
+    image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    image_info.imageType = VK_IMAGE_TYPE_2D;
+    image_info.format = format;
+    image_info.extent = {width, height, 1};
+    image_info.mipLevels = 1;
+    image_info.arrayLayers = 1;
+    image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+    image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    image_info.usage = usage;
+    image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    VmaAllocationCreateInfo alloc_create{};
+    alloc_create.usage = VMA_MEMORY_USAGE_AUTO;
+    alloc_create.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;  // image lourde => dédiée
+
+    if (vmaCreateImage(allocator_, &image_info, &alloc_create, &out_image, &out_allocation,
+                       nullptr) != VK_SUCCESS) {
+        log::error("VMA : création d'une image échouée ({}x{})", width, height);
+        return false;
+    }
+    return true;
+}
+
+void VulkanContext::destroy_image(VkImage image, VmaAllocation allocation) const {
+    if (image != VK_NULL_HANDLE) {
+        vmaDestroyImage(allocator_, image, allocation);
+    }
+}
+
 void VulkanContext::shutdown() {
     if (allocator_ != VK_NULL_HANDLE) {
         vmaDestroyAllocator(allocator_);

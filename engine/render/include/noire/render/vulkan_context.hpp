@@ -6,8 +6,9 @@
 
 #include <vulkan/vulkan.h>
 
-// Forward-declare l'allocateur VMA pour ne pas tirer tout <vk_mem_alloc.h> ici.
-// (Typedef identique à celui de VMA : redéfinition sans danger en C++.)
+#include "noire/render/gpu_buffer.hpp"
+
+// Forward-declare les handles VMA (typedefs identiques à ceux de VMA).
 typedef struct VmaAllocator_T* VmaAllocator;
 
 namespace noire::render {
@@ -22,6 +23,7 @@ struct ContextCreateInfo {
 };
 
 // Possède l'instance, le device, les files d'attente et l'allocateur VMA.
+// Fournit aussi les helpers d'allocation (buffers, images) au-dessus de VMA.
 class VulkanContext {
 public:
     VulkanContext() = default;
@@ -41,6 +43,17 @@ public:
     [[nodiscard]] VkQueue graphics_queue() const { return graphics_queue_; }
     [[nodiscard]] VkQueue present_queue() const { return present_queue_; }
     [[nodiscard]] std::uint32_t graphics_queue_family() const { return graphics_queue_family_; }
+
+    // --- Helpers d'allocation VMA --------------------------------------------
+    // `host_visible` => tampon mappé en permanence (GpuBuffer::mapped valide).
+    bool create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, bool host_visible,
+                       GpuBuffer& out) const;
+    void destroy_buffer(GpuBuffer& buffer) const;
+
+    bool create_image(std::uint32_t width, std::uint32_t height, VkFormat format,
+                      VkImageUsageFlags usage, VkImage& out_image,
+                      VmaAllocation& out_allocation) const;
+    void destroy_image(VkImage image, VmaAllocation allocation) const;
 
 private:
     VkInstance instance_ = VK_NULL_HANDLE;

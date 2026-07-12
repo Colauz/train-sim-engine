@@ -17,10 +17,11 @@ struct EngineConfig {
 // ainsi TOTALEMENT indépendant de la fenêtre et du rendu : il n'orchestre que le
 // temps. C'est ce qui empêche la logique graphique de « fuiter » vers le bas.
 struct EngineHooks {
-    std::function<void()> poll_events;                 // pomper les événements OS
-    std::function<bool()> should_stop;                 // true => quitter la boucle
-    std::function<void(double dt)> fixed_update;       // un pas de simulation
-    std::function<void(double interpolation)> render;  // rendu interpolé [0,1]
+    std::function<void()> poll_events;                    // pomper les événements OS
+    std::function<bool()> should_stop;                    // true => quitter la boucle
+    std::function<void(double frame_dt)> variable_update;  // caméra, inputs (par frame)
+    std::function<void(double dt)> fixed_update;          // un pas de simulation (fixe)
+    std::function<void(double interpolation)> render;     // rendu interpolé [0,1]
 };
 
 // Boucle principale à PAS DE TEMPS FIXE (cf. Glenn Fiedler « Fix Your Timestep! »).

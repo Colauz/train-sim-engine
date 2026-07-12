@@ -40,6 +40,12 @@ void Engine::run() {
         double frame_time = std::chrono::duration<double>(now - previous).count();
         previous = now;
         frame_time = std::min(frame_time, 0.25);  // garde-fou anti « spirale de la mort »
+
+        // Mise à jour à débit variable (caméra libre, inputs) : hors simulation déterministe.
+        if (hooks_.variable_update) {
+            hooks_.variable_update(frame_time);
+        }
+
         accumulator += frame_time;
 
         // Simulation : consommée par pas fixes => déterminisme.

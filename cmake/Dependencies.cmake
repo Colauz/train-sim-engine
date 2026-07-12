@@ -48,3 +48,7 @@ FetchContent_Declare(VulkanMemoryAllocator
     GIT_SHALLOW    ON)
 
 FetchContent_MakeAvailable(spdlog glm glfw vk-bootstrap VulkanMemoryAllocator)
+
+# Conventions Vulkan pour glm, imposées à TOUS les consommateurs (cohérence des
+# matrices) : profondeur [0,1] et angles en radians.
+target_compile_definitions(glm INTERFACE GLM_FORCE_DEPTH_ZERO_TO_ONE GLM_FORCE_RADIANS)

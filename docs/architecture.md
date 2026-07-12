@@ -62,7 +62,10 @@ descendante : le moteur ne connaît pas le jeu.
 - **M1 — Fenêtre & Vulkan** *(fait)* : `platform` (GLFW), `render` (Vulkan via
   vk-bootstrap + VMA, premier triangle), `app` (orchestration PIMPL). Boucle `core`
   rendue indépendante du graphique via des callbacks (`EngineHooks`).
-- **M2 — Monde & caméra** : origine flottante, caméra libre, terrain simple.
+- **M2 — Monde & caméra** *(fait)* : origine flottante (positions monde `double`,
+  Model relatif caméra ramené en `float` — `render` ne voit aucun `double`), caméra
+  libre (fly, inputs clavier/souris), UBO caméra + push-constant Model, vertex
+  buffers & depth buffer via VMA, scène grille + cubes.
 - **M3 — Voie & train** : génération de rails par splines, un bogie physique.
 - **M4 — Streaming** : chargement/déchargement tuilé sur longue distance.
 - **M5 — Réalisme** : adhérence dynamique, météo, audio Doppler.
