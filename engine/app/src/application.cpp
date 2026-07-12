@@ -7,64 +7,60 @@
 #include "noire/core/engine.hpp"
 #include "noire/core/log.hpp"
 #include "noire/core/math.hpp"
+#include "noire/core/spline.hpp"
+#include "noire/physics/bogie.hpp"
 #include "noire/platform/window.hpp"
 #include "noire/render/renderer.hpp"
 #include "noire/render/vertex.hpp"
+#include "noire/scene/track_mesh.hpp"
 
 namespace noire {
 
 namespace {
 
-// Origine du monde volontairement TRÈS éloignée (~1 000 km sur X et Z) pour
-// démontrer l'origine flottante : sans elle, un float perdrait ~0,1 m de précision
-// ici => jittering. Avec le calcul double->relatif->float, tout reste net.
-constexpr WorldPosition kWorldBase{1000000.0, 0.0, 1000000.0};
+// Origine de la voie, volontairement à ~1000 km de l'origine absolue : démontre
+// que l'origine flottante tient (mesh rails et bogie restent nets, sans jittering).
+constexpr WorldPosition kTrackOrigin{1000000.0, 0.0, 1000000.0};
 
-// Cube unité (±0.5) centré à l'origine, une couleur par face. cullMode = NONE
-// => l'ordre des sommets n'a pas d'importance pour la visibilité.
-std::vector<render::Vertex> make_cube_vertices() {
+// Cube unité (±0.5) coloré uniformément, avec un léger ombrage par face pour la 3D.
+std::vector<render::Vertex> make_box_vertices(const glm::vec3& base_color) {
     const glm::vec3 c[8] = {
         {-0.5f, -0.5f, -0.5f}, {0.5f, -0.5f, -0.5f}, {0.5f, 0.5f, -0.5f}, {-0.5f, 0.5f, -0.5f},
         {-0.5f, -0.5f, 0.5f},  {0.5f, -0.5f, 0.5f},  {0.5f, 0.5f, 0.5f},  {-0.5f, 0.5f, 0.5f},
     };
     struct Face {
         int a, b, c, d;
-        glm::vec3 color;
+        float shade;
     };
     const Face faces[6] = {
-        {4, 5, 6, 7, {0.85f, 0.25f, 0.25f}},  // avant  (z+) rouge
-        {1, 0, 3, 2, {0.25f, 0.55f, 0.85f}},  // arrière (z-) bleu
-        {0, 4, 7, 3, {0.30f, 0.75f, 0.35f}},  // gauche (x-) vert
-        {5, 1, 2, 6, {0.90f, 0.70f, 0.25f}},  // droite (x+) jaune
-        {7, 6, 2, 3, {0.85f, 0.85f, 0.85f}},  // haut   (y+) clair
-        {0, 1, 5, 4, {0.45f, 0.45f, 0.50f}},  // bas    (y-) sombre
+        {4, 5, 6, 7, 1.00f}, {1, 0, 3, 2, 0.80f}, {0, 4, 7, 3, 0.70f},
+        {5, 1, 2, 6, 0.90f}, {7, 6, 2, 3, 1.15f}, {0, 1, 5, 4, 0.55f},
     };
     std::vector<render::Vertex> vertices;
     vertices.reserve(36);
     for (const Face& f : faces) {
+        const glm::vec3 color = base_color * f.shade;
         const int order[6] = {f.a, f.b, f.c, f.a, f.c, f.d};
         for (int i : order) {
-            vertices.push_back(render::Vertex{c[i], f.color});
+            vertices.push_back(render::Vertex{c[i], color});
         }
     }
     return vertices;
 }
 
-// Grille au sol (y = 0) faite de lignes ; axes X (rouge) et Z (bleu) mis en valeur.
+// Grille au sol (y = 0) en lignes ; axes X (rouge) et Z (bleu) mis en valeur.
 std::vector<render::Vertex> make_grid_vertices(int half_lines, float step) {
-    const glm::vec3 gray{0.25f, 0.25f, 0.28f};
-    const glm::vec3 axis_x{0.70f, 0.20f, 0.20f};
-    const glm::vec3 axis_z{0.20f, 0.40f, 0.80f};
+    const glm::vec3 gray{0.22f, 0.22f, 0.25f};
+    const glm::vec3 axis_x{0.55f, 0.20f, 0.20f};
+    const glm::vec3 axis_z{0.20f, 0.35f, 0.60f};
     const float extent = static_cast<float>(half_lines) * step;
 
     std::vector<render::Vertex> vertices;
     for (int i = -half_lines; i <= half_lines; ++i) {
         const float t = static_cast<float>(i) * step;
-        // Ligne parallèle à Z (x = t) ; à x = 0 c'est l'axe Z.
         const glm::vec3 col_z = (i == 0) ? axis_z : gray;
         vertices.push_back(render::Vertex{{t, 0.0f, -extent}, col_z});
         vertices.push_back(render::Vertex{{t, 0.0f, extent}, col_z});
-        // Ligne parallèle à X (z = t) ; à z = 0 c'est l'axe X.
         const glm::vec3 col_x = (i == 0) ? axis_x : gray;
         vertices.push_back(render::Vertex{{-extent, 0.0f, t}, col_x});
         vertices.push_back(render::Vertex{{extent, 0.0f, t}, col_x});
@@ -74,7 +70,6 @@ std::vector<render::Vertex> make_grid_vertices(int half_lines, float step) {
 
 }  // namespace
 
-// Toute la logique (et donc toutes les dépendances graphiques) est confinée ici.
 struct Application::Impl {
     explicit Impl(ApplicationConfig cfg)
         : config(std::move(cfg)),
@@ -87,17 +82,19 @@ struct Application::Impl {
     Engine engine;
     Camera camera;
 
+    Spline track;              // la voie ferrée (double)
+    physics::Bogie bogie;      // le bogie cinématique contraint dessus
+
     render::MeshId grid_mesh = 0;
-    render::MeshId cube_mesh = 0;
-    WorldPosition grid_origin{kWorldBase};
-    std::vector<WorldPosition> cube_positions;
+    render::MeshId rails_mesh = 0;
+    render::MeshId bogie_mesh = 0;
+    WorldPosition grid_center{kTrackOrigin};
 
     bool initialize() {
         if (!window.initialize()) {
             return false;
         }
 
-        // render <- fenêtre, sans couplage à GLFW (fabrique de surface + taille).
         render::RendererCreateInfo rc;
         rc.context.instance_extensions = window.required_instance_extensions();
         rc.context.enable_validation = config.enable_validation;
@@ -113,25 +110,41 @@ struct Application::Impl {
             return false;
         }
 
-        // Géométrie de la scène (définie par l'app, pas par render).
-        grid_mesh = renderer.create_mesh(make_grid_vertices(50, 2.0f), render::Topology::Lines);
-        cube_mesh = renderer.create_mesh(make_cube_vertices(), render::Topology::Triangles);
-        cube_positions = {
-            kWorldBase + WorldPosition{0.0, 0.5, 0.0},   kWorldBase + WorldPosition{3.0, 0.5, -2.0},
-            kWorldBase + WorldPosition{-3.0, 0.5, -1.0}, kWorldBase + WorldPosition{0.0, 0.5, -6.0},
-            kWorldBase + WorldPosition{6.0, 1.5, -4.0},  kWorldBase + WorldPosition{-6.0, 0.5, -5.0},
-        };
+        // --- La voie : une courbe en S d'environ 500 m (points de contrôle en double) ---
+        track.set_control_points({
+            kTrackOrigin + WorldPosition{0.0, 0.0, 0.0},
+            kTrackOrigin + WorldPosition{100.0, 0.0, 0.0},
+            kTrackOrigin + WorldPosition{200.0, 0.0, 35.0},
+            kTrackOrigin + WorldPosition{300.0, 0.0, -35.0},
+            kTrackOrigin + WorldPosition{400.0, 0.0, 0.0},
+            kTrackOrigin + WorldPosition{500.0, 0.0, 0.0},
+        });
+        log::info("Voie générée : longueur ~{:.1f} m", track.length());
 
-        // Caméra placée à ~1 000 km de l'origine absolue, face aux cubes.
-        camera.set_position(kWorldBase + WorldPosition{0.0, 2.0, 8.0});
-        window.set_cursor_captured(true);  // mode FPS
+        // --- Maillages créés UNE SEULE FOIS (jamais recalculés par frame) ---
+        rails_mesh = renderer.create_mesh(scene::generate_rail_mesh(track, kTrackOrigin, {}),
+                                          render::Topology::Triangles);
+        grid_mesh = renderer.create_mesh(make_grid_vertices(60, 5.0f), render::Topology::Lines);
+        bogie_mesh = renderer.create_mesh(make_box_vertices(glm::vec3(0.85f, 0.15f, 0.15f)),
+                                          render::Topology::Triangles);
+        grid_center = kTrackOrigin + WorldPosition{250.0, 0.0, 0.0};
+
+        // --- Le bogie posé sur la voie, à vitesse constante ---
+        bogie.attach(&track);
+        bogie.set_distance(0.0);
+        bogie.set_speed(18.0);  // ~65 km/h
+
+        // Caméra derrière le début de la voie, regardant le long des rails (+X).
+        camera.set_position(kTrackOrigin + WorldPosition{-25.0, 18.0, 14.0});
+        camera.set_orientation(0.08f, -0.25f);
+        window.set_cursor_captured(true);
 
         EngineHooks hooks;
         hooks.poll_events = [this] { window.poll_events(); };
         hooks.should_stop = [this] { return window.should_close(); };
         hooks.variable_update = [this](double dt) { update_input(dt); };
-        hooks.fixed_update = [](double /*dt*/) {
-            // Simulation ferroviaire à venir (M3 : bogies, adhérence, réseau de voies).
+        hooks.fixed_update = [this](double dt) {
+            bogie.update(dt);  // avancement déterministe le long de la spline
         };
         hooks.render = [this](double /*interpolation*/) { render_frame(); };
         engine.set_hooks(std::move(hooks));
@@ -143,13 +156,11 @@ struct Application::Impl {
     void update_input(double dt) {
         using platform::Key;
 
-        // Souris -> orientation (fly camera).
         const platform::CursorDelta d = window.consume_cursor_delta();
         const float sensitivity = camera.mouse_sensitivity;
         camera.add_yaw_pitch(static_cast<float>(d.dx) * sensitivity,
                              static_cast<float>(-d.dy) * sensitivity);
 
-        // Clavier -> déplacement (ZQSD + WASD gérés ensemble).
         const double distance = static_cast<double>(camera.move_speed) * dt;
         double forward = 0.0;
         double strafe = 0.0;
@@ -171,7 +182,7 @@ struct Application::Impl {
     void render_frame() {
         const auto size = window.framebuffer_size();
         if (size.width == 0 || size.height == 0) {
-            window.wait_events();  // minimisé
+            window.wait_events();
             return;
         }
         if (window.was_resized()) {
@@ -185,14 +196,19 @@ struct Application::Impl {
         uniforms.view = camera.view_matrix();
         uniforms.proj = camera.projection_matrix(aspect);
 
-        // ORIGINE FLOTTANTE : chaque Model est calculé (double - double) puis ramené
-        // en float relativement à la caméra. render ne reçoit que des float.
+        // ORIGINE FLOTTANTE : chaque Model = (position monde double - caméra double) -> float.
         std::vector<render::DrawItem> items;
-        items.reserve(cube_positions.size() + 1);
-        items.push_back(render::DrawItem{camera.relative_model(grid_origin), grid_mesh});
-        for (const WorldPosition& p : cube_positions) {
-            items.push_back(render::DrawItem{camera.relative_model(p), cube_mesh});
-        }
+        items.reserve(3);
+
+        // Grille (sommets locaux centrés) + rails (sommets locaux à kTrackOrigin).
+        items.push_back(render::DrawItem{camera.relative_model(grid_center), grid_mesh});
+        items.push_back(render::DrawItem{camera.relative_model(kTrackOrigin), rails_mesh});
+
+        // Bogie : position (double) relevée de 0.6 m, orientée sur la tangente, mise à l'échelle.
+        const WorldPosition bogie_pos = bogie.position() + WorldPosition{0.0, 0.6, 0.0};
+        const glm::mat4 bogie_model = camera.relative_model(bogie_pos) * bogie.orientation() *
+                                      glm::scale(glm::mat4(1.0f), glm::vec3(1.4f, 0.9f, 2.6f));
+        items.push_back(render::DrawItem{bogie_model, bogie_mesh});
 
         renderer.draw_frame(uniforms, items);
     }

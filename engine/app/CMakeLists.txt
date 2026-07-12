@@ -7,6 +7,6 @@ target_include_directories(noire_app PUBLIC
 # Tout est PRIVATE : grâce au PIMPL, application.hpp n'expose ni Vulkan ni GLFW.
 # Le runtime qui lie noire::app ne voit donc AUCUN détail graphique.
 target_link_libraries(noire_app
-    PRIVATE noire::core noire::platform noire::render)
+    PRIVATE noire::core noire::platform noire::render noire::physics noire::scene)
 
 noire_set_warnings(noire_app)

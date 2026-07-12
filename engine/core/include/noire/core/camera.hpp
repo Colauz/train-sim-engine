@@ -18,6 +18,10 @@ public:
     void add_yaw_pitch(float delta_yaw, float delta_pitch);  // radians (souris)
 
     void set_position(const WorldPosition& p) { position_ = p; }
+    void set_orientation(float yaw, float pitch) {
+        yaw_ = yaw;
+        pitch_ = pitch;
+    }
     [[nodiscard]] const WorldPosition& position() const { return position_; }
     [[nodiscard]] glm::vec3 forward() const;
     [[nodiscard]] glm::vec3 right() const;

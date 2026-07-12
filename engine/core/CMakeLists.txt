@@ -1,7 +1,8 @@
 add_library(noire_core
     src/log.cpp
     src/engine.cpp
-    src/camera.cpp)
+    src/camera.cpp
+    src/spline.cpp)
 add_library(noire::core ALIAS noire_core)
 
 target_compile_features(noire_core PUBLIC cxx_std_20)

@@ -66,6 +66,9 @@ descendante : le moteur ne connaît pas le jeu.
   Model relatif caméra ramené en `float` — `render` ne voit aucun `double`), caméra
   libre (fly, inputs clavier/souris), UBO caméra + push-constant Model, vertex
   buffers & depth buffer via VMA, scène grille + cubes.
-- **M3 — Voie & train** : génération de rails par splines, un bogie physique.
+- **M3 — Voie & train** *(fait)* : `Spline` Catmull-Rom en `double` (paramétrée par
+  distance d'arc, LUT arc-longueur), génération procédurale des rails (`scene`, sommets
+  relatifs à l'origine de voie, calculée une seule fois), `Bogie` cinématique (`physics`)
+  aligné sur la tangente, avancé dans `fixed_update`. Courbe en S de ~500 m.
 - **M4 — Streaming** : chargement/déchargement tuilé sur longue distance.
 - **M5 — Réalisme** : adhérence dynamique, météo, audio Doppler.
