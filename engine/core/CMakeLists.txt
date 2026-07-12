@@ -1,8 +1,12 @@
+find_package(Threads REQUIRED)
+
 add_library(noire_core
     src/log.cpp
     src/engine.cpp
     src/camera.cpp
-    src/spline.cpp)
+    src/spline.cpp
+    src/procedural_track.cpp
+    src/job_system.cpp)
 add_library(noire::core ALIAS noire_core)
 
 target_compile_features(noire_core PUBLIC cxx_std_20)
@@ -20,8 +24,9 @@ target_include_directories(noire_core PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/generated>)
 
 # glm est exposé dans l'API publique (types math) ; spdlog reste un détail interne.
+# Threads (pthread) pour le JobSystem.
 target_link_libraries(noire_core
-    PUBLIC  glm::glm
+    PUBLIC  glm::glm Threads::Threads
     PRIVATE spdlog::spdlog)
 
 noire_set_warnings(noire_core)

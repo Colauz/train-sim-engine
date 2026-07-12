@@ -2,15 +2,12 @@
 
 namespace noire::physics {
 
-void Bogie::follow(const Spline& track, double distance) {
-    distance_ = distance;
-    if (track.empty()) {
-        return;
-    }
+void Bogie::follow(const TrackSource& track, double x) {
+    chainage_ = x;
 
     glm::dvec3 position;
     glm::dvec3 tangent;
-    track.sample(distance_, position, tangent);
+    track.sample(x, position, tangent);
     position_ = position;
     tangent_ = tangent;
 

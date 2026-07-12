@@ -3,7 +3,7 @@
 // Le runtime ne connaît NI Vulkan NI GLFW : il configure et lance l'Application.
 int main() {
     noire::ApplicationConfig config;
-    config.title = "Noire Engine — M4 : Wagon multi-corps, forces & adhérence";
+    config.title = "Noire Engine — M5 : World Streaming & voie infinie";
     config.width = 1280;
     config.height = 720;
     config.simulation_hz = 120.0;

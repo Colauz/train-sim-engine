@@ -1,26 +1,24 @@
 #pragma once
 
 #include "noire/core/math.hpp"
-#include "noire/core/spline.hpp"
+#include "noire/core/track_source.hpp"
 
 namespace noire::physics {
 
-// Bogie : point de contact contraint sur la voie. Depuis le M4 il est PASSIF :
-// le Wagon lui impose une abscisse curviligne et il en déduit sa position (double)
-// et son orientation (alignée sur la tangente). Toute la dynamique (forces, masse,
-// adhérence) est portée par le Wagon.
+// Bogie passif contraint sur la voie : le Wagon lui impose un chainage x et il en
+// déduit sa position (double) + orientation (alignée sur la tangente). Fonctionne
+// sur une voie infinie (TrackSource) comme sur une voie finie.
 class Bogie {
 public:
-    // Place le bogie à l'abscisse `distance` le long de la voie.
-    void follow(const Spline& track, double distance);
+    void follow(const TrackSource& track, double x);
 
     [[nodiscard]] const WorldPosition& position() const { return position_; }
     [[nodiscard]] const glm::dvec3& tangent() const { return tangent_; }
     [[nodiscard]] const glm::mat4& orientation() const { return orientation_; }
-    [[nodiscard]] double distance() const { return distance_; }
+    [[nodiscard]] double chainage() const { return chainage_; }
 
 private:
-    double distance_ = 0.0;
+    double chainage_ = 0.0;
     WorldPosition position_{0.0, 0.0, 0.0};
     glm::dvec3 tangent_{0.0, 0.0, 1.0};
     glm::mat4 orientation_{1.0f};

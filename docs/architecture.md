@@ -73,5 +73,8 @@ descendante : le moteur ne connaît pas le jeu.
 - **M4 — Physique multi-corps** *(fait)* : `Wagon` (2 bogies + caisse), dynamique
   `F = m·a`, gravité projetée sur la pente, adhérence acier/acier (patinage si effort
   > μ·N), suspension 1D ressort/amortisseur (pilonnement + tangage). Bogie devenu passif.
-- **M5 — Streaming** : chargement/déchargement tuilé sur longue distance.
+- **M5 — World Streaming** *(fait)* : voie **infinie** analytique (`TrackSource` /
+  `ProceduralTrack`), tuiles de 2 km générées en asynchrone (`core::JobSystem` +
+  `scene::WorldStreamer`), upload GPU budgété, destruction GPU différée, GC des
+  tuiles lointaines. Origine flottante **par tuile**. Physique découplée du streaming.
 - **M6 — Réalisme** : adhérence dynamique avancée (pluie/feuilles), météo, audio Doppler.

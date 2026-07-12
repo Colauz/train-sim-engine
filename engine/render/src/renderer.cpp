@@ -61,8 +61,31 @@ MeshId Renderer::create_mesh(const std::vector<Vertex>& vertices, Topology topol
     }
     std::memcpy(mesh.vertex_buffer.mapped, vertices.data(), static_cast<std::size_t>(size));
 
-    meshes_.push_back(mesh);
-    return static_cast<MeshId>(meshes_.size() - 1);
+    const MeshId id = next_mesh_id_++;
+    meshes_.emplace(id, std::move(mesh));
+    return id;
+}
+
+void Renderer::destroy_mesh(MeshId id) {
+    const auto it = meshes_.find(id);
+    if (it == meshes_.end()) {
+        return;
+    }
+    // Destruction différée : le tampon peut encore être référencé par une frame en vol.
+    pending_deletes_.push_back(
+        PendingDelete{it->second.vertex_buffer, frame_index_ + kFramesInFlight + 1});
+    meshes_.erase(it);
+}
+
+void Renderer::process_deferred_deletes() {
+    for (auto it = pending_deletes_.begin(); it != pending_deletes_.end();) {
+        if (frame_index_ >= it->destroy_at_frame) {
+            context_.destroy_buffer(it->buffer);
+            it = pending_deletes_.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 bool Renderer::create_render_pass() {
@@ -522,10 +545,11 @@ void Renderer::record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
                             &descriptor_sets_[current_frame_], 0, nullptr);
 
     for (const DrawItem& item : items) {
-        if (item.mesh >= meshes_.size()) {
+        const auto mesh_it = meshes_.find(item.mesh);
+        if (mesh_it == meshes_.end()) {
             continue;
         }
-        const Mesh& mesh = meshes_[item.mesh];
+        const Mesh& mesh = mesh_it->second;
         VkPipeline pipeline =
             mesh.topology == Topology::Lines ? pipeline_lines_ : pipeline_triangles_;
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
@@ -544,6 +568,11 @@ void Renderer::record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
 
 void Renderer::draw_frame(const FrameUniforms& uniforms, const std::vector<DrawItem>& items) {
     VkDevice dev = context_.device();
+
+    // Compteur de frames monotone + traitement des destructions GPU différées.
+    ++frame_index_;
+    process_deferred_deletes();
+
     vkWaitForFences(dev, 1, &in_flight_[current_frame_], VK_TRUE, UINT64_MAX);
 
     std::uint32_t image_index = 0;
@@ -641,10 +670,14 @@ void Renderer::shutdown() {
     }
     vkDeviceWaitIdle(dev);
 
-    for (Mesh& mesh : meshes_) {
+    for (auto& [id, mesh] : meshes_) {
         context_.destroy_buffer(mesh.vertex_buffer);
     }
     meshes_.clear();
+    for (PendingDelete& pending : pending_deletes_) {
+        context_.destroy_buffer(pending.buffer);
+    }
+    pending_deletes_.clear();
 
     for (GpuBuffer& ubo : uniform_buffers_) {
         context_.destroy_buffer(ubo);

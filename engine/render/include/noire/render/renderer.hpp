@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <unordered_map>
 #include <vector>
 
 #include <vulkan/vulkan.h>
@@ -49,8 +50,11 @@ public:
     bool initialize(const RendererCreateInfo& info);
     void shutdown();
 
-    // Téléverse un maillage sur le GPU (via VMA) et renvoie son identifiant.
+    // Téléverse un maillage sur le GPU (via VMA) et renvoie son identifiant (0 = échec).
     MeshId create_mesh(const std::vector<Vertex>& vertices, Topology topology);
+    // Détruit un maillage. La destruction GPU est DIFFÉRÉE de kFramesInFlight frames
+    // pour ne jamais libérer un tampon encore référencé par une frame en vol.
+    void destroy_mesh(MeshId id);
 
     void draw_frame(const FrameUniforms& uniforms, const std::vector<DrawItem>& items);
     void wait_idle();
@@ -81,6 +85,7 @@ private:
                          const std::vector<DrawItem>& items);
     void recreate_swapchain();
     void destroy_depth_resources();
+    void process_deferred_deletes();
 
     static constexpr int kFramesInFlight = 2;
 
@@ -114,7 +119,19 @@ private:
     VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;
     std::vector<VkDescriptorSet> descriptor_sets_;  // kFramesInFlight
 
-    std::vector<Mesh> meshes_;
+    // Maillages indexés par identifiant (permet créations/suppressions dynamiques
+    // pour le streaming). 0 = identifiant invalide.
+    std::unordered_map<MeshId, Mesh> meshes_;
+    MeshId next_mesh_id_ = 1;
+
+    // File de destruction GPU différée : chaque tampon n'est libéré qu'une fois
+    // qu'aucune frame en vol ne peut plus le référencer.
+    struct PendingDelete {
+        GpuBuffer buffer;
+        std::uint64_t destroy_at_frame = 0;
+    };
+    std::vector<PendingDelete> pending_deletes_;
+    std::uint64_t frame_index_ = 0;
 
     std::uint32_t current_frame_ = 0;
     bool framebuffer_resized_ = false;

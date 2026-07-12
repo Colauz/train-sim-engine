@@ -6,21 +6,33 @@
 
 #include "noire/core/camera.hpp"
 #include "noire/core/engine.hpp"
+#include "noire/core/job_system.hpp"
 #include "noire/core/log.hpp"
 #include "noire/core/math.hpp"
-#include "noire/core/spline.hpp"
+#include "noire/core/procedural_track.hpp"
 #include "noire/physics/wagon.hpp"
 #include "noire/platform/window.hpp"
 #include "noire/render/renderer.hpp"
 #include "noire/render/vertex.hpp"
 #include "noire/scene/track_mesh.hpp"
+#include "noire/scene/world_streamer.hpp"
 
 namespace noire {
 
 namespace {
 
-// Origine de la voie à ~1000 km : l'origine flottante reste indispensable.
+// Origine du monde à ~1000 km : l'origine flottante reste indispensable, y compris
+// au fil des chunks (chaque tuile a sa propre origine locale).
 constexpr WorldPosition kTrackOrigin{1000000.0, 0.0, 1000000.0};
+
+physics::WagonConfig make_loco_config() {
+    physics::WagonConfig c;
+    c.mass = 80000.0;                 // 80 t (locomotive)
+    c.wheelbase = 14.0;
+    c.max_tractive_effort = 300000.0;  // 300 kN
+    c.max_brake_force = 350000.0;
+    return c;
+}
 
 std::vector<render::Vertex> make_box_vertices(const glm::vec3& base_color) {
     const glm::vec3 c[8] = {
@@ -48,20 +60,15 @@ std::vector<render::Vertex> make_box_vertices(const glm::vec3& base_color) {
 }
 
 std::vector<render::Vertex> make_grid_vertices(int half_lines, float step) {
-    const glm::vec3 gray{0.20f, 0.20f, 0.23f};
-    const glm::vec3 axis_x{0.50f, 0.20f, 0.20f};
-    const glm::vec3 axis_z{0.20f, 0.32f, 0.55f};
+    const glm::vec3 gray{0.18f, 0.18f, 0.21f};
     const float extent = static_cast<float>(half_lines) * step;
-
     std::vector<render::Vertex> vertices;
     for (int i = -half_lines; i <= half_lines; ++i) {
         const float t = static_cast<float>(i) * step;
-        const glm::vec3 col_z = (i == 0) ? axis_z : gray;
-        vertices.push_back(render::Vertex{{t, 0.0f, -extent}, col_z});
-        vertices.push_back(render::Vertex{{t, 0.0f, extent}, col_z});
-        const glm::vec3 col_x = (i == 0) ? axis_x : gray;
-        vertices.push_back(render::Vertex{{-extent, 0.0f, t}, col_x});
-        vertices.push_back(render::Vertex{{extent, 0.0f, t}, col_x});
+        vertices.push_back(render::Vertex{{t, 0.0f, -extent}, gray});
+        vertices.push_back(render::Vertex{{t, 0.0f, extent}, gray});
+        vertices.push_back(render::Vertex{{-extent, 0.0f, t}, gray});
+        vertices.push_back(render::Vertex{{extent, 0.0f, t}, gray});
     }
     return vertices;
 }
@@ -72,7 +79,20 @@ struct Application::Impl {
     explicit Impl(ApplicationConfig cfg)
         : config(std::move(cfg)),
           window(platform::WindowConfig{config.width, config.height, config.title}),
-          engine(EngineConfig{config.simulation_hz, 0}) {}
+          engine(EngineConfig{config.simulation_hz, 0}),
+          track(kTrackOrigin),
+          wagon(make_loco_config()),
+          streamer(track, jobs, make_streamer_config()) {}
+
+    static scene::StreamerConfig make_streamer_config() {
+        scene::StreamerConfig sc;
+        sc.chunk_length = 2000.0;  // tuiles de 2 km
+        sc.chunks_ahead = 2;
+        sc.chunks_behind = 1;
+        sc.max_uploads_per_update = 1;  // budget anti-pic
+        sc.rail_profile.sample_step = 2.0;
+        return sc;
+    }
 
     ApplicationConfig config;
     platform::Window window;
@@ -80,20 +100,18 @@ struct Application::Impl {
     Engine engine;
     Camera camera;
 
-    Spline track;
-    physics::Wagon wagon;
+    ProceduralTrack track;       // voie INFINIE analytique
+    JobSystem jobs;              // pool de threads (génération async)
+    physics::Wagon wagon;        // dépend de `track`
+    scene::WorldStreamer streamer;  // dépend de `track` et `jobs`
 
     render::MeshId grid_mesh = 0;
-    render::MeshId rails_mesh = 0;
-    render::MeshId bogie_mesh = 0;  // cube rouge
-    render::MeshId body_mesh = 0;   // caisse (parallélépipède)
-    WorldPosition grid_center{kTrackOrigin};
+    render::MeshId bogie_mesh = 0;
+    render::MeshId body_mesh = 0;
 
-    // Caméra orbitale autour du wagon.
     float orbit_yaw = 3.14159f;
-    float orbit_pitch = 0.32f;
-    float orbit_distance = 38.0f;
-
+    float orbit_pitch = 0.30f;
+    float orbit_distance = 42.0f;
     std::uint64_t telemetry_ticks = 0;
 
     bool initialize() {
@@ -116,30 +134,18 @@ struct Application::Impl {
             return false;
         }
 
-        // --- Voie en S avec dénivelé (une vallée) : la gravité pourra agir ---
-        track.set_control_points({
-            kTrackOrigin + WorldPosition{0.0, 0.0, 0.0},
-            kTrackOrigin + WorldPosition{100.0, -4.0, 0.0},
-            kTrackOrigin + WorldPosition{200.0, -9.0, 35.0},
-            kTrackOrigin + WorldPosition{300.0, -9.0, -35.0},
-            kTrackOrigin + WorldPosition{400.0, -4.0, 0.0},
-            kTrackOrigin + WorldPosition{500.0, 0.0, 0.0},
-        });
-        log::info("Voie générée : longueur ~{:.1f} m", track.length());
+        // Workers pour la génération asynchrone du décor.
+        jobs.start(2);
 
-        // --- Maillages générés UNE SEULE FOIS ---
-        rails_mesh = renderer.create_mesh(scene::generate_rail_mesh(track, kTrackOrigin, {}),
-                                          render::Topology::Triangles);
-        grid_mesh = renderer.create_mesh(make_grid_vertices(70, 5.0f), render::Topology::Lines);
+        grid_mesh = renderer.create_mesh(make_grid_vertices(80, 5.0f), render::Topology::Lines);
         bogie_mesh = renderer.create_mesh(make_box_vertices(glm::vec3(0.85f, 0.15f, 0.15f)),
                                           render::Topology::Triangles);
         body_mesh = renderer.create_mesh(make_box_vertices(glm::vec3(0.20f, 0.38f, 0.58f)),
                                          render::Topology::Triangles);
-        grid_center = kTrackOrigin + WorldPosition{250.0, -5.0, 0.0};
 
-        // --- Le wagon posé en haut de la première pente ---
         wagon.attach(&track);
-        wagon.place_at(25.0);
+        wagon.place_at(0.0);
+        wagon.set_speed(25.0);  // départ lancé (~90 km/h) : le streaming s'exerce d'emblée
         window.set_cursor_captured(true);
 
         EngineHooks hooks;
@@ -150,11 +156,10 @@ struct Application::Impl {
         hooks.render = [this](double /*interpolation*/) { render_frame(); };
         engine.set_hooks(std::move(hooks));
 
-        log::info("Commandes : W/Z = traction, S = frein | souris = orbite caméra, Espace/Maj = zoom | Échap = quitter");
+        log::info("Commandes : W/Z = traction, S = frein | souris = orbite, Espace/Maj = zoom | Échap = quitter");
         return engine.initialize();
     }
 
-    // Inputs (par frame) : commandes du TRAIN + caméra orbitale. Latché pour fixed_update.
     void update_input(double dt) {
         using platform::Key;
 
@@ -171,21 +176,24 @@ struct Application::Impl {
         orbit_pitch = glm::clamp(orbit_pitch - static_cast<float>(d.dy) * 0.005f, -1.30f, 1.30f);
         if (window.is_key_down(Key::Space)) orbit_distance += static_cast<float>(25.0 * dt);
         if (window.is_key_down(Key::LeftShift)) orbit_distance -= static_cast<float>(25.0 * dt);
-        orbit_distance = glm::clamp(orbit_distance, 10.0f, 150.0f);
+        orbit_distance = glm::clamp(orbit_distance, 12.0f, 200.0f);
     }
 
-    // Physique (pas fixe, déterministe).
     void update_physics(double dt) {
-        wagon.update(dt);
+        wagon.update(dt);  // dynamique déterministe (jamais bloquée par le streaming)
 
         if (++telemetry_ticks % 120 == 0) {  // ~1x/s
-            log::info("v={:5.1f} km/h | traction={:6.1f} kN | pente={:+5.1f}% | {}",
-                      wagon.speed() * 3.6, wagon.tractive_effort() / 1000.0, wagon.grade_percent(),
-                      wagon.slipping() ? "PATINE" : "adherence OK");
+            log::info("v={:6.1f} km/h | pente={:+5.1f}% | {} | chunks actifs={} | jobs={}",
+                      wagon.speed() * 3.6, wagon.grade_percent(),
+                      wagon.slipping() ? "PATINE   " : "adherent ", streamer.active_chunk_count(),
+                      jobs.in_flight());
         }
     }
 
     void render_frame() {
+        // STREAMING (thread principal) : (dé)charge les tuiles selon la position du train.
+        streamer.update(wagon.chainage(), renderer);
+
         const auto size = window.framebuffer_size();
         if (size.width == 0 || size.height == 0) {
             window.wait_events();
@@ -196,7 +204,7 @@ struct Application::Impl {
             renderer.notify_resized();
         }
 
-        // Caméra orbitale : positionnée autour du wagon, le regard fixé dessus.
+        // Caméra orbitale qui suit le wagon.
         const WorldPosition target = wagon.body_position();
         const glm::vec3 dir(std::cos(orbit_yaw) * std::cos(orbit_pitch), std::sin(orbit_pitch),
                             std::sin(orbit_yaw) * std::cos(orbit_pitch));
@@ -208,13 +216,21 @@ struct Application::Impl {
         uniforms.view = camera.view_matrix();
         uniforms.proj = camera.projection_matrix(aspect);
 
-        // ORIGINE FLOTTANTE : tous les Model = (monde double - caméra double) -> float.
         std::vector<render::DrawItem> items;
-        items.reserve(5);
-        items.push_back(render::DrawItem{camera.relative_model(grid_center), grid_mesh});
-        items.push_back(render::DrawItem{camera.relative_model(kTrackOrigin), rails_mesh});
 
-        // Les deux bogies (cubes rouges), relevés pour poser sur les rails.
+        // Sol « infini » : la grille se recentre sous le train (accrochée au pas de grille).
+        const WorldPosition wp = wagon.body_position();
+        const double gs = 5.0;
+        const WorldPosition grid_center(std::floor(wp.x / gs) * gs, wp.y - 3.0,
+                                        std::floor(wp.z / gs) * gs);
+        items.push_back(render::DrawItem{camera.relative_model(grid_center), grid_mesh});
+
+        // Rails : une entrée par tuile chargée, chacune avec SA propre origine (origine flottante).
+        for (const scene::ChunkRenderInfo& chunk : streamer.renderables()) {
+            items.push_back(render::DrawItem{camera.relative_model(chunk.origin), chunk.mesh});
+        }
+
+        // Les deux bogies (cubes rouges).
         const glm::vec3 bogie_scale(2.2f, 0.7f, 2.6f);
         for (const physics::Bogie* b : {&wagon.front_bogie(), &wagon.rear_bogie()}) {
             const WorldPosition p = b->position() + WorldPosition{0.0, 0.4, 0.0};
@@ -223,16 +239,19 @@ struct Application::Impl {
             items.push_back(render::DrawItem{model, bogie_mesh});
         }
 
-        // La caisse (grand parallélépipède) au-dessus, orientation issue des 2 bogies + suspension.
+        // La caisse (parallélépipède) au-dessus.
         const glm::mat4 body_model = camera.relative_model(wagon.body_position()) *
                                      wagon.body_orientation() *
-                                     glm::scale(glm::mat4(1.0f), glm::vec3(2.8f, 2.6f, 16.0f));
+                                     glm::scale(glm::mat4(1.0f), glm::vec3(2.8f, 2.6f, 18.0f));
         items.push_back(render::DrawItem{body_model, body_mesh});
 
         renderer.draw_frame(uniforms, items);
     }
 
     void shutdown() {
+        // IMPORTANT : arrêter les workers AVANT tout le reste. stop() draine les jobs
+        // en cours (ils écrivent dans les chunks) => plus aucun accès concurrent ensuite.
+        jobs.stop();
         renderer.wait_idle();
         renderer.shutdown();
         window.shutdown();
