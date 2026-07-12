@@ -59,7 +59,9 @@ descendante : le moteur ne connaît pas le jeu.
 ## Feuille de route (jalons)
 
 - **M0 — Fondations** *(fait)* : build CMake, `core` (log + boucle fixe), exécutable.
-- **M1 — Fenêtre & Vulkan** : `platform` (GLFW) + triangle Vulkan, RHI de base.
+- **M1 — Fenêtre & Vulkan** *(fait)* : `platform` (GLFW), `render` (Vulkan via
+  vk-bootstrap + VMA, premier triangle), `app` (orchestration PIMPL). Boucle `core`
+  rendue indépendante du graphique via des callbacks (`EngineHooks`).
 - **M2 — Monde & caméra** : origine flottante, caméra libre, terrain simple.
 - **M3 — Voie & train** : génération de rails par splines, un bogie physique.
 - **M4 — Streaming** : chargement/déchargement tuilé sur longue distance.

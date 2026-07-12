@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
+#include <utility>
 
 namespace noire {
 
@@ -8,23 +10,28 @@ namespace noire {
 // namespace pour pouvoir servir d'argument par défaut ({}) du constructeur.
 struct EngineConfig {
     double simulation_hz = 120.0;  // fréquence de la simulation (Hz)
-    std::uint32_t max_ticks = 0;   // 0 = illimité ; sinon arrêt auto (utile en démo/tests)
+    std::uint32_t max_ticks = 0;   // 0 = illimité ; sinon arrêt auto (démo/tests)
 };
 
-// Cœur du moteur : boucle principale à PAS DE TEMPS FIXE.
-//
-// La simulation (physique lourde, dynamique des bogies, réseau de voies, IA)
-// avance par incréments fixes et déterministes, découplés du framerate de rendu.
-// Le rendu, lui, interpole entre les deux derniers états simulés pour rester
-// fluide quel que soit le taux d'images. Référence : Glenn Fiedler,
-// « Fix Your Timestep! ». C'est LE pilier d'une simulation reproductible.
+// Points d'ancrage injectés par la couche supérieure (app). Le module core reste
+// ainsi TOTALEMENT indépendant de la fenêtre et du rendu : il n'orchestre que le
+// temps. C'est ce qui empêche la logique graphique de « fuiter » vers le bas.
+struct EngineHooks {
+    std::function<void()> poll_events;                 // pomper les événements OS
+    std::function<bool()> should_stop;                 // true => quitter la boucle
+    std::function<void(double dt)> fixed_update;       // un pas de simulation
+    std::function<void(double interpolation)> render;  // rendu interpolé [0,1]
+};
+
+// Boucle principale à PAS DE TEMPS FIXE (cf. Glenn Fiedler « Fix Your Timestep! »).
 class Engine {
 public:
     explicit Engine(EngineConfig config = {});
     ~Engine();
-
     Engine(const Engine&) = delete;
     Engine& operator=(const Engine&) = delete;
+
+    void set_hooks(EngineHooks hooks) { hooks_ = std::move(hooks); }
 
     bool initialize();
     void run();
@@ -34,10 +41,8 @@ public:
     [[nodiscard]] std::uint64_t tick_count() const { return tick_count_; }
 
 private:
-    void fixed_update(double dt);       // un pas de simulation
-    void render(double interpolation);  // rendu de l'état interpolé [0,1]
-
     EngineConfig config_;
+    EngineHooks hooks_;
     bool running_ = false;
     bool initialized_ = false;
     std::uint64_t tick_count_ = 0;

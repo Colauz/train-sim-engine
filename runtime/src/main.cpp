@@ -1,16 +1,13 @@
-#include <noire/core/engine.hpp>
+#include <noire/app/application.hpp>
 
+// Le runtime ne connaît NI Vulkan NI GLFW : il configure et lance l'Application.
 int main() {
-    noire::EngineConfig config;
-    config.simulation_hz = 120.0;  // pas de temps physique (120 Hz)
-    config.max_ticks = 600;        // ~5 s de simulation puis arrêt propre (démo)
+    noire::ApplicationConfig config;
+    config.title = "Noire Engine — M1 : Premier Triangle Vulkan";
+    config.width = 1280;
+    config.height = 720;
+    config.simulation_hz = 120.0;
 
-    noire::Engine engine(config);
-    if (!engine.initialize()) {
-        return 1;
-    }
-
-    engine.run();
-    engine.shutdown();
-    return 0;
+    noire::Application app{config};
+    return app.run();
 }
