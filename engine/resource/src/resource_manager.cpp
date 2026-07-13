@@ -3,6 +3,7 @@
 #include <atomic>
 #include <utility>
 
+#include "noire/audio/audio_loader.hpp"
 #include "noire/core/job_system.hpp"
 #include "noire/core/log.hpp"
 #include "noire/render/renderer.hpp"
@@ -27,6 +28,13 @@ struct ResourceManager::ModelSlot {
     std::atomic<ResourceState> state{ResourceState::Queued};
     ModelData cpu;
     std::vector<TextureHandle> textures;  // textures GPU du modèle (créées au pump)
+};
+
+struct ResourceManager::AudioSlot {
+    AudioHandle handle;
+    std::string full_path;
+    std::atomic<ResourceState> state{ResourceState::Queued};
+    std::vector<float> cpu;  // PCM décodé par le worker
 };
 
 ResourceManager::ResourceManager(render::Renderer& renderer, JobSystem& jobs,
@@ -138,6 +146,42 @@ TextureHandle ResourceManager::load_texture(const std::string& relative_path) {
     return texture;
 }
 
+AudioHandle ResourceManager::load_audio(const std::string& relative_path) {
+    const auto cached = audio_cache_.find(relative_path);
+    if (cached != audio_cache_.end()) {
+        if (AudioHandle alive = cached->second.lock()) {
+            return alive;
+        }
+    }
+
+    AudioHandle clip = std::make_shared<AudioClip>();
+    audio_cache_[relative_path] = clip;
+
+    auto slot = std::make_shared<AudioSlot>();
+    slot->handle = clip;
+    slot->full_path = paths_.resolve(relative_path);
+    loading_audio_.push_back(slot);
+
+    if (!paths_.exists(relative_path)) {
+        log::warn("Asset introuvable : '{}' — audio de synthèse (fallback M6)", relative_path);
+        slot->state.store(ResourceState::Failed, std::memory_order_relaxed);
+        return clip;
+    }
+
+    // Décodage CPU (ma_decoder) sur un worker : aucun périphérique audio requis.
+    jobs_.submit([slot] {
+        slot->state.store(ResourceState::Loading, std::memory_order_relaxed);
+        std::vector<float> pcm;
+        if (audio::decode_audio_file(slot->full_path, pcm)) {
+            slot->cpu = std::move(pcm);
+            slot->state.store(ResourceState::CpuReady, std::memory_order_release);
+        } else {
+            slot->state.store(ResourceState::Failed, std::memory_order_release);
+        }
+    });
+    return clip;
+}
+
 void ResourceManager::drain_recycler() {
     std::vector<render::MeshId> meshes;
     std::vector<render::TextureId> textures;
@@ -242,11 +286,31 @@ void ResourceManager::pump_models(int& budget) {
     }
 }
 
+void ResourceManager::pump_audio() {
+    for (auto it = loading_audio_.begin(); it != loading_audio_.end();) {
+        AudioSlot& slot = **it;
+        const ResourceState state = slot.state.load(std::memory_order_acquire);
+        if (state == ResourceState::Failed) {
+            it = loading_audio_.erase(it);  // clip vide => fallback synthé côté app
+            continue;
+        }
+        if (state == ResourceState::CpuReady) {
+            // Publication sur le thread principal (move O(1)). Aucun GPU => pas de budget.
+            slot.handle->pcm = std::move(slot.cpu);
+            slot.handle->ready = true;
+            it = loading_audio_.erase(it);
+            continue;
+        }
+        ++it;
+    }
+}
+
 void ResourceManager::pump() {
     drain_recycler();
     int budget = upload_budget_ > 0 ? upload_budget_ : 1;
     pump_textures(budget);
     pump_models(budget);
+    pump_audio();
 }
 
 }  // namespace noire::resource

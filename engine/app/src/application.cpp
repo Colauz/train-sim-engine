@@ -177,10 +177,12 @@ struct Application::Impl {
     audio::AudioEngine audio;
     audio::RailAudio rail_audio;
 
-    // Pipeline d'assets (M7 étape 4) : racine assets/ + cache/loaders asynchrones.
+    // Pipeline d'assets (M7 étapes 4-5) : racine assets/ + cache/loaders asynchrones.
     resource::AssetPaths asset_paths;
     resource::ResourceManager resources;
     resource::ModelHandle train_model;
+    resource::AudioHandle rumble_clip;
+    bool rumble_source_applied = false;
 
     render::MeshId grid_mesh = 0;
     render::MeshId bogie_mesh = 0;
@@ -250,6 +252,10 @@ struct Application::Impl {
         asset_paths = resource::AssetPaths::discover();
         resources.set_upload_budget(2);
         train_model = resources.load_model("models/BoxTextured.glb");
+
+        // M7 étape 5 : décodage ASYNCHRONE du roulement (ma_decoder sur un worker).
+        // Fallback automatique sur la synthèse M6 si le fichier est absent/illisible.
+        rumble_clip = resources.load_audio("audio/roulement.wav");
 
         wagon.attach(&track);
         wagon.place_at(0.0);
@@ -337,6 +343,16 @@ struct Application::Impl {
         // Pipeline d'assets (thread principal, 1x/frame) : injecte le CpuReady dans le
         // GPU (budget) et recycle les ressources des handles relâchés.
         resources.pump();
+
+        // M7 étape 5 : dès que le PCM du roulement est décodé, on le branche sur
+        // l'émetteur « rumble » (spatialisation + Doppler conservés). Sinon : synthé M6.
+        if (!rumble_source_applied && rumble_clip && rumble_clip->ready) {
+            if (audio.set_source(audio::AudioEngine::Emitter::Rumble, rumble_clip->pcm.data(),
+                                 rumble_clip->pcm.size())) {
+                log::info("M7 étape 5 : roulement.wav branché sur l'émetteur audio (spatialisé + Doppler)");
+            }
+            rumble_source_applied = true;  // une seule fois, même si l'audio est indisponible
+        }
 
         // Streaming (thread principal), toujours exécuté (même minimisé).
         streamer.update(wagon.chainage(), renderer);

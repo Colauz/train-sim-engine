@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <memory>
 
 #include "noire/core/math.hpp"
@@ -37,6 +38,15 @@ public:
 
     // Joint de rail : « clac » one-shot spatialisé (pool interne round-robin).
     void play_rail_joint(const WorldPosition& position, const glm::vec3& velocity, float volume);
+
+    // Émetteurs pilotables par un PCM EXTERNE (M7 étape 5). Remplace la synthèse M6
+    // d'un émetteur par le PCM fourni (mono float32 48 kHz, cf. decode_audio_file),
+    // en conservant tout le chemin de spatialisation + Doppler. Le PCM est COPIÉ
+    // (l'AudioEngine reste propriétaire de ses données). Si non appelé (ou fichier
+    // manquant côté appelant), l'émetteur garde le son de synthèse — fallback M6.
+    // Renvoie false si l'audio est indisponible ou le PCM invalide.
+    enum class Emitter { Rumble, Squeal, Joint };
+    bool set_source(Emitter emitter, const float* pcm, std::size_t frame_count);
 
 private:
     struct Impl;

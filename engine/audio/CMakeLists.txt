@@ -4,6 +4,7 @@ find_package(Threads REQUIRED)
 
 add_library(noire_audio
     src/audio_engine.cpp
+    src/audio_loader.cpp
     src/rail_audio.cpp
     src/miniaudio_impl.cpp)
 add_library(noire::audio ALIAS noire_audio)

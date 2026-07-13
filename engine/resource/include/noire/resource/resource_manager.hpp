@@ -42,8 +42,18 @@ struct Model {
     [[nodiscard]] bool empty() const { return primitives.empty(); }
 };
 
+// Clip audio décodé (CPU) : PCM mono float32 48 kHz (cf. audio::decode_audio_file).
+// `ready` passe à true quand le décodage asynchrone est publié (thread principal).
+// Aucune ressource GPU : le cycle s'arrête à CpuReady (pas d'étape Uploading).
+struct AudioClip {
+    std::vector<float> pcm;
+    bool ready = false;
+    [[nodiscard]] bool empty() const { return pcm.empty(); }
+};
+
 using ModelHandle = std::shared_ptr<Model>;
 using TextureHandle = std::shared_ptr<Texture>;
+using AudioHandle = std::shared_ptr<AudioClip>;
 
 // Gestionnaire de ressources centralisé (M7 étape 4).
 //   * load_*  : NON bloquant ; dédup par chemin via weak_ptr (une seule copie en
@@ -61,17 +71,21 @@ public:
 
     ModelHandle load_model(const std::string& relative_path);
     TextureHandle load_texture(const std::string& relative_path);
+    // Charge un fichier audio (.wav/.mp3/...) décodé en PCM sur le JobSystem. NON
+    // bloquant, dédup par chemin. Le PCM (handle->pcm) est prêt quand handle->ready.
+    AudioHandle load_audio(const std::string& relative_path);
 
     void pump();  // thread principal, 1x/frame
 
     void set_upload_budget(int uploads_per_pump) { upload_budget_ = uploads_per_pump; }
     [[nodiscard]] std::size_t in_flight() const {
-        return loading_models_.size() + loading_textures_.size();
+        return loading_models_.size() + loading_textures_.size() + loading_audio_.size();
     }
 
 private:
     struct ModelSlot;
     struct TextureSlot;
+    struct AudioSlot;
 
     // Cimetière GPU thread-safe : les deleters des handles y déposent les identifiants
     // à détruire ; pump() les draine sur le thread principal (le Renderer diffère
@@ -88,6 +102,7 @@ private:
     void drain_recycler();
     void pump_textures(int& budget);
     void pump_models(int& budget);
+    void pump_audio();  // pas de GPU : simple publication du PCM décodé
 
     render::Renderer& renderer_;
     JobSystem& jobs_;
@@ -95,8 +110,10 @@ private:
 
     std::unordered_map<std::string, std::weak_ptr<Model>> model_cache_;
     std::unordered_map<std::string, std::weak_ptr<Texture>> texture_cache_;
+    std::unordered_map<std::string, std::weak_ptr<AudioClip>> audio_cache_;
     std::vector<std::shared_ptr<ModelSlot>> loading_models_;
     std::vector<std::shared_ptr<TextureSlot>> loading_textures_;
+    std::vector<std::shared_ptr<AudioSlot>> loading_audio_;
 
     std::shared_ptr<Recycler> recycler_;
     int upload_budget_ = 2;

@@ -105,6 +105,52 @@ struct AudioEngine::Impl {
         cfg.sampleRate = kSampleRate;
         return ma_audio_buffer_init(&cfg, &buffer) == MA_SUCCESS;
     }
+
+    // Remplace la source d'un son en boucle (rumble/squeal) par un PCM externe, en
+    // conservant looping + Doppler + volume. `storage` devient propriétaire du PCM
+    // copié ; l'ancien tampon (qui le référençait) est détruit AVANT la réassignation.
+    bool rebuild_loop(ma_sound& sound, ma_audio_buffer& buffer, std::vector<float>& storage,
+                      const float* pcm, std::size_t frames) {
+        ma_sound_stop(&sound);
+        ma_sound_uninit(&sound);
+        ma_audio_buffer_uninit(&buffer);
+        storage.assign(pcm, pcm + frames);
+        if (!make_buffer(storage, buffer)) {
+            return false;
+        }
+        if (ma_sound_init_from_data_source(&engine, &buffer, 0, nullptr, &sound) != MA_SUCCESS) {
+            return false;
+        }
+        ma_sound_set_looping(&sound, MA_TRUE);
+        ma_sound_set_doppler_factor(&sound, 1.0f);
+        ma_sound_set_volume(&sound, 0.0f);  // le prochain set_rumble/set_squeal pilotera le volume
+        ma_sound_start(&sound);
+        return true;
+    }
+
+    // Idem pour le pool de « clacs » one-shot (kJointPoolSize sons partageant le PCM).
+    bool rebuild_joint(const float* pcm, std::size_t frames) {
+        for (ma_sound& s : joint_pool) {
+            ma_sound_stop(&s);
+            ma_sound_uninit(&s);
+        }
+        for (ma_audio_buffer& b : clack_bufs) {
+            ma_audio_buffer_uninit(&b);
+        }
+        clack_pcm.assign(pcm, pcm + frames);
+        for (int i = 0; i < kJointPoolSize; ++i) {
+            const std::size_t idx = static_cast<std::size_t>(i);
+            if (!make_buffer(clack_pcm, clack_bufs[idx])) {
+                return false;
+            }
+            if (ma_sound_init_from_data_source(&engine, &clack_bufs[idx], 0, nullptr,
+                                               &joint_pool[idx]) != MA_SUCCESS) {
+                return false;
+            }
+            ma_sound_set_doppler_factor(&joint_pool[idx], 1.0f);
+        }
+        return true;
+    }
 };
 
 AudioEngine::AudioEngine() = default;
@@ -240,6 +286,23 @@ void AudioEngine::play_rail_joint(const WorldPosition& position, const glm::vec3
     ma_sound_set_volume(&s, volume);
     ma_sound_seek_to_pcm_frame(&s, 0);
     ma_sound_start(&s);
+}
+
+bool AudioEngine::set_source(Emitter emitter, const float* pcm, std::size_t frame_count) {
+    if (!valid() || pcm == nullptr || frame_count == 0) {
+        return false;
+    }
+    switch (emitter) {
+        case Emitter::Rumble:
+            return impl_->rebuild_loop(impl_->rumble_sound, impl_->rumble_buf, impl_->rumble_pcm,
+                                       pcm, frame_count);
+        case Emitter::Squeal:
+            return impl_->rebuild_loop(impl_->squeal_sound, impl_->squeal_buf, impl_->squeal_pcm,
+                                       pcm, frame_count);
+        case Emitter::Joint:
+            return impl_->rebuild_joint(pcm, frame_count);
+    }
+    return false;
 }
 
 }  // namespace noire::audio

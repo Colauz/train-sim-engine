@@ -15,10 +15,11 @@ target_include_directories(noire_resource PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 
 # noire::render est PUBLIC : les en-têtes exposent render::MeshId/TextureId (Model).
-# noire::core pour la journalisation ; cgltf/stb restent des détails PRIVATE.
+# noire::core pour la journalisation ; cgltf/stb + noire::audio (décodage ma_decoder)
+# restent des détails d'implémentation PRIVATE.
 target_link_libraries(noire_resource
     PUBLIC  noire::core noire::render
-    PRIVATE cgltf stb)
+    PRIVATE cgltf stb noire::audio)
 
 # Implémentations single-header tierces : on coupe les warnings (comme vma_impl).
 foreach(_tu src/cgltf_impl.cpp src/stb_image_impl.cpp)
