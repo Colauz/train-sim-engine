@@ -33,11 +33,14 @@ struct FrameUniforms {
     glm::vec4 params;             // x = wetness (humidité 0..1), reste = réserve
 };
 
-// Un objet à dessiner : sa matrice Model (déjà relative à la caméra, en float)
-// et le maillage à utiliser.
+// Un objet à dessiner : sa matrice Model (déjà relative à la caméra, en float),
+// le maillage à utiliser et, pour les maillages indexés (MeshVertex), la texture
+// de base à appliquer. `texture == 0` => texture de secours (blanche 1x1). Ignoré
+// pour les maillages legacy (Vertex pos+couleur), dessinés par le pipeline debug.
 struct DrawItem {
     glm::mat4 model;
     MeshId mesh;
+    TextureId texture = 0;
 };
 
 // Renderer générique : il ne connaît PAS la scène. L'app crée des maillages puis
@@ -71,6 +74,16 @@ public:
     // pour ne jamais libérer un tampon encore référencé par une frame en vol.
     void destroy_mesh(MeshId id);
 
+    // Crée une texture GPU (RGBA8 SRGB) à partir de pixels CPU, téléversée de façon
+    // ASYNCHRONE (staging + TransferManager). `rgba_pixels` = width*height*4 octets.
+    // Échantillonnable seulement une fois le transfert terminé (is_texture_ready) ;
+    // en attendant, les DrawItem qui la référencent retombent sur la texture de secours.
+    TextureId create_texture(std::uint32_t width, std::uint32_t height, const void* rgba_pixels);
+    [[nodiscard]] bool is_texture_ready(TextureId id) const;
+    void destroy_texture(TextureId id);
+    // Texture blanche 1x1 de secours (toujours prête une fois l'init terminée).
+    [[nodiscard]] TextureId white_texture() const { return white_texture_; }
+
     void draw_frame(const FrameUniforms& uniforms, const std::vector<DrawItem>& items);
     void wait_idle();
     void notify_resized() { framebuffer_resized_ = true; }
@@ -88,6 +101,17 @@ private:
         bool ready = true;
     };
 
+    // Texture GPU (M7 étape 3) : image + vue + descriptor set=1 (combined image
+    // sampler). `ready` bascule à true quand le transfert (copie + transition de
+    // layout vers SHADER_READ_ONLY) est terminé ; le sampler est partagé (sampler_).
+    struct Texture {
+        VkImage image = VK_NULL_HANDLE;
+        VmaAllocation allocation = nullptr;
+        VkImageView view = VK_NULL_HANDLE;
+        VkDescriptorSet descriptor = VK_NULL_HANDLE;
+        bool ready = false;
+    };
+
     bool create_descriptor_set_layout();
     bool create_pipeline_layout();
     bool create_pipelines();
@@ -100,7 +124,20 @@ private:
     bool create_uniform_buffers();
     bool create_descriptor_sets();
 
+    // Textures / matériaux (M7 étape 3).
+    bool create_sampler();
+    bool create_texture_descriptor_layout();  // set=1 : combined image sampler (frag)
+    bool create_texture_descriptor_pool();
+    bool create_textured_pipeline_layout();    // set0 (UBO) + set1 (sampler) + push model
+    bool create_default_texture();             // texture blanche 1x1 de secours
+    VkImageView create_image_view_2d(VkImage image, VkFormat format);
+    // Texture à lier pour un DrawItem : celle demandée si prête, sinon le fallback ;
+    // nullptr si même le fallback n'est pas encore prêt (toutes premières frames).
+    [[nodiscard]] const Texture* resolve_texture(TextureId id) const;
+    void free_texture(Texture& texture);  // libère descriptor + vue + image (device idle)
+
     VkPipeline build_pipeline(Topology topology);
+    VkPipeline build_textured_pipeline();
     VkShaderModule create_shader_module(const unsigned char* code, std::size_t size);
     void record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
                          const std::vector<DrawItem>& items);
@@ -120,6 +157,17 @@ private:
     VkPipelineLayout pipeline_layout_ = VK_NULL_HANDLE;
     VkPipeline pipeline_triangles_ = VK_NULL_HANDLE;
     VkPipeline pipeline_lines_ = VK_NULL_HANDLE;
+
+    // --- Textures / matériaux (M7 étape 3) -----------------------------------
+    VkSampler sampler_ = VK_NULL_HANDLE;                          // partagé (linéaire + aniso)
+    VkDescriptorSetLayout texture_set_layout_ = VK_NULL_HANDLE;   // set=1
+    VkDescriptorPool texture_pool_ = VK_NULL_HANDLE;
+    VkPipelineLayout textured_pipeline_layout_ = VK_NULL_HANDLE;  // set0 + set1
+    VkPipeline pipeline_textured_ = VK_NULL_HANDLE;               // MeshVertex + textures
+    std::unordered_map<TextureId, Texture> textures_;
+    TextureId next_texture_id_ = 1;
+    TextureId white_texture_ = 0;
+    static constexpr std::uint32_t kMaxTextures = 128;
 
     // Profondeur (partagée) pour le test de profondeur 3D.
     VkFormat depth_format_ = VK_FORMAT_D32_SFLOAT;
@@ -153,6 +201,13 @@ private:
         std::uint64_t destroy_at_frame = 0;
     };
     std::vector<PendingDelete> pending_deletes_;
+
+    // Idem pour les textures (image + vue + descriptor set libérés en différé).
+    struct PendingTextureDelete {
+        Texture texture;
+        std::uint64_t destroy_at_frame = 0;
+    };
+    std::vector<PendingTextureDelete> pending_texture_deletes_;
     std::uint64_t frame_index_ = 0;
 
     // Couleur de fond = couleur du brouillard (mise à jour depuis les uniforms).

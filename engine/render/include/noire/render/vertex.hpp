@@ -31,4 +31,8 @@ enum class Topology {
 // Identifiant opaque d'un maillage géré par le Renderer.
 using MeshId = std::uint32_t;
 
+// Identifiant opaque d'une texture gérée par le Renderer. 0 => texture de secours
+// (blanche 1x1) : c'est aussi la valeur par défaut d'un DrawItem non texturé.
+using TextureId = std::uint32_t;
+
 }  // namespace noire::render

@@ -44,6 +44,10 @@ public:
     [[nodiscard]] VkQueue present_queue() const { return present_queue_; }
     [[nodiscard]] std::uint32_t graphics_queue_family() const { return graphics_queue_family_; }
 
+    // Anisotropie d'échantillonnage : activée seulement si le GPU la supporte.
+    [[nodiscard]] bool sampler_anisotropy() const { return sampler_anisotropy_; }
+    [[nodiscard]] float max_sampler_anisotropy() const { return max_sampler_anisotropy_; }
+
     // --- Helpers d'allocation VMA --------------------------------------------
     // `host_visible` => tampon mappé en permanence (GpuBuffer::mapped valide).
     bool create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, bool host_visible,
@@ -65,6 +69,8 @@ private:
     VkQueue graphics_queue_ = VK_NULL_HANDLE;
     VkQueue present_queue_ = VK_NULL_HANDLE;
     std::uint32_t graphics_queue_family_ = 0;
+    bool sampler_anisotropy_ = false;
+    float max_sampler_anisotropy_ = 1.0f;
 };
 
 }  // namespace noire::render

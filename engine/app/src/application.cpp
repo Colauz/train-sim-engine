@@ -60,23 +60,69 @@ std::vector<render::Vertex> make_box_vertices(const glm::vec3& base_color) {
     return vertices;
 }
 
-// Cube unité indexé (M7, étape 2) : sert à exercer create_mesh_indexed — staging,
-// copie GPU, fence pollée et bascule « prêt ». Normales/UV factices : ce maillage
-// n'est pas encore dessiné (le pipeline texturé arrive à l'étape 3). À remplacer
-// par le chargement de train.glb à l'étape 6.
+// Cube unité indexé (M7, étape 3) : 24 sommets (4 par face) avec normales et UV
+// [0,1] correctes, pour montrer le placage de texture face par face. Sert de
+// démonstrateur du pipeline texturé en attendant le chargement de train.glb (étape 6).
 void make_unit_cube(std::vector<render::MeshVertex>& vertices,
                     std::vector<std::uint32_t>& indices) {
-    const glm::vec3 p[8] = {
-        {-0.5f, -0.5f, -0.5f}, {0.5f, -0.5f, -0.5f}, {0.5f, 0.5f, -0.5f}, {-0.5f, 0.5f, -0.5f},
-        {-0.5f, -0.5f, 0.5f},  {0.5f, -0.5f, 0.5f},  {0.5f, 0.5f, 0.5f},  {-0.5f, 0.5f, 0.5f},
+    struct Face {
+        glm::vec3 normal;
+        glm::vec3 origin;  // coin (u=0, v=0)
+        glm::vec3 du;      // arête u (longueur 1)
+        glm::vec3 dv;      // arête v (longueur 1)
     };
+    const Face faces[6] = {
+        {{0.0f, 0.0f, 1.0f}, {-0.5f, -0.5f, 0.5f}, {1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}},    // +Z
+        {{0.0f, 0.0f, -1.0f}, {0.5f, -0.5f, -0.5f}, {-1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}},  // -Z
+        {{1.0f, 0.0f, 0.0f}, {0.5f, -0.5f, 0.5f}, {0.0f, 0.0f, -1.0f}, {0.0f, 1.0f, 0.0f}},    // +X
+        {{-1.0f, 0.0f, 0.0f}, {-0.5f, -0.5f, -0.5f}, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f, 0.0f}},  // -X
+        {{0.0f, 1.0f, 0.0f}, {-0.5f, 0.5f, 0.5f}, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, -1.0f}},    // +Y
+        {{0.0f, -1.0f, 0.0f}, {-0.5f, -0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f}},  // -Y
+    };
+    const glm::vec2 uv[4] = {{0.0f, 0.0f}, {1.0f, 0.0f}, {1.0f, 1.0f}, {0.0f, 1.0f}};
     vertices.clear();
-    vertices.reserve(8);
-    for (const glm::vec3& pos : p) {
-        vertices.push_back(render::MeshVertex{pos, glm::normalize(pos), glm::vec2(0.0f, 0.0f)});
+    indices.clear();
+    vertices.reserve(24);
+    indices.reserve(36);
+    std::uint32_t base = 0;
+    for (const Face& f : faces) {
+        const glm::vec3 corners[4] = {
+            f.origin, f.origin + f.du, f.origin + f.du + f.dv, f.origin + f.dv,
+        };
+        for (int i = 0; i < 4; ++i) {
+            vertices.push_back(render::MeshVertex{corners[i], f.normal, uv[i]});
+        }
+        indices.push_back(base + 0);
+        indices.push_back(base + 1);
+        indices.push_back(base + 2);
+        indices.push_back(base + 0);
+        indices.push_back(base + 2);
+        indices.push_back(base + 3);
+        base += 4;
     }
-    indices = {0, 1, 2, 0, 2, 3, 4, 6, 5, 4, 7, 6, 0, 4, 7, 0, 7, 3,
-               1, 5, 6, 1, 6, 2, 3, 7, 6, 3, 6, 2, 0, 1, 5, 0, 5, 4};
+}
+
+// Texture damier RGBA8 générée en code (démonstration du placage). Deux teintes
+// « signalisation » orangé / gris-bleu foncé.
+std::vector<unsigned char> make_checker_rgba(int size, int cells) {
+    std::vector<unsigned char> px(static_cast<std::size_t>(size) * static_cast<std::size_t>(size) *
+                                  4u);
+    const unsigned char on_rgb[3] = {235, 120, 40};
+    const unsigned char off_rgb[3] = {50, 55, 70};
+    for (int y = 0; y < size; ++y) {
+        for (int x = 0; x < size; ++x) {
+            const bool on = ((((x * cells) / size) + ((y * cells) / size)) % 2) == 0;
+            const unsigned char* c = on ? on_rgb : off_rgb;
+            const std::size_t idx = (static_cast<std::size_t>(y) * static_cast<std::size_t>(size) +
+                                     static_cast<std::size_t>(x)) *
+                                    4u;
+            px[idx + 0] = c[0];
+            px[idx + 1] = c[1];
+            px[idx + 2] = c[2];
+            px[idx + 3] = 255;
+        }
+    }
+    return px;
 }
 
 std::vector<render::Vertex> make_grid_vertices(int half_lines, float step) {
@@ -132,8 +178,11 @@ struct Application::Impl {
     render::MeshId bogie_mesh = 0;
     render::MeshId body_mesh = 0;
 
-    // Smoke-test M7 étape 2 : maillage indexé téléversé de façon asynchrone.
+    // Démonstrateur M7 étape 3 : maillage indexé + texture damier, dessiné par le
+    // pipeline texturé (cube rotatif au-dessus du train).
     render::MeshId test_indexed_mesh = 0;
+    render::TextureId cube_texture = 0;
+    double demo_time = 0.0;
     bool test_upload_reported = false;
 
     float orbit_yaw = 3.14159f;
@@ -179,11 +228,14 @@ struct Application::Impl {
         body_mesh = renderer.create_mesh(make_box_vertices(glm::vec3(0.20f, 0.38f, 0.58f)),
                                          render::Topology::Triangles);
 
-        // M7 étape 2 : téléversement GPU asynchrone d'un maillage indexé device-local.
+        // M7 étape 3 : maillage indexé device-local + texture damier procédurale,
+        // tous deux téléversés de façon asynchrone (staging + TransferManager).
         std::vector<render::MeshVertex> cube_v;
         std::vector<std::uint32_t> cube_i;
         make_unit_cube(cube_v, cube_i);
         test_indexed_mesh = renderer.create_mesh_indexed(cube_v, cube_i);
+        const std::vector<unsigned char> checker = make_checker_rgba(64, 8);
+        cube_texture = renderer.create_texture(64, 64, checker.data());
 
         wagon.attach(&track);
         wagon.place_at(0.0);
@@ -260,11 +312,11 @@ struct Application::Impl {
     }
 
     void render_frame() {
-        // Smoke-test M7 étape 2 : signale une fois que le transfert GPU asynchrone du
-        // maillage indexé est terminé (staging libéré, fence signalée, maillage prêt).
+        // Smoke-test M7 étape 3 : signale une fois que le maillage indexé ET sa texture
+        // sont prêts (transferts GPU asynchrones terminés, pipeline texturé actif).
         if (!test_upload_reported && test_indexed_mesh != 0 &&
-            renderer.is_mesh_ready(test_indexed_mesh)) {
-            log::info("M7 étape 2 : maillage indexé prêt — staging + transfert GPU asynchrone OK");
+            renderer.is_mesh_ready(test_indexed_mesh) && renderer.is_texture_ready(cube_texture)) {
+            log::info("M7 étape 3 : maillage indexé + texture prêts — pipeline texturé actif");
             test_upload_reported = true;
         }
 
@@ -348,6 +400,19 @@ struct Application::Impl {
                                      wagon.body_orientation() *
                                      glm::scale(glm::mat4(1.0f), glm::vec3(2.8f, 2.6f, 18.0f));
         items.push_back(render::DrawItem{body_model, body_mesh});
+
+        // Démonstrateur M7 étape 3 : cube texturé (damier) tournant au-dessus du train.
+        // Tombe sur la texture blanche de secours tant que `cube_texture` n'est pas prête.
+        if (test_indexed_mesh != 0) {
+            demo_time += dt_render;
+            const WorldPosition cube_pos = wagon.body_position() + WorldPosition{0.0, 7.0, 0.0};
+            const glm::mat4 cube_model =
+                camera.relative_model(cube_pos) *
+                glm::rotate(glm::mat4(1.0f), static_cast<float>(demo_time),
+                            glm::vec3(0.25f, 1.0f, 0.0f)) *
+                glm::scale(glm::mat4(1.0f), glm::vec3(3.0f));
+            items.push_back(render::DrawItem{cube_model, test_indexed_mesh, cube_texture});
+        }
 
         renderer.draw_frame(uniforms, items);
     }

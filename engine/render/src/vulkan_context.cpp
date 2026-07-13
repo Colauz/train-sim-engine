@@ -47,6 +47,16 @@ bool VulkanContext::initialize(const ContextCreateInfo& info) {
     physical_device_ = vkb_phys.physical_device;
     log::info("GPU sélectionné : {}", vkb_phys.name);
 
+    // Anisotropie « si possible » : activée uniquement si le GPU la supporte (doit
+    // précéder la construction du device, qui reprend les features de vkb_phys).
+    VkPhysicalDeviceFeatures wanted{};
+    wanted.samplerAnisotropy = VK_TRUE;
+    sampler_anisotropy_ = vkb_phys.enable_features_if_present(wanted);
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(physical_device_, &props);
+    max_sampler_anisotropy_ = props.limits.maxSamplerAnisotropy;
+    log::info("Anisotropie : {}", sampler_anisotropy_ ? "activée" : "non supportée");
+
     vkb::DeviceBuilder device_builder{vkb_phys};
     auto dev_ret = device_builder.build();
     if (!dev_ret) {

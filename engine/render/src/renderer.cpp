@@ -1,5 +1,6 @@
 #include "noire/render/renderer.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -10,6 +11,8 @@
 // En-têtes SPIR-V embarqués (générés au build : voir cmake/Shaders.cmake).
 #include "shaders/mesh.frag.spv.h"
 #include "shaders/mesh.vert.spv.h"
+#include "shaders/mesh_textured.frag.spv.h"
+#include "shaders/mesh_textured.vert.spv.h"
 
 namespace noire::render {
 
@@ -45,6 +48,20 @@ bool Renderer::initialize(const RendererCreateInfo& info) {
         !create_pipelines() || !create_depth_resources() || !create_framebuffers() ||
         !create_command_objects() || !create_sync_objects() || !create_uniform_buffers() ||
         !create_descriptor_sets()) {
+        return false;
+    }
+
+    // Textures / matériaux (M7 étape 3) : sampler partagé, layout+pool set=1, pipeline
+    // texturé, puis la texture de secours blanche 1x1.
+    if (!create_sampler() || !create_texture_descriptor_layout() ||
+        !create_texture_descriptor_pool() || !create_textured_pipeline_layout()) {
+        return false;
+    }
+    pipeline_textured_ = build_textured_pipeline();
+    if (pipeline_textured_ == VK_NULL_HANDLE) {
+        return false;
+    }
+    if (!create_default_texture()) {
         return false;
     }
 
@@ -191,6 +208,14 @@ void Renderer::process_deferred_deletes() {
             ++it;
         }
     }
+    for (auto it = pending_texture_deletes_.begin(); it != pending_texture_deletes_.end();) {
+        if (frame_index_ >= it->destroy_at_frame) {
+            free_texture(it->texture);
+            it = pending_texture_deletes_.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 bool Renderer::create_render_pass() {
@@ -261,7 +286,8 @@ bool Renderer::create_descriptor_set_layout() {
     ubo_binding.binding = 0;
     ubo_binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     ubo_binding.descriptorCount = 1;
-    ubo_binding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    // Lu par le vertex ET le fragment (météo : wetness + brouillard côté frag).
+    ubo_binding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
 
     VkDescriptorSetLayoutCreateInfo layout_info{};
     layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
@@ -611,6 +637,399 @@ bool Renderer::create_descriptor_sets() {
     return true;
 }
 
+// --- Textures / matériaux (M7 étape 3) --------------------------------------
+
+bool Renderer::create_sampler() {
+    VkSamplerCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    info.magFilter = VK_FILTER_LINEAR;
+    info.minFilter = VK_FILTER_LINEAR;
+    info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    info.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    info.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    info.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    info.minLod = 0.0f;
+    info.maxLod = 0.0f;  // pas de mipmaps pour l'instant (M8+)
+    info.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
+    if (context_.sampler_anisotropy()) {
+        info.anisotropyEnable = VK_TRUE;
+        info.maxAnisotropy = std::min(8.0f, context_.max_sampler_anisotropy());
+    } else {
+        info.anisotropyEnable = VK_FALSE;
+        info.maxAnisotropy = 1.0f;
+    }
+    if (vkCreateSampler(context_.device(), &info, nullptr, &sampler_) != VK_SUCCESS) {
+        log::error("Vulkan : création du sampler échouée");
+        return false;
+    }
+    return true;
+}
+
+bool Renderer::create_texture_descriptor_layout() {
+    VkDescriptorSetLayoutBinding binding{};
+    binding.binding = 0;
+    binding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    binding.descriptorCount = 1;
+    binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+    VkDescriptorSetLayoutCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    info.bindingCount = 1;
+    info.pBindings = &binding;
+    if (vkCreateDescriptorSetLayout(context_.device(), &info, nullptr, &texture_set_layout_) !=
+        VK_SUCCESS) {
+        log::error("Vulkan : création du descriptor set layout de texture échouée");
+        return false;
+    }
+    return true;
+}
+
+bool Renderer::create_texture_descriptor_pool() {
+    VkDescriptorPoolSize pool_size{};
+    pool_size.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    pool_size.descriptorCount = kMaxTextures;
+
+    VkDescriptorPoolCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;  // libération individuelle
+    info.poolSizeCount = 1;
+    info.pPoolSizes = &pool_size;
+    info.maxSets = kMaxTextures;
+    if (vkCreateDescriptorPool(context_.device(), &info, nullptr, &texture_pool_) != VK_SUCCESS) {
+        log::error("Vulkan : création du descriptor pool de textures échouée");
+        return false;
+    }
+    return true;
+}
+
+bool Renderer::create_textured_pipeline_layout() {
+    VkPushConstantRange push_range{};
+    push_range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    push_range.offset = 0;
+    push_range.size = sizeof(glm::mat4);
+
+    // set 0 = UBO global (identique au pipeline debug => layouts compatibles pour
+    // le set 0) ; set 1 = combined image sampler du matériau.
+    std::array<VkDescriptorSetLayout, 2> sets{descriptor_set_layout_, texture_set_layout_};
+
+    VkPipelineLayoutCreateInfo layout_info{};
+    layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    layout_info.setLayoutCount = static_cast<std::uint32_t>(sets.size());
+    layout_info.pSetLayouts = sets.data();
+    layout_info.pushConstantRangeCount = 1;
+    layout_info.pPushConstantRanges = &push_range;
+    if (vkCreatePipelineLayout(context_.device(), &layout_info, nullptr,
+                               &textured_pipeline_layout_) != VK_SUCCESS) {
+        log::error("Vulkan : création du pipeline layout texturé échouée");
+        return false;
+    }
+    return true;
+}
+
+VkPipeline Renderer::build_textured_pipeline() {
+    VkShaderModule vert = create_shader_module(mesh_textured_vert_spv, mesh_textured_vert_spv_size);
+    VkShaderModule frag = create_shader_module(mesh_textured_frag_spv, mesh_textured_frag_spv_size);
+    if (vert == VK_NULL_HANDLE || frag == VK_NULL_HANDLE) {
+        return VK_NULL_HANDLE;
+    }
+
+    VkPipelineShaderStageCreateInfo vs{};
+    vs.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    vs.stage = VK_SHADER_STAGE_VERTEX_BIT;
+    vs.module = vert;
+    vs.pName = "main";
+
+    VkPipelineShaderStageCreateInfo fs{};
+    fs.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    fs.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    fs.module = frag;
+    fs.pName = "main";
+
+    std::array<VkPipelineShaderStageCreateInfo, 2> stages{vs, fs};
+
+    // Format de sommet : position (loc 0) + normale (loc 1) + UV (loc 2).
+    VkVertexInputBindingDescription binding{};
+    binding.binding = 0;
+    binding.stride = sizeof(MeshVertex);
+    binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+
+    std::array<VkVertexInputAttributeDescription, 3> attributes{};
+    attributes[0].location = 0;
+    attributes[0].binding = 0;
+    attributes[0].format = VK_FORMAT_R32G32B32_SFLOAT;
+    attributes[0].offset = offsetof(MeshVertex, position);
+    attributes[1].location = 1;
+    attributes[1].binding = 0;
+    attributes[1].format = VK_FORMAT_R32G32B32_SFLOAT;
+    attributes[1].offset = offsetof(MeshVertex, normal);
+    attributes[2].location = 2;
+    attributes[2].binding = 0;
+    attributes[2].format = VK_FORMAT_R32G32_SFLOAT;
+    attributes[2].offset = offsetof(MeshVertex, uv);
+
+    VkPipelineVertexInputStateCreateInfo vertex_input{};
+    vertex_input.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vertex_input.vertexBindingDescriptionCount = 1;
+    vertex_input.pVertexBindingDescriptions = &binding;
+    vertex_input.vertexAttributeDescriptionCount = static_cast<std::uint32_t>(attributes.size());
+    vertex_input.pVertexAttributeDescriptions = attributes.data();
+
+    VkPipelineInputAssemblyStateCreateInfo input_asm{};
+    input_asm.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    input_asm.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkPipelineViewportStateCreateInfo viewport_state{};
+    viewport_state.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    viewport_state.viewportCount = 1;
+    viewport_state.scissorCount = 1;
+
+    VkPipelineRasterizationStateCreateInfo raster{};
+    raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    raster.polygonMode = VK_POLYGON_MODE_FILL;
+    raster.cullMode = VK_CULL_MODE_NONE;  // winding des modèles non garanti au M7 => pas de culling
+    raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    raster.lineWidth = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo multisample{};
+    multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineDepthStencilStateCreateInfo depth_stencil{};
+    depth_stencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    depth_stencil.depthTestEnable = VK_TRUE;
+    depth_stencil.depthWriteEnable = VK_TRUE;
+    depth_stencil.depthCompareOp = VK_COMPARE_OP_LESS;
+
+    VkPipelineColorBlendAttachmentState blend_attachment{};
+    blend_attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                      VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    blend_attachment.blendEnable = VK_FALSE;
+
+    VkPipelineColorBlendStateCreateInfo blend{};
+    blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    blend.attachmentCount = 1;
+    blend.pAttachments = &blend_attachment;
+
+    std::array<VkDynamicState, 2> dynamic_states{VK_DYNAMIC_STATE_VIEWPORT,
+                                                 VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamic{};
+    dynamic.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynamic.dynamicStateCount = static_cast<std::uint32_t>(dynamic_states.size());
+    dynamic.pDynamicStates = dynamic_states.data();
+
+    VkGraphicsPipelineCreateInfo pipe{};
+    pipe.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pipe.stageCount = static_cast<std::uint32_t>(stages.size());
+    pipe.pStages = stages.data();
+    pipe.pVertexInputState = &vertex_input;
+    pipe.pInputAssemblyState = &input_asm;
+    pipe.pViewportState = &viewport_state;
+    pipe.pRasterizationState = &raster;
+    pipe.pMultisampleState = &multisample;
+    pipe.pDepthStencilState = &depth_stencil;
+    pipe.pColorBlendState = &blend;
+    pipe.pDynamicState = &dynamic;
+    pipe.layout = textured_pipeline_layout_;
+    pipe.renderPass = render_pass_;
+    pipe.subpass = 0;
+
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkResult result =
+        vkCreateGraphicsPipelines(context_.device(), VK_NULL_HANDLE, 1, &pipe, nullptr, &pipeline);
+
+    vkDestroyShaderModule(context_.device(), vert, nullptr);
+    vkDestroyShaderModule(context_.device(), frag, nullptr);
+
+    if (result != VK_SUCCESS) {
+        log::error("Vulkan : création du pipeline texturé échouée");
+        return VK_NULL_HANDLE;
+    }
+    return pipeline;
+}
+
+VkImageView Renderer::create_image_view_2d(VkImage image, VkFormat format) {
+    VkImageViewCreateInfo view_info{};
+    view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view_info.image = image;
+    view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view_info.format = format;
+    view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    view_info.subresourceRange.levelCount = 1;
+    view_info.subresourceRange.layerCount = 1;
+    VkImageView view = VK_NULL_HANDLE;
+    if (vkCreateImageView(context_.device(), &view_info, nullptr, &view) != VK_SUCCESS) {
+        log::error("Vulkan : création d'une vue de texture échouée");
+        return VK_NULL_HANDLE;
+    }
+    return view;
+}
+
+bool Renderer::create_default_texture() {
+    const unsigned char white[4] = {255, 255, 255, 255};
+    white_texture_ = create_texture(1, 1, white);
+    if (white_texture_ == 0) {
+        log::error("Renderer : création de la texture de secours (blanche 1x1) échouée");
+        return false;
+    }
+    return true;
+}
+
+TextureId Renderer::create_texture(std::uint32_t width, std::uint32_t height,
+                                   const void* rgba_pixels) {
+    if (width == 0 || height == 0 || rgba_pixels == nullptr) {
+        return 0;
+    }
+
+    Texture tex;
+    const VkFormat format = VK_FORMAT_R8G8B8A8_SRGB;  // couleur de base => espace sRGB
+    if (!context_.create_image(width, height, format,
+                               VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                               tex.image, tex.allocation)) {
+        return 0;
+    }
+    tex.view = create_image_view_2d(tex.image, format);
+    if (tex.view == VK_NULL_HANDLE) {
+        context_.destroy_image(tex.image, tex.allocation);
+        return 0;
+    }
+
+    // Descriptor set=1 (combined image sampler), écrit tout de suite (le layout
+    // SHADER_READ_ONLY sera atteint par le transfert avant tout échantillonnage).
+    VkDescriptorSetAllocateInfo alloc{};
+    alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    alloc.descriptorPool = texture_pool_;
+    alloc.descriptorSetCount = 1;
+    alloc.pSetLayouts = &texture_set_layout_;
+    if (vkAllocateDescriptorSets(context_.device(), &alloc, &tex.descriptor) != VK_SUCCESS) {
+        log::error("Renderer : allocation d'un descriptor set de texture échouée (pool plein ?)");
+        vkDestroyImageView(context_.device(), tex.view, nullptr);
+        context_.destroy_image(tex.image, tex.allocation);
+        return 0;
+    }
+
+    VkDescriptorImageInfo image_info{};
+    image_info.sampler = sampler_;
+    image_info.imageView = tex.view;
+    image_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkWriteDescriptorSet write{};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = tex.descriptor;
+    write.dstBinding = 0;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write.descriptorCount = 1;
+    write.pImageInfo = &image_info;
+    vkUpdateDescriptorSets(context_.device(), 1, &write, 0, nullptr);
+
+    // Staging host-visible + téléversement asynchrone (copie + transitions de layout).
+    const VkDeviceSize size =
+        static_cast<VkDeviceSize>(width) * static_cast<VkDeviceSize>(height) * 4u;
+    GpuBuffer staging;
+    if (!context_.create_buffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, /*host_visible=*/true,
+                                staging)) {
+        log::error("Renderer : échec d'allocation du staging buffer d'une texture");
+        vkFreeDescriptorSets(context_.device(), texture_pool_, 1, &tex.descriptor);
+        vkDestroyImageView(context_.device(), tex.view, nullptr);
+        context_.destroy_image(tex.image, tex.allocation);
+        return 0;
+    }
+    std::memcpy(staging.mapped, rgba_pixels, static_cast<std::size_t>(size));
+
+    TransferManager::Transfer t = transfer_.begin();
+
+    // 1) UNDEFINED -> TRANSFER_DST_OPTIMAL
+    VkImageMemoryBarrier to_dst{};
+    to_dst.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    to_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    to_dst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_dst.image = tex.image;
+    to_dst.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    to_dst.subresourceRange.levelCount = 1;
+    to_dst.subresourceRange.layerCount = 1;
+    to_dst.srcAccessMask = 0;
+    to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(t.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                         0, nullptr, 0, nullptr, 1, &to_dst);
+
+    // 2) Copie staging -> image
+    VkBufferImageCopy region{};
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.layerCount = 1;
+    region.imageExtent = {width, height, 1u};
+    vkCmdCopyBufferToImage(t.cmd, staging.buffer, tex.image,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+    // 3) TRANSFER_DST_OPTIMAL -> SHADER_READ_ONLY_OPTIMAL (échantillonnage frag)
+    VkImageMemoryBarrier to_read = to_dst;
+    to_read.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    to_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    to_read.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(t.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                         &to_read);
+
+    transfer_.stage(t, staging);
+    const TextureId id = next_texture_id_++;
+    transfer_.on_complete(t, [this, id] {
+        const auto it = textures_.find(id);
+        if (it != textures_.end()) {
+            it->second.ready = true;
+        }
+    });
+    transfer_.submit(t);
+
+    textures_.emplace(id, tex);
+    return id;
+}
+
+bool Renderer::is_texture_ready(TextureId id) const {
+    const auto it = textures_.find(id);
+    return it != textures_.end() && it->second.ready;
+}
+
+const Renderer::Texture* Renderer::resolve_texture(TextureId id) const {
+    if (id != 0) {
+        const auto it = textures_.find(id);
+        if (it != textures_.end() && it->second.ready) {
+            return &it->second;
+        }
+    }
+    const auto fallback = textures_.find(white_texture_);
+    if (fallback != textures_.end() && fallback->second.ready) {
+        return &fallback->second;
+    }
+    return nullptr;
+}
+
+void Renderer::free_texture(Texture& texture) {
+    if (texture.descriptor != VK_NULL_HANDLE) {
+        vkFreeDescriptorSets(context_.device(), texture_pool_, 1, &texture.descriptor);
+        texture.descriptor = VK_NULL_HANDLE;
+    }
+    if (texture.view != VK_NULL_HANDLE) {
+        vkDestroyImageView(context_.device(), texture.view, nullptr);
+        texture.view = VK_NULL_HANDLE;
+    }
+    if (texture.image != VK_NULL_HANDLE) {
+        context_.destroy_image(texture.image, texture.allocation);
+        texture.image = VK_NULL_HANDLE;
+        texture.allocation = nullptr;
+    }
+}
+
+void Renderer::destroy_texture(TextureId id) {
+    const auto it = textures_.find(id);
+    if (it == textures_.end()) {
+        return;
+    }
+    // Destruction différée (l'image/descriptor peut être référencé par une frame en vol).
+    pending_texture_deletes_.push_back(
+        PendingTextureDelete{it->second, frame_index_ + kFramesInFlight + 1});
+    textures_.erase(it);
+}
+
 void Renderer::record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
                                const std::vector<DrawItem>& items) {
     VkCommandBufferBeginInfo begin{};
@@ -645,9 +1064,7 @@ void Renderer::record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
     scissor.extent = swapchain_.extent();
     vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-    // UBO caméra : lié une fois (identique pour tous les objets de la frame).
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_, 0, 1,
-                            &descriptor_sets_[current_frame_], 0, nullptr);
+    const VkDescriptorSet frame_ubo = descriptor_sets_[current_frame_];
 
     for (const DrawItem& item : items) {
         const auto mesh_it = meshes_.find(item.mesh);
@@ -658,21 +1075,34 @@ void Renderer::record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
         if (!mesh.ready) {
             continue;  // transfert GPU asynchrone pas encore terminé (chemin M7).
         }
-        // NOTE(M7) : les maillages indexés (MeshVertex) seront dessinés par le
-        // pipeline texturé à l'étape 3 ; ils ne sont pas encore soumis via DrawItem.
-        VkPipeline pipeline =
-            mesh.topology == Topology::Lines ? pipeline_lines_ : pipeline_triangles_;
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-
-        vkCmdPushConstants(cmd, pipeline_layout_, VK_SHADER_STAGE_VERTEX_BIT, 0,
-                           sizeof(glm::mat4), &item.model);
 
         VkDeviceSize offset = 0;
-        vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertex_buffer.buffer, &offset);
         if (mesh.indexed) {
+            // Modèle texturé : pipeline dédié + set 0 (UBO) + set 1 (matériau).
+            const Texture* tex = resolve_texture(item.texture);
+            if (tex == nullptr) {
+                continue;  // même la texture de secours n'est pas encore prête.
+            }
+            const std::array<VkDescriptorSet, 2> sets{frame_ubo, tex->descriptor};
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_textured_);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, textured_pipeline_layout_,
+                                    0, static_cast<std::uint32_t>(sets.size()), sets.data(), 0,
+                                    nullptr);
+            vkCmdPushConstants(cmd, textured_pipeline_layout_, VK_SHADER_STAGE_VERTEX_BIT, 0,
+                               sizeof(glm::mat4), &item.model);
+            vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertex_buffer.buffer, &offset);
             vkCmdBindIndexBuffer(cmd, mesh.index_buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
             vkCmdDrawIndexed(cmd, mesh.index_count, 1, 0, 0, 0);
         } else {
+            // Géométrie debug (grille, rails, cubes de secours) : couleur par sommet.
+            VkPipeline pipeline =
+                mesh.topology == Topology::Lines ? pipeline_lines_ : pipeline_triangles_;
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_, 0, 1,
+                                    &frame_ubo, 0, nullptr);
+            vkCmdPushConstants(cmd, pipeline_layout_, VK_SHADER_STAGE_VERTEX_BIT, 0,
+                               sizeof(glm::mat4), &item.model);
+            vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertex_buffer.buffer, &offset);
             vkCmdDraw(cmd, mesh.vertex_count, 1, 0, 0);
         }
     }
@@ -807,6 +1237,37 @@ void Renderer::shutdown() {
         context_.destroy_buffer(pending.buffer);
     }
     pending_deletes_.clear();
+
+    // Textures / matériaux (M7 étape 3) : on libère les descriptor sets tant que le
+    // pool est vivant, puis vues + images, puis pool / layout / sampler / pipeline.
+    for (auto& [id, tex] : textures_) {
+        free_texture(tex);
+    }
+    textures_.clear();
+    for (PendingTextureDelete& pending : pending_texture_deletes_) {
+        free_texture(pending.texture);
+    }
+    pending_texture_deletes_.clear();
+    if (pipeline_textured_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(dev, pipeline_textured_, nullptr);
+        pipeline_textured_ = VK_NULL_HANDLE;
+    }
+    if (textured_pipeline_layout_ != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(dev, textured_pipeline_layout_, nullptr);
+        textured_pipeline_layout_ = VK_NULL_HANDLE;
+    }
+    if (texture_pool_ != VK_NULL_HANDLE) {
+        vkDestroyDescriptorPool(dev, texture_pool_, nullptr);
+        texture_pool_ = VK_NULL_HANDLE;
+    }
+    if (texture_set_layout_ != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(dev, texture_set_layout_, nullptr);
+        texture_set_layout_ = VK_NULL_HANDLE;
+    }
+    if (sampler_ != VK_NULL_HANDLE) {
+        vkDestroySampler(dev, sampler_, nullptr);
+        sampler_ = VK_NULL_HANDLE;
+    }
 
     for (GpuBuffer& ubo : uniform_buffers_) {
         context_.destroy_buffer(ubo);
