@@ -17,6 +17,8 @@
 #include "noire/platform/window.hpp"
 #include "noire/render/renderer.hpp"
 #include "noire/render/vertex.hpp"
+#include "noire/resource/asset_paths.hpp"
+#include "noire/resource/resource_manager.hpp"
 #include "noire/scene/track_mesh.hpp"
 #include "noire/scene/world_streamer.hpp"
 
@@ -148,7 +150,8 @@ struct Application::Impl {
           engine(EngineConfig{config.simulation_hz, 0}),
           track(kTrackOrigin),
           wagon(make_loco_config()),
-          streamer(track, jobs, make_streamer_config()) {}
+          streamer(track, jobs, make_streamer_config()),
+          resources(renderer, jobs, asset_paths) {}
 
     static scene::StreamerConfig make_streamer_config() {
         scene::StreamerConfig sc;
@@ -174,12 +177,17 @@ struct Application::Impl {
     audio::AudioEngine audio;
     audio::RailAudio rail_audio;
 
+    // Pipeline d'assets (M7 étape 4) : racine assets/ + cache/loaders asynchrones.
+    resource::AssetPaths asset_paths;
+    resource::ResourceManager resources;
+    resource::ModelHandle train_model;
+
     render::MeshId grid_mesh = 0;
     render::MeshId bogie_mesh = 0;
     render::MeshId body_mesh = 0;
 
-    // Démonstrateur M7 étape 3 : maillage indexé + texture damier, dessiné par le
-    // pipeline texturé (cube rotatif au-dessus du train).
+    // Placeholder affiché pendant le chargement asynchrone du modèle (cube damier
+    // de l'étape 3) ; sert aussi de fallback si le .glb est introuvable.
     render::MeshId test_indexed_mesh = 0;
     render::TextureId cube_texture = 0;
     double demo_time = 0.0;
@@ -236,6 +244,12 @@ struct Application::Impl {
         test_indexed_mesh = renderer.create_mesh_indexed(cube_v, cube_i);
         const std::vector<unsigned char> checker = make_checker_rgba(64, 8);
         cube_texture = renderer.create_texture(64, 64, checker.data());
+
+        // M7 étape 4 : découverte du dossier assets/ + chargement ASYNCHRONE du modèle
+        // depuis le disque (cgltf sur le JobSystem). Fallback (cube placeholder) si absent.
+        asset_paths = resource::AssetPaths::discover();
+        resources.set_upload_budget(2);
+        train_model = resources.load_model("models/BoxTextured.glb");
 
         wagon.attach(&track);
         wagon.place_at(0.0);
@@ -312,13 +326,17 @@ struct Application::Impl {
     }
 
     void render_frame() {
-        // Smoke-test M7 étape 3 : signale une fois que le maillage indexé ET sa texture
-        // sont prêts (transferts GPU asynchrones terminés, pipeline texturé actif).
-        if (!test_upload_reported && test_indexed_mesh != 0 &&
-            renderer.is_mesh_ready(test_indexed_mesh) && renderer.is_texture_ready(cube_texture)) {
-            log::info("M7 étape 3 : maillage indexé + texture prêts — pipeline texturé actif");
+        // Smoke-test M7 étape 4 : signale une fois que le modèle chargé depuis le disque
+        // est entièrement téléversé (loader cgltf async -> ResourceManager -> GPU).
+        if (!test_upload_reported && train_model && train_model->ready) {
+            log::info("M7 étape 4 : modèle 'models/BoxTextured.glb' prêt — {} primitive(s) sur le GPU",
+                      train_model->primitives.size());
             test_upload_reported = true;
         }
+
+        // Pipeline d'assets (thread principal, 1x/frame) : injecte le CpuReady dans le
+        // GPU (budget) et recycle les ressources des handles relâchés.
+        resources.pump();
 
         // Streaming (thread principal), toujours exécuté (même minimisé).
         streamer.update(wagon.chainage(), renderer);
@@ -401,24 +419,30 @@ struct Application::Impl {
                                      glm::scale(glm::mat4(1.0f), glm::vec3(2.8f, 2.6f, 18.0f));
         items.push_back(render::DrawItem{body_model, body_mesh});
 
-        // Démonstrateur M7 étape 3 : cube texturé (damier) tournant au-dessus du train.
-        // Tombe sur la texture blanche de secours tant que `cube_texture` n'est pas prête.
-        if (test_indexed_mesh != 0) {
-            demo_time += dt_render;
-            const WorldPosition cube_pos = wagon.body_position() + WorldPosition{0.0, 7.0, 0.0};
-            const glm::mat4 cube_model =
-                camera.relative_model(cube_pos) *
-                glm::rotate(glm::mat4(1.0f), static_cast<float>(demo_time),
-                            glm::vec3(0.25f, 1.0f, 0.0f)) *
-                glm::scale(glm::mat4(1.0f), glm::vec3(3.0f));
-            items.push_back(render::DrawItem{cube_model, test_indexed_mesh, cube_texture});
+        // Démonstrateur M7 étape 4 : le vrai modèle chargé depuis le disque tourne
+        // au-dessus du train. Tant qu'il n'est pas prêt (chargement/upload async), on
+        // affiche le cube damier placeholder à la même place.
+        demo_time += dt_render;
+        const WorldPosition demo_pos = wagon.body_position() + WorldPosition{0.0, 7.0, 0.0};
+        const glm::mat4 demo_xform =
+            camera.relative_model(demo_pos) *
+            glm::rotate(glm::mat4(1.0f), static_cast<float>(demo_time), glm::vec3(0.25f, 1.0f, 0.0f)) *
+            glm::scale(glm::mat4(1.0f), glm::vec3(3.0f));
+        if (train_model && train_model->ready) {
+            for (const resource::Model::Primitive& prim : train_model->primitives) {
+                const render::TextureId tex = prim.texture ? prim.texture->id : 0;
+                items.push_back(render::DrawItem{demo_xform, prim.mesh, tex});
+            }
+        } else if (test_indexed_mesh != 0) {
+            items.push_back(render::DrawItem{demo_xform, test_indexed_mesh, cube_texture});
         }
 
         renderer.draw_frame(uniforms, items);
     }
 
     void shutdown() {
-        jobs.stop();      // draine les workers avant toute destruction
+        jobs.stop();          // draine les workers avant toute destruction
+        train_model.reset();  // relâche le handle ; renderer.shutdown() détruit le GPU restant
         audio.shutdown();
         renderer.wait_idle();
         renderer.shutdown();

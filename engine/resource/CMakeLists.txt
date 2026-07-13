@@ -4,6 +4,9 @@
 
 add_library(noire_resource
     src/asset_paths.cpp
+    src/image_loader.cpp
+    src/gltf_loader.cpp
+    src/resource_manager.cpp
     src/cgltf_impl.cpp
     src/stb_image_impl.cpp)
 add_library(noire::resource ALIAS noire_resource)
@@ -11,10 +14,10 @@ add_library(noire::resource ALIAS noire_resource)
 target_include_directories(noire_resource PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 
-# cgltf / stb sont des détails d'implémentation PRIVATE (masqués derrière nos
-# loaders) ; noire::core pour la journalisation.
+# noire::render est PUBLIC : les en-têtes exposent render::MeshId/TextureId (Model).
+# noire::core pour la journalisation ; cgltf/stb restent des détails PRIVATE.
 target_link_libraries(noire_resource
-    PUBLIC  noire::core
+    PUBLIC  noire::core noire::render
     PRIVATE cgltf stb)
 
 # Implémentations single-header tierces : on coupe les warnings (comme vma_impl).
