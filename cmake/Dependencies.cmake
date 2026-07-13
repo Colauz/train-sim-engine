@@ -53,13 +53,36 @@ FetchContent_Declare(miniaudio
     GIT_TAG        0.11.21
     GIT_SHALLOW    ON)
 
-FetchContent_MakeAvailable(spdlog glm glfw vk-bootstrap VulkanMemoryAllocator miniaudio)
+# --- cgltf : lecture des modèles glTF / GLB (header unique) -------------------
+FetchContent_Declare(cgltf
+    GIT_REPOSITORY https://github.com/jkuhlmann/cgltf.git
+    GIT_TAG        v1.14
+    GIT_SHALLOW    ON)
+
+# --- stb : décodage d'images PNG / JPG (stb_image, header unique) -------------
+# Pas de tag stable en amont : on suit master (comme recommandé par le projet).
+FetchContent_Declare(stb
+    GIT_REPOSITORY https://github.com/nothings/stb.git
+    GIT_TAG        master
+    GIT_SHALLOW    ON)
+
+FetchContent_MakeAvailable(spdlog glm glfw vk-bootstrap VulkanMemoryAllocator miniaudio cgltf stb)
 
 # miniaudio n'a pas de CMakeLists : on expose son include nous-mêmes (en SYSTEM
 # pour que ses warnings ne polluent pas notre build strict).
 if(NOT TARGET miniaudio)
     add_library(miniaudio INTERFACE)
     target_include_directories(miniaudio SYSTEM INTERFACE ${miniaudio_SOURCE_DIR})
+endif()
+
+# cgltf / stb : headers uniques sans CMakeLists — même traitement (include SYSTEM).
+if(NOT TARGET cgltf)
+    add_library(cgltf INTERFACE)
+    target_include_directories(cgltf SYSTEM INTERFACE ${cgltf_SOURCE_DIR})
+endif()
+if(NOT TARGET stb)
+    add_library(stb INTERFACE)
+    target_include_directories(stb SYSTEM INTERFACE ${stb_SOURCE_DIR})
 endif()
 
 # Conventions Vulkan pour glm, imposées à TOUS les consommateurs (cohérence des

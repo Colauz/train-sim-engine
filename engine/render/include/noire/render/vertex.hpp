@@ -6,10 +6,20 @@
 
 namespace noire::render {
 
-// Format de sommet unique pour le M2 : position + couleur.
+// Format de sommet du M2 : position + couleur (grille, rails procéduraux, cube de
+// secours) — dessiné par le pipeline « debug » à couleur par sommet.
 struct Vertex {
     glm::vec3 position;
     glm::vec3 color;
+};
+
+// Format de sommet des modèles chargés (M7) : position + normale + UV. Alimente le
+// chemin indexé device-local (create_mesh_indexed) et, dès l'étape 3, le pipeline
+// texturé/éclairé.
+struct MeshVertex {
+    glm::vec3 position;
+    glm::vec3 normal;
+    glm::vec2 uv;
 };
 
 // Topologie d'un maillage (abstraction de VkPrimitiveTopology côté API publique).

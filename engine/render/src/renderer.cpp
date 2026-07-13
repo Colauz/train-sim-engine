@@ -29,6 +29,11 @@ bool Renderer::initialize(const RendererCreateInfo& info) {
         return false;
     }
 
+    // Système de téléversement GPU asynchrone (staging buffers + fences pollées).
+    if (!transfer_.initialize(&context_)) {
+        return false;
+    }
+
     VkExtent2D extent = get_framebuffer_size_ ? get_framebuffer_size_() : VkExtent2D{1280, 720};
     if (extent.width == 0) extent.width = 1;
     if (extent.height == 0) extent.height = 1;
@@ -66,14 +71,114 @@ MeshId Renderer::create_mesh(const std::vector<Vertex>& vertices, Topology topol
     return id;
 }
 
+MeshId Renderer::create_mesh_indexed(const std::vector<MeshVertex>& vertices,
+                                     const std::vector<std::uint32_t>& indices) {
+    if (vertices.empty() || indices.empty()) {
+        return 0;
+    }
+
+    Mesh mesh;
+    mesh.vertex_count = static_cast<std::uint32_t>(vertices.size());
+    mesh.index_count = static_cast<std::uint32_t>(indices.size());
+    mesh.topology = Topology::Triangles;
+    mesh.indexed = true;
+    mesh.ready = false;  // dessinable seulement après complétion du transfert GPU.
+
+    const VkDeviceSize vsize = sizeof(MeshVertex) * vertices.size();
+    const VkDeviceSize isize = sizeof(std::uint32_t) * indices.size();
+
+    // Tampons DESTINATION device-local (TRANSFER_DST + VERTEX/INDEX).
+    if (!context_.create_buffer(vsize,
+                                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                /*host_visible=*/false, mesh.vertex_buffer)) {
+        log::error("Renderer : échec d'allocation du vertex buffer device-local");
+        return 0;
+    }
+    if (!context_.create_buffer(isize,
+                                VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                /*host_visible=*/false, mesh.index_buffer)) {
+        log::error("Renderer : échec d'allocation de l'index buffer device-local");
+        context_.destroy_buffer(mesh.vertex_buffer);
+        return 0;
+    }
+
+    // Staging host-visible (SOURCE) : on y recopie les données CPU.
+    GpuBuffer staging_v;
+    GpuBuffer staging_i;
+    if (!context_.create_buffer(vsize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, /*host_visible=*/true,
+                                staging_v) ||
+        !context_.create_buffer(isize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, /*host_visible=*/true,
+                                staging_i)) {
+        log::error("Renderer : échec d'allocation d'un staging buffer");
+        context_.destroy_buffer(staging_v);
+        context_.destroy_buffer(mesh.index_buffer);
+        context_.destroy_buffer(mesh.vertex_buffer);
+        return 0;
+    }
+    std::memcpy(staging_v.mapped, vertices.data(), static_cast<std::size_t>(vsize));
+    std::memcpy(staging_i.mapped, indices.data(), static_cast<std::size_t>(isize));
+
+    // Enregistrement du transfert : copies staging -> device-local + barrière vers
+    // l'étage d'assemblage des sommets. Tout est asynchrone (fence pollée).
+    TransferManager::Transfer t = transfer_.begin();
+
+    VkBufferCopy vcopy{};
+    vcopy.size = vsize;
+    vkCmdCopyBuffer(t.cmd, staging_v.buffer, mesh.vertex_buffer.buffer, 1, &vcopy);
+    VkBufferCopy icopy{};
+    icopy.size = isize;
+    vkCmdCopyBuffer(t.cmd, staging_i.buffer, mesh.index_buffer.buffer, 1, &icopy);
+
+    std::array<VkBufferMemoryBarrier, 2> barriers{};
+    barriers[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barriers[0].dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
+    barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barriers[0].buffer = mesh.vertex_buffer.buffer;
+    barriers[0].offset = 0;
+    barriers[0].size = VK_WHOLE_SIZE;
+    barriers[1] = barriers[0];
+    barriers[1].dstAccessMask = VK_ACCESS_INDEX_READ_BIT;
+    barriers[1].buffer = mesh.index_buffer.buffer;
+    vkCmdPipelineBarrier(t.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0, 0, nullptr,
+                         static_cast<std::uint32_t>(barriers.size()), barriers.data(), 0, nullptr);
+
+    // Les staging buffers seront libérés à la complétion (fence signalée).
+    transfer_.stage(t, staging_v);
+    transfer_.stage(t, staging_i);
+
+    const MeshId id = next_mesh_id_++;
+    // À la complétion : marque le maillage prêt à dessiner (sur le thread principal).
+    transfer_.on_complete(t, [this, id] {
+        const auto it = meshes_.find(id);
+        if (it != meshes_.end()) {
+            it->second.ready = true;
+        }
+    });
+    transfer_.submit(t);
+
+    meshes_.emplace(id, std::move(mesh));
+    return id;
+}
+
+bool Renderer::is_mesh_ready(MeshId id) const {
+    const auto it = meshes_.find(id);
+    return it != meshes_.end() && it->second.ready;
+}
+
 void Renderer::destroy_mesh(MeshId id) {
     const auto it = meshes_.find(id);
     if (it == meshes_.end()) {
         return;
     }
     // Destruction différée : le tampon peut encore être référencé par une frame en vol.
-    pending_deletes_.push_back(
-        PendingDelete{it->second.vertex_buffer, frame_index_ + kFramesInFlight + 1});
+    const std::uint64_t destroy_at = frame_index_ + kFramesInFlight + 1;
+    pending_deletes_.push_back(PendingDelete{it->second.vertex_buffer, destroy_at});
+    if (it->second.indexed) {
+        pending_deletes_.push_back(PendingDelete{it->second.index_buffer, destroy_at});
+    }
     meshes_.erase(it);
 }
 
@@ -550,6 +655,11 @@ void Renderer::record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
             continue;
         }
         const Mesh& mesh = mesh_it->second;
+        if (!mesh.ready) {
+            continue;  // transfert GPU asynchrone pas encore terminé (chemin M7).
+        }
+        // NOTE(M7) : les maillages indexés (MeshVertex) seront dessinés par le
+        // pipeline texturé à l'étape 3 ; ils ne sont pas encore soumis via DrawItem.
         VkPipeline pipeline =
             mesh.topology == Topology::Lines ? pipeline_lines_ : pipeline_triangles_;
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
@@ -559,7 +669,12 @@ void Renderer::record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
 
         VkDeviceSize offset = 0;
         vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertex_buffer.buffer, &offset);
-        vkCmdDraw(cmd, mesh.vertex_count, 1, 0, 0);
+        if (mesh.indexed) {
+            vkCmdBindIndexBuffer(cmd, mesh.index_buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
+            vkCmdDrawIndexed(cmd, mesh.index_count, 1, 0, 0, 0);
+        } else {
+            vkCmdDraw(cmd, mesh.vertex_count, 1, 0, 0);
+        }
     }
 
     vkCmdEndRenderPass(cmd);
@@ -572,6 +687,10 @@ void Renderer::draw_frame(const FrameUniforms& uniforms, const std::vector<DrawI
     // Compteur de frames monotone + traitement des destructions GPU différées.
     ++frame_index_;
     process_deferred_deletes();
+
+    // Récupère les téléversements asynchrones terminés (fences pollées, non bloquant) :
+    // libère les staging buffers et marque les maillages prêts à dessiner.
+    transfer_.poll();
 
     vkWaitForFences(dev, 1, &in_flight_[current_frame_], VK_TRUE, UINT64_MAX);
 
@@ -675,8 +794,15 @@ void Renderer::shutdown() {
 
     for (auto& [id, mesh] : meshes_) {
         context_.destroy_buffer(mesh.vertex_buffer);
+        if (mesh.indexed) {
+            context_.destroy_buffer(mesh.index_buffer);
+        }
     }
     meshes_.clear();
+
+    // Termine les téléversements encore en vol et libère leurs ressources (staging,
+    // fences, pool). meshes_ est déjà vidé : les callbacks de complétion sont no-op.
+    transfer_.shutdown();
     for (PendingDelete& pending : pending_deletes_) {
         context_.destroy_buffer(pending.buffer);
     }

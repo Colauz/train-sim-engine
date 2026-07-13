@@ -2,6 +2,7 @@ add_library(noire_render
     src/vulkan_context.cpp
     src/swapchain.cpp
     src/renderer.cpp
+    src/transfer_manager.cpp
     src/vma_impl.cpp)
 add_library(noire::render ALIAS noire_render)
 

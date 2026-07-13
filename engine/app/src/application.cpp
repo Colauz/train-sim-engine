@@ -60,6 +60,25 @@ std::vector<render::Vertex> make_box_vertices(const glm::vec3& base_color) {
     return vertices;
 }
 
+// Cube unité indexé (M7, étape 2) : sert à exercer create_mesh_indexed — staging,
+// copie GPU, fence pollée et bascule « prêt ». Normales/UV factices : ce maillage
+// n'est pas encore dessiné (le pipeline texturé arrive à l'étape 3). À remplacer
+// par le chargement de train.glb à l'étape 6.
+void make_unit_cube(std::vector<render::MeshVertex>& vertices,
+                    std::vector<std::uint32_t>& indices) {
+    const glm::vec3 p[8] = {
+        {-0.5f, -0.5f, -0.5f}, {0.5f, -0.5f, -0.5f}, {0.5f, 0.5f, -0.5f}, {-0.5f, 0.5f, -0.5f},
+        {-0.5f, -0.5f, 0.5f},  {0.5f, -0.5f, 0.5f},  {0.5f, 0.5f, 0.5f},  {-0.5f, 0.5f, 0.5f},
+    };
+    vertices.clear();
+    vertices.reserve(8);
+    for (const glm::vec3& pos : p) {
+        vertices.push_back(render::MeshVertex{pos, glm::normalize(pos), glm::vec2(0.0f, 0.0f)});
+    }
+    indices = {0, 1, 2, 0, 2, 3, 4, 6, 5, 4, 7, 6, 0, 4, 7, 0, 7, 3,
+               1, 5, 6, 1, 6, 2, 3, 7, 6, 3, 6, 2, 0, 1, 5, 0, 5, 4};
+}
+
 std::vector<render::Vertex> make_grid_vertices(int half_lines, float step) {
     const glm::vec3 gray{0.18f, 0.18f, 0.21f};
     const float extent = static_cast<float>(half_lines) * step;
@@ -113,6 +132,10 @@ struct Application::Impl {
     render::MeshId bogie_mesh = 0;
     render::MeshId body_mesh = 0;
 
+    // Smoke-test M7 étape 2 : maillage indexé téléversé de façon asynchrone.
+    render::MeshId test_indexed_mesh = 0;
+    bool test_upload_reported = false;
+
     float orbit_yaw = 3.14159f;
     float orbit_pitch = 0.30f;
     float orbit_distance = 42.0f;
@@ -155,6 +178,12 @@ struct Application::Impl {
                                           render::Topology::Triangles);
         body_mesh = renderer.create_mesh(make_box_vertices(glm::vec3(0.20f, 0.38f, 0.58f)),
                                          render::Topology::Triangles);
+
+        // M7 étape 2 : téléversement GPU asynchrone d'un maillage indexé device-local.
+        std::vector<render::MeshVertex> cube_v;
+        std::vector<std::uint32_t> cube_i;
+        make_unit_cube(cube_v, cube_i);
+        test_indexed_mesh = renderer.create_mesh_indexed(cube_v, cube_i);
 
         wagon.attach(&track);
         wagon.place_at(0.0);
@@ -231,6 +260,14 @@ struct Application::Impl {
     }
 
     void render_frame() {
+        // Smoke-test M7 étape 2 : signale une fois que le transfert GPU asynchrone du
+        // maillage indexé est terminé (staging libéré, fence signalée, maillage prêt).
+        if (!test_upload_reported && test_indexed_mesh != 0 &&
+            renderer.is_mesh_ready(test_indexed_mesh)) {
+            log::info("M7 étape 2 : maillage indexé prêt — staging + transfert GPU asynchrone OK");
+            test_upload_reported = true;
+        }
+
         // Streaming (thread principal), toujours exécuté (même minimisé).
         streamer.update(wagon.chainage(), renderer);
 

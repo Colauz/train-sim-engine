@@ -11,6 +11,7 @@
 #include "noire/core/math.hpp"
 #include "noire/render/gpu_buffer.hpp"
 #include "noire/render/swapchain.hpp"
+#include "noire/render/transfer_manager.hpp"
 #include "noire/render/vertex.hpp"
 #include "noire/render/vulkan_context.hpp"
 
@@ -53,7 +54,19 @@ public:
     void shutdown();
 
     // Téléverse un maillage sur le GPU (via VMA) et renvoie son identifiant (0 = échec).
+    // Chemin M2 : tampon host-visible à mapping persistant, immédiatement dessinable.
     MeshId create_mesh(const std::vector<Vertex>& vertices, Topology topology);
+
+    // Chemin M7 : maillage INDEXÉ device-local (position/normale/UV), téléversé de
+    // façon ASYNCHRONE via staging buffers (TransferManager). Renvoie immédiatement
+    // un identifiant (0 = échec), mais le maillage n'est dessiné qu'une fois le
+    // transfert GPU terminé — cf. is_mesh_ready(). Aucune attente sur la boucle.
+    MeshId create_mesh_indexed(const std::vector<MeshVertex>& vertices,
+                               const std::vector<std::uint32_t>& indices);
+    // true quand le transfert GPU d'un maillage indexé est terminé (donc dessinable).
+    // Toujours true pour les maillages du chemin M2 (create_mesh).
+    [[nodiscard]] bool is_mesh_ready(MeshId id) const;
+
     // Détruit un maillage. La destruction GPU est DIFFÉRÉE de kFramesInFlight frames
     // pour ne jamais libérer un tampon encore référencé par une frame en vol.
     void destroy_mesh(MeshId id);
@@ -65,8 +78,14 @@ public:
 private:
     struct Mesh {
         GpuBuffer vertex_buffer;
+        GpuBuffer index_buffer;  // valide si `indexed` (chemin M7)
         std::uint32_t vertex_count = 0;
+        std::uint32_t index_count = 0;
         Topology topology = Topology::Triangles;
+        bool indexed = false;
+        // false tant que le transfert GPU asynchrone n'est pas terminé (chemin M7).
+        // Les maillages host-visible (M2) sont prêts dès leur création.
+        bool ready = true;
     };
 
     bool create_descriptor_set_layout();
@@ -92,6 +111,7 @@ private:
     static constexpr int kFramesInFlight = 2;
 
     VulkanContext context_;
+    TransferManager transfer_;  // téléversements GPU asynchrones (staging + fences)
     Swapchain swapchain_;
     std::function<VkExtent2D()> get_framebuffer_size_;
 
