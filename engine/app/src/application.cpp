@@ -62,71 +62,6 @@ std::vector<render::Vertex> make_box_vertices(const glm::vec3& base_color) {
     return vertices;
 }
 
-// Cube unité indexé (M7, étape 3) : 24 sommets (4 par face) avec normales et UV
-// [0,1] correctes, pour montrer le placage de texture face par face. Sert de
-// démonstrateur du pipeline texturé en attendant le chargement de train.glb (étape 6).
-void make_unit_cube(std::vector<render::MeshVertex>& vertices,
-                    std::vector<std::uint32_t>& indices) {
-    struct Face {
-        glm::vec3 normal;
-        glm::vec3 origin;  // coin (u=0, v=0)
-        glm::vec3 du;      // arête u (longueur 1)
-        glm::vec3 dv;      // arête v (longueur 1)
-    };
-    const Face faces[6] = {
-        {{0.0f, 0.0f, 1.0f}, {-0.5f, -0.5f, 0.5f}, {1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}},    // +Z
-        {{0.0f, 0.0f, -1.0f}, {0.5f, -0.5f, -0.5f}, {-1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}},  // -Z
-        {{1.0f, 0.0f, 0.0f}, {0.5f, -0.5f, 0.5f}, {0.0f, 0.0f, -1.0f}, {0.0f, 1.0f, 0.0f}},    // +X
-        {{-1.0f, 0.0f, 0.0f}, {-0.5f, -0.5f, -0.5f}, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f, 0.0f}},  // -X
-        {{0.0f, 1.0f, 0.0f}, {-0.5f, 0.5f, 0.5f}, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, -1.0f}},    // +Y
-        {{0.0f, -1.0f, 0.0f}, {-0.5f, -0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f}},  // -Y
-    };
-    const glm::vec2 uv[4] = {{0.0f, 0.0f}, {1.0f, 0.0f}, {1.0f, 1.0f}, {0.0f, 1.0f}};
-    vertices.clear();
-    indices.clear();
-    vertices.reserve(24);
-    indices.reserve(36);
-    std::uint32_t base = 0;
-    for (const Face& f : faces) {
-        const glm::vec3 corners[4] = {
-            f.origin, f.origin + f.du, f.origin + f.du + f.dv, f.origin + f.dv,
-        };
-        for (int i = 0; i < 4; ++i) {
-            vertices.push_back(render::MeshVertex{corners[i], f.normal, uv[i]});
-        }
-        indices.push_back(base + 0);
-        indices.push_back(base + 1);
-        indices.push_back(base + 2);
-        indices.push_back(base + 0);
-        indices.push_back(base + 2);
-        indices.push_back(base + 3);
-        base += 4;
-    }
-}
-
-// Texture damier RGBA8 générée en code (démonstration du placage). Deux teintes
-// « signalisation » orangé / gris-bleu foncé.
-std::vector<unsigned char> make_checker_rgba(int size, int cells) {
-    std::vector<unsigned char> px(static_cast<std::size_t>(size) * static_cast<std::size_t>(size) *
-                                  4u);
-    const unsigned char on_rgb[3] = {235, 120, 40};
-    const unsigned char off_rgb[3] = {50, 55, 70};
-    for (int y = 0; y < size; ++y) {
-        for (int x = 0; x < size; ++x) {
-            const bool on = ((((x * cells) / size) + ((y * cells) / size)) % 2) == 0;
-            const unsigned char* c = on ? on_rgb : off_rgb;
-            const std::size_t idx = (static_cast<std::size_t>(y) * static_cast<std::size_t>(size) +
-                                     static_cast<std::size_t>(x)) *
-                                    4u;
-            px[idx + 0] = c[0];
-            px[idx + 1] = c[1];
-            px[idx + 2] = c[2];
-            px[idx + 3] = 255;
-        }
-    }
-    return px;
-}
-
 std::vector<render::Vertex> make_grid_vertices(int half_lines, float step) {
     const glm::vec3 gray{0.18f, 0.18f, 0.21f};
     const float extent = static_cast<float>(half_lines) * step;
@@ -184,16 +119,12 @@ struct Application::Impl {
     resource::AudioHandle rumble_clip;
     bool rumble_source_applied = false;
 
+    // Cubes de debug M4, dessinés uniquement en fallback / pendant le chargement.
     render::MeshId grid_mesh = 0;
     render::MeshId bogie_mesh = 0;
     render::MeshId body_mesh = 0;
 
-    // Placeholder affiché pendant le chargement asynchrone du modèle (cube damier
-    // de l'étape 3) ; sert aussi de fallback si le .glb est introuvable.
-    render::MeshId test_indexed_mesh = 0;
-    render::TextureId cube_texture = 0;
-    double demo_time = 0.0;
-    bool test_upload_reported = false;
+    bool model_ready_reported = false;
 
     float orbit_yaw = 3.14159f;
     float orbit_pitch = 0.30f;
@@ -238,23 +169,12 @@ struct Application::Impl {
         body_mesh = renderer.create_mesh(make_box_vertices(glm::vec3(0.20f, 0.38f, 0.58f)),
                                          render::Topology::Triangles);
 
-        // M7 étape 3 : maillage indexé device-local + texture damier procédurale,
-        // tous deux téléversés de façon asynchrone (staging + TransferManager).
-        std::vector<render::MeshVertex> cube_v;
-        std::vector<std::uint32_t> cube_i;
-        make_unit_cube(cube_v, cube_i);
-        test_indexed_mesh = renderer.create_mesh_indexed(cube_v, cube_i);
-        const std::vector<unsigned char> checker = make_checker_rgba(64, 8);
-        cube_texture = renderer.create_texture(64, 64, checker.data());
-
-        // M7 étape 4 : découverte du dossier assets/ + chargement ASYNCHRONE du modèle
-        // depuis le disque (cgltf sur le JobSystem). Fallback (cube placeholder) si absent.
+        // M7 : découverte du dossier assets/ puis chargement ASYNCHRONE (JobSystem) de la
+        // locomotive et du roulement. Fallbacks automatiques : cubes de debug si le .glb
+        // est absent, synthèse M6 si le .wav est absent — le moteur ne crashe jamais.
         asset_paths = resource::AssetPaths::discover();
         resources.set_upload_budget(2);
-        train_model = resources.load_model("models/BoxTextured.glb");
-
-        // M7 étape 5 : décodage ASYNCHRONE du roulement (ma_decoder sur un worker).
-        // Fallback automatique sur la synthèse M6 si le fichier est absent/illisible.
+        train_model = resources.load_model("models/train.glb");
         rumble_clip = resources.load_audio("audio/roulement.wav");
 
         wagon.attach(&track);
@@ -332,12 +252,12 @@ struct Application::Impl {
     }
 
     void render_frame() {
-        // Smoke-test M7 étape 4 : signale une fois que le modèle chargé depuis le disque
-        // est entièrement téléversé (loader cgltf async -> ResourceManager -> GPU).
-        if (!test_upload_reported && train_model && train_model->ready) {
-            log::info("M7 étape 4 : modèle 'models/BoxTextured.glb' prêt — {} primitive(s) sur le GPU",
+        // M7 finalisé : signale une fois la locomotive entièrement chargée et téléversée
+        // (cgltf async -> ResourceManager -> GPU), remplaçant les cubes de debug.
+        if (!model_ready_reported && train_model && train_model->ready) {
+            log::info("M7 : locomotive 'models/train.glb' chargée — {} primitive(s), cubes masqués",
                       train_model->primitives.size());
-            test_upload_reported = true;
+            model_ready_reported = true;
         }
 
         // Pipeline d'assets (thread principal, 1x/frame) : injecte le CpuReady dans le
@@ -420,37 +340,32 @@ struct Application::Impl {
             items.push_back(render::DrawItem{camera.relative_model(chunk.origin), chunk.mesh});
         }
 
-        // Deux bogies (cubes rouges).
-        const glm::vec3 bogie_scale(2.2f, 0.7f, 2.6f);
-        for (const physics::Bogie* b : {&wagon.front_bogie(), &wagon.rear_bogie()}) {
-            const WorldPosition p = b->position() + WorldPosition{0.0, 0.4, 0.0};
-            const glm::mat4 model = camera.relative_model(p) * b->orientation() *
-                                    glm::scale(glm::mat4(1.0f), bogie_scale);
-            items.push_back(render::DrawItem{model, bogie_mesh});
-        }
-
-        // Caisse.
-        const glm::mat4 body_model = camera.relative_model(wagon.body_position()) *
-                                     wagon.body_orientation() *
-                                     glm::scale(glm::mat4(1.0f), glm::vec3(2.8f, 2.6f, 18.0f));
-        items.push_back(render::DrawItem{body_model, body_mesh});
-
-        // Démonstrateur M7 étape 4 : le vrai modèle chargé depuis le disque tourne
-        // au-dessus du train. Tant qu'il n'est pas prêt (chargement/upload async), on
-        // affiche le cube damier placeholder à la même place.
-        demo_time += dt_render;
-        const WorldPosition demo_pos = wagon.body_position() + WorldPosition{0.0, 7.0, 0.0};
-        const glm::mat4 demo_xform =
-            camera.relative_model(demo_pos) *
-            glm::rotate(glm::mat4(1.0f), static_cast<float>(demo_time), glm::vec3(0.25f, 1.0f, 0.0f)) *
-            glm::scale(glm::mat4(1.0f), glm::vec3(3.0f));
+        // Locomotive (M7 finalisé) : dès que le modèle .glb est chargé, il remplace les
+        // cubes de debug. Il est dessiné avec le transform EXACT de la caisse — position,
+        // orientation, pitch et heave issus de la physique multi-corps (M4). Le modèle
+        // est déjà en mètres et dans le repère caisse (+Z arrière, +Y haut), donc aucun
+        // ajustement d'échelle/rotation/hauteur n'est nécessaire.
         if (train_model && train_model->ready) {
+            const glm::mat4 loco =
+                camera.relative_model(wagon.body_position()) * wagon.body_orientation();
             for (const resource::Model::Primitive& prim : train_model->primitives) {
                 const render::TextureId tex = prim.texture ? prim.texture->id : 0;
-                items.push_back(render::DrawItem{demo_xform, prim.mesh, tex});
+                items.push_back(render::DrawItem{loco, prim.mesh, tex});
             }
-        } else if (test_indexed_mesh != 0) {
-            items.push_back(render::DrawItem{demo_xform, test_indexed_mesh, cube_texture});
+        } else {
+            // Fallback / pendant le chargement : cubes de debug M4 (2 bogies + caisse),
+            // masqués définitivement une fois la locomotive prête.
+            const glm::vec3 bogie_scale(2.2f, 0.7f, 2.6f);
+            for (const physics::Bogie* b : {&wagon.front_bogie(), &wagon.rear_bogie()}) {
+                const WorldPosition p = b->position() + WorldPosition{0.0, 0.4, 0.0};
+                const glm::mat4 model = camera.relative_model(p) * b->orientation() *
+                                        glm::scale(glm::mat4(1.0f), bogie_scale);
+                items.push_back(render::DrawItem{model, bogie_mesh});
+            }
+            const glm::mat4 body_model = camera.relative_model(wagon.body_position()) *
+                                         wagon.body_orientation() *
+                                         glm::scale(glm::mat4(1.0f), glm::vec3(2.8f, 2.6f, 18.0f));
+            items.push_back(render::DrawItem{body_model, body_mesh});
         }
 
         renderer.draw_frame(uniforms, items);
