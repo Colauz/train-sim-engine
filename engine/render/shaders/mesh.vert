@@ -1,11 +1,16 @@
 #version 450
 
-// UBO global : matrices caméra + paramètres météo.
+// UBO global : matrices caméra + météo + soleil/ombres. Ce bloc est le layout
+// CANONIQUE (std140), déclaré à l'identique dans tous les shaders et miroir exact
+// de GpuFrameUniforms (renderer.cpp) : toute évolution se répercute des deux côtés.
 layout(set = 0, binding = 0) uniform GlobalUBO {
     mat4 view;
     mat4 proj;
-    vec4 fogColorDensity;  // rgb = couleur brouillard, a = densité
-    vec4 params;           // x = wetness
+    vec4 fogColorDensity;   // rgb = couleur brouillard, a = densité
+    vec4 params;            // x = wetness
+    vec4 sunDirection;      // xyz = direction VERS le soleil (normalisée)
+    mat4 lightViewProj[2];  // une matrice par cascade d'ombre (kShadowCascades)
+    vec4 cascadeSplits;     // x,y = fin de chaque cascade (distance en espace vue)
 } u;
 
 layout(push_constant) uniform PushConstants {

@@ -325,6 +325,9 @@ struct Application::Impl {
         const float fog_density = glm::mix(0.0006f, 0.010f, wetness);
         uniforms.fog_color_density = glm::vec4(fog_color, fog_density);
         uniforms.params = glm::vec4(wetness, 0.0f, 0.0f, 0.0f);
+        // Soleil : direction VERS l'astre. Une seule source de vérité — elle éclaire
+        // les modèles et cadre les cascades d'ombre.
+        uniforms.sun_direction = glm::vec4(glm::normalize(glm::vec3(-0.4f, 0.8f, 0.3f)), 0.0f);
 
         std::vector<render::DrawItem> items;
 

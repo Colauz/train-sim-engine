@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -13,6 +14,7 @@
 #include "shaders/mesh.vert.spv.h"
 #include "shaders/mesh_textured.frag.spv.h"
 #include "shaders/mesh_textured.vert.spv.h"
+#include "shaders/shadow.vert.spv.h"
 
 namespace noire::render {
 
@@ -21,6 +23,38 @@ VkPrimitiveTopology to_vk_topology(Topology topology) {
     return topology == Topology::Lines ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST
                                        : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 }
+
+// Miroir std140 du bloc GlobalUBO des shaders : c'est CE que voit le GPU. Superset
+// de FrameUniforms — le Renderer y ajoute ce qu'il calcule lui-même (le cadrage des
+// cascades d'ombre). Uniquement des vec4/mat4 => alignements std140 naturels, aucun
+// padding manuel. Toute évolution doit être répercutée dans les 4 shaders.
+struct GpuFrameUniforms {
+    glm::mat4 view;
+    glm::mat4 proj;
+    glm::vec4 fog_color_density;
+    glm::vec4 params;
+    glm::vec4 sun_direction;
+    glm::mat4 light_view_proj[kShadowCascades];
+    glm::vec4 cascade_splits;  // x,y = distance de fin de chaque cascade
+};
+static_assert(kShadowCascades <= 4, "cascade_splits (vec4) ne porte que 4 distances");
+
+// Format des shadow maps : profondeur pure 32 bits (pas de stencil).
+constexpr VkFormat kShadowFormat = VK_FORMAT_D32_SFLOAT;
+
+// Depth bias slope-scaled : pousse les casters loin de la lumière au moment de
+// l'écriture de profondeur. Le terme « slope » monte avec l'inclinaison de la face
+// vis-à-vis du soleil, là où l'acné apparaît en premier (surfaces rasantes).
+constexpr float kDepthBiasConstant = 1.25f;
+constexpr float kDepthBiasSlope = 1.75f;
+
+// Marge (m) ajoutée devant chaque cascade le long de l'axe du soleil : capte les
+// casters situés HORS de la tranche de frustum mais qui projettent dedans.
+constexpr float kShadowCasterMargin = 60.0f;
+
+// Répartition des cascades : 1 = purement logarithmique (précision au plus près),
+// 0 = uniforme. 0.7 = compromis classique.
+constexpr float kCascadeSplitLambda = 0.7f;
 }  // namespace
 
 Renderer::~Renderer() { shutdown(); }
@@ -48,6 +82,14 @@ bool Renderer::initialize(const RendererCreateInfo& info) {
         !create_pipelines() || !create_depth_resources() || !create_framebuffers() ||
         !create_command_objects() || !create_sync_objects() || !create_uniform_buffers() ||
         !create_descriptor_sets()) {
+        return false;
+    }
+
+    // Ombres du soleil (M8 étape 1) : passe depth-only + cascades. Leur taille est
+    // fixe (kShadowMapSize) => indépendantes de la swapchain, donc créées une seule
+    // fois et jamais recréées au redimensionnement.
+    if (!create_shadow_render_pass() || !create_shadow_resources() ||
+        !create_shadow_pipeline_layout() || !create_shadow_pipelines()) {
         return false;
     }
 
@@ -582,7 +624,7 @@ bool Renderer::create_present_semaphores() {
 bool Renderer::create_uniform_buffers() {
     uniform_buffers_.resize(kFramesInFlight);
     for (int i = 0; i < kFramesInFlight; ++i) {
-        if (!context_.create_buffer(sizeof(FrameUniforms), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+        if (!context_.create_buffer(sizeof(GpuFrameUniforms), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
                                     /*host_visible=*/true, uniform_buffers_[static_cast<std::size_t>(i)])) {
             return false;
         }
@@ -623,7 +665,7 @@ bool Renderer::create_descriptor_sets() {
         VkDescriptorBufferInfo buffer_info{};
         buffer_info.buffer = uniform_buffers_[static_cast<std::size_t>(i)].buffer;
         buffer_info.offset = 0;
-        buffer_info.range = sizeof(FrameUniforms);
+        buffer_info.range = sizeof(GpuFrameUniforms);
 
         VkWriteDescriptorSet write{};
         write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -635,6 +677,419 @@ bool Renderer::create_descriptor_sets() {
         vkUpdateDescriptorSets(context_.device(), 1, &write, 0, nullptr);
     }
     return true;
+}
+
+// --- Ombres du soleil (M8 étape 1) ------------------------------------------
+
+bool Renderer::create_shadow_render_pass() {
+    // Une seule pièce jointe : la profondeur, qu'on CONSERVE (storeOp STORE) puisque
+    // la passe principale l'échantillonnera. Chaque frame repart d'un clear, donc
+    // initialLayout = UNDEFINED (on ne relit jamais l'ancien contenu).
+    VkAttachmentDescription depth{};
+    depth.format = kShadowFormat;
+    depth.samples = VK_SAMPLE_COUNT_1_BIT;
+    depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    depth.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    depth.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depth.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    depth.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    VkAttachmentReference depth_ref{};
+    depth_ref.attachment = 0;
+    depth_ref.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+    // Passe depth-only : AUCUNE pièce jointe de couleur.
+    VkSubpassDescription subpass{};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 0;
+    subpass.pDepthStencilAttachment = &depth_ref;
+
+    // Deux dépendances externes encadrent l'usage de la carte :
+    //   [0] l'écriture de profondeur attend la lecture frag de la frame précédente ;
+    //   [1] la lecture frag (passe principale) attend la fin de l'écriture.
+    // Pas de BY_REGION : l'échantillonnage d'une shadow map lit des texels arbitraires,
+    // sans correspondance avec la région du fragment lecteur.
+    std::array<VkSubpassDependency, 2> deps{};
+    deps[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+    deps[0].dstSubpass = 0;
+    deps[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    deps[0].dstStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    deps[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    deps[0].dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    deps[1].srcSubpass = 0;
+    deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+    deps[1].srcStageMask = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    deps[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    deps[1].srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    deps[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+    VkRenderPassCreateInfo rp{};
+    rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    rp.attachmentCount = 1;
+    rp.pAttachments = &depth;
+    rp.subpassCount = 1;
+    rp.pSubpasses = &subpass;
+    rp.dependencyCount = static_cast<std::uint32_t>(deps.size());
+    rp.pDependencies = deps.data();
+
+    if (vkCreateRenderPass(context_.device(), &rp, nullptr, &shadow_render_pass_) != VK_SUCCESS) {
+        log::error("Vulkan : création de la render pass d'ombre échouée");
+        return false;
+    }
+    return true;
+}
+
+bool Renderer::create_shadow_resources() {
+    for (ShadowCascade& cascade : shadow_cascades_) {
+        // SAMPLED dès maintenant : la passe principale échantillonnera ces cartes
+        // (étape 2) sans qu'il faille recréer les images.
+        if (!context_.create_image(kShadowMapSize, kShadowMapSize, kShadowFormat,
+                                   VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                                       VK_IMAGE_USAGE_SAMPLED_BIT,
+                                   cascade.image, cascade.allocation)) {
+            log::error("Vulkan : allocation d'une shadow map échouée");
+            return false;
+        }
+
+        VkImageViewCreateInfo view_info{};
+        view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        view_info.image = cascade.image;
+        view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        view_info.format = kShadowFormat;
+        view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        view_info.subresourceRange.levelCount = 1;
+        view_info.subresourceRange.layerCount = 1;
+        if (vkCreateImageView(context_.device(), &view_info, nullptr, &cascade.view) != VK_SUCCESS) {
+            log::error("Vulkan : création de la vue d'une shadow map échouée");
+            return false;
+        }
+
+        VkFramebufferCreateInfo fb{};
+        fb.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        fb.renderPass = shadow_render_pass_;
+        fb.attachmentCount = 1;
+        fb.pAttachments = &cascade.view;
+        fb.width = kShadowMapSize;
+        fb.height = kShadowMapSize;
+        fb.layers = 1;
+        if (vkCreateFramebuffer(context_.device(), &fb, nullptr, &cascade.framebuffer) !=
+            VK_SUCCESS) {
+            log::error("Vulkan : création du framebuffer d'une shadow map échouée");
+            return false;
+        }
+    }
+    return true;
+}
+
+bool Renderer::create_shadow_pipeline_layout() {
+    // Aucun descriptor set : la seule donnée nécessaire est lightViewProj * model,
+    // poussée par objet. Pas d'UBO => la passe d'ombre ne dépend d'aucune frame en vol.
+    VkPushConstantRange push_range{};
+    push_range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    push_range.offset = 0;
+    push_range.size = sizeof(glm::mat4);
+
+    VkPipelineLayoutCreateInfo layout_info{};
+    layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    layout_info.setLayoutCount = 0;
+    layout_info.pushConstantRangeCount = 1;
+    layout_info.pPushConstantRanges = &push_range;
+
+    if (vkCreatePipelineLayout(context_.device(), &layout_info, nullptr,
+                               &shadow_pipeline_layout_) != VK_SUCCESS) {
+        log::error("Vulkan : création du pipeline layout d'ombre échouée");
+        return false;
+    }
+    return true;
+}
+
+VkPipeline Renderer::build_shadow_pipeline(std::uint32_t vertex_stride) {
+    VkShaderModule vert = create_shader_module(shadow_vert_spv, shadow_vert_spv_size);
+    if (vert == VK_NULL_HANDLE) {
+        return VK_NULL_HANDLE;
+    }
+
+    // Un seul étage : pas de fragment shader, seule la profondeur nous intéresse.
+    VkPipelineShaderStageCreateInfo vs{};
+    vs.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    vs.stage = VK_SHADER_STAGE_VERTEX_BIT;
+    vs.module = vert;
+    vs.pName = "main";
+
+    // Seule la position est lue (offset 0 dans Vertex comme dans MeshVertex) ; le
+    // reste du sommet est simplement ignoré, d'où le stride en paramètre.
+    VkVertexInputBindingDescription binding{};
+    binding.binding = 0;
+    binding.stride = vertex_stride;
+    binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+
+    VkVertexInputAttributeDescription attribute{};
+    attribute.location = 0;
+    attribute.binding = 0;
+    attribute.format = VK_FORMAT_R32G32B32_SFLOAT;
+    attribute.offset = 0;
+
+    VkPipelineVertexInputStateCreateInfo vertex_input{};
+    vertex_input.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vertex_input.vertexBindingDescriptionCount = 1;
+    vertex_input.pVertexBindingDescriptions = &binding;
+    vertex_input.vertexAttributeDescriptionCount = 1;
+    vertex_input.pVertexAttributeDescriptions = &attribute;
+
+    VkPipelineInputAssemblyStateCreateInfo input_asm{};
+    input_asm.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    input_asm.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkPipelineViewportStateCreateInfo viewport_state{};
+    viewport_state.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    viewport_state.viewportCount = 1;
+    viewport_state.scissorCount = 1;
+
+    VkPipelineRasterizationStateCreateInfo raster{};
+    raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    raster.polygonMode = VK_POLYGON_MODE_FILL;
+    raster.cullMode = VK_CULL_MODE_NONE;  // winding des modèles non garanti (cf. M7)
+    raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    raster.lineWidth = 1.0f;
+    raster.depthBiasEnable = VK_TRUE;  // anti-acné, dès maintenant (cf. constantes)
+    raster.depthBiasConstantFactor = kDepthBiasConstant;
+    raster.depthBiasSlopeFactor = kDepthBiasSlope;
+    raster.depthBiasClamp = 0.0f;
+
+    VkPipelineMultisampleStateCreateInfo multisample{};
+    multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineDepthStencilStateCreateInfo depth_stencil{};
+    depth_stencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    depth_stencil.depthTestEnable = VK_TRUE;
+    depth_stencil.depthWriteEnable = VK_TRUE;
+    depth_stencil.depthCompareOp = VK_COMPARE_OP_LESS;
+
+    // Aucune pièce jointe de couleur dans le subpass => aucun attachment de blend.
+    VkPipelineColorBlendStateCreateInfo blend{};
+    blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    blend.attachmentCount = 0;
+
+    std::array<VkDynamicState, 2> dynamic_states{VK_DYNAMIC_STATE_VIEWPORT,
+                                                 VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamic{};
+    dynamic.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynamic.dynamicStateCount = static_cast<std::uint32_t>(dynamic_states.size());
+    dynamic.pDynamicStates = dynamic_states.data();
+
+    VkGraphicsPipelineCreateInfo pipe{};
+    pipe.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pipe.stageCount = 1;
+    pipe.pStages = &vs;
+    pipe.pVertexInputState = &vertex_input;
+    pipe.pInputAssemblyState = &input_asm;
+    pipe.pViewportState = &viewport_state;
+    pipe.pRasterizationState = &raster;
+    pipe.pMultisampleState = &multisample;
+    pipe.pDepthStencilState = &depth_stencil;
+    pipe.pColorBlendState = &blend;
+    pipe.pDynamicState = &dynamic;
+    pipe.layout = shadow_pipeline_layout_;
+    pipe.renderPass = shadow_render_pass_;
+    pipe.subpass = 0;
+
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    const VkResult result =
+        vkCreateGraphicsPipelines(context_.device(), VK_NULL_HANDLE, 1, &pipe, nullptr, &pipeline);
+
+    vkDestroyShaderModule(context_.device(), vert, nullptr);
+
+    if (result != VK_SUCCESS) {
+        log::error("Vulkan : création du pipeline d'ombre échouée");
+        return VK_NULL_HANDLE;
+    }
+    return pipeline;
+}
+
+bool Renderer::create_shadow_pipelines() {
+    shadow_pipeline_mesh_ = build_shadow_pipeline(sizeof(MeshVertex));
+    shadow_pipeline_legacy_ = build_shadow_pipeline(sizeof(Vertex));
+    return shadow_pipeline_mesh_ != VK_NULL_HANDLE && shadow_pipeline_legacy_ != VK_NULL_HANDLE;
+}
+
+void Renderer::update_shadow_cascades(const FrameUniforms& uniforms) {
+    // Direction VERS le soleil. L'app la fournit ; on se protège d'un vecteur nul.
+    glm::vec3 to_sun(uniforms.sun_direction);
+    if (glm::dot(to_sun, to_sun) < 1e-6f) {
+        to_sun = glm::vec3(0.0f, 1.0f, 0.0f);
+    }
+    to_sun = glm::normalize(to_sun);
+
+    // near/far de la projection perspective (profondeur 0..1) :
+    //   proj[2][2] = f/(n-f) et proj[3][2] = f*n/(n-f)
+    //   => n = proj[3][2] / proj[2][2] et f = proj[3][2] / (proj[2][2] + 1)
+    // (l'inversion de Y côté Vulkan ne touche pas ces deux termes)
+    const float p22 = uniforms.proj[2][2];
+    const float p32 = uniforms.proj[3][2];
+    const float near_plane = p32 / p22;
+    const float far_plane = p32 / (p22 + 1.0f);
+    const float shadow_far = std::min(kShadowDistance, far_plane);
+    const float depth_range = far_plane - near_plane;
+
+    // Coins du frustum caméra dans l'ESPACE FLOTTANT : la vue ne portant aucune
+    // translation, la caméra est à l'origine et tout ce cadrage reste en float
+    // proche de zéro — c'est exactement ce qui rend les ombres compatibles avec
+    // l'origine flottante. NDC Vulkan : x,y ∈ [-1,1], z ∈ [0,1].
+    const glm::mat4 inv_view_proj = glm::inverse(uniforms.proj * uniforms.view);
+    std::array<glm::vec3, 8> corners{};  // [0..3] = plan proche, [4..7] = plan lointain
+    std::size_t index = 0;
+    for (int z = 0; z <= 1; ++z) {
+        for (int y = -1; y <= 1; y += 2) {
+            for (int x = -1; x <= 1; x += 2) {
+                const glm::vec4 p =
+                    inv_view_proj * glm::vec4(static_cast<float>(x), static_cast<float>(y),
+                                              static_cast<float>(z), 1.0f);
+                corners[index++] = glm::vec3(p) / p.w;
+            }
+        }
+    }
+
+    // Le soleil est directionnel : sa « vue » est une pure ROTATION (pas d'origine).
+    // La garder indépendante du centre de la cascade est ce qui rend le snap au texel
+    // possible plus bas.
+    const glm::vec3 up =
+        std::abs(to_sun.y) > 0.99f ? glm::vec3(0.0f, 0.0f, 1.0f) : glm::vec3(0.0f, 1.0f, 0.0f);
+    const glm::mat4 light_rotation = glm::lookAt(glm::vec3(0.0f), -to_sun, up);
+
+    float slice_near = near_plane;
+    for (std::uint32_t i = 0; i < kShadowCascades; ++i) {
+        // Découpe pratique : mélange log/uniforme (lambda).
+        const float ratio = static_cast<float>(i + 1) / static_cast<float>(kShadowCascades);
+        const float log_split = near_plane * std::pow(shadow_far / near_plane, ratio);
+        const float uniform_split = near_plane + (shadow_far - near_plane) * ratio;
+        const float slice_far =
+            kCascadeSplitLambda * log_split + (1.0f - kCascadeSplitLambda) * uniform_split;
+
+        // Coins de la tranche : la position le long d'une arête du frustum est
+        // LINÉAIRE en profondeur de vue, d'où une simple interpolation proche->lointain.
+        const float t_near = (slice_near - near_plane) / depth_range;
+        const float t_far = (slice_far - near_plane) / depth_range;
+        std::array<glm::vec3, 8> slice{};
+        for (std::size_t k = 0; k < 4; ++k) {
+            const glm::vec3 edge = corners[k + 4] - corners[k];
+            slice[k] = corners[k] + edge * t_near;
+            slice[k + 4] = corners[k] + edge * t_far;
+        }
+
+        // Sphère englobante de la tranche : son rayon ne dépend QUE de la forme de la
+        // tranche (fov/aspect/splits), pas de l'orientation caméra => volume d'ombre de
+        // taille constante, donc pas de pompage de résolution quand on tourne la tête.
+        glm::vec3 center(0.0f);
+        for (const glm::vec3& corner : slice) {
+            center += corner;
+        }
+        center /= static_cast<float>(slice.size());
+        float radius = 0.0f;
+        for (const glm::vec3& corner : slice) {
+            radius = std::max(radius, glm::length(corner - center));
+        }
+        radius = std::ceil(radius * 16.0f) / 16.0f;  // absorbe le bruit flottant
+
+        // Snap du centre sur la grille de texels de la carte, en espace lumière :
+        // sans ça, un déplacement sub-texel fait grouiller le bord des ombres.
+        glm::vec3 center_light(light_rotation * glm::vec4(center, 1.0f));
+        const float units_per_texel = (2.0f * radius) / static_cast<float>(kShadowMapSize);
+        center_light.x = std::floor(center_light.x / units_per_texel) * units_per_texel;
+        center_light.y = std::floor(center_light.y / units_per_texel) * units_per_texel;
+
+        // Ortho cadrée sur la sphère. La lumière regarde vers -Z : la profondeur croît
+        // quand z décroît, d'où l'inversion de signe. kShadowCasterMargin recule le plan
+        // proche pour attraper les casters situés au-dessus du volume.
+        const float z_near = -(center_light.z + radius) - kShadowCasterMargin;
+        const float z_far = -(center_light.z - radius);
+        const glm::mat4 light_projection =
+            glm::ortho(center_light.x - radius, center_light.x + radius,
+                       center_light.y - radius, center_light.y + radius, z_near, z_far);
+
+        shadow_cascades_[i].light_view_proj = light_projection * light_rotation;
+        shadow_cascades_[i].split_depth = slice_far;
+        slice_near = slice_far;
+    }
+}
+
+void Renderer::record_shadow_pass(VkCommandBuffer cmd, const std::vector<DrawItem>& items) {
+    VkClearValue clear{};
+    clear.depthStencil = {1.0f, 0};
+
+    // Viewport/scissor dynamiques (comme les autres pipelines) : ici toujours la
+    // taille fixe de la carte.
+    VkViewport viewport{};
+    viewport.width = static_cast<float>(kShadowMapSize);
+    viewport.height = static_cast<float>(kShadowMapSize);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+    VkRect2D scissor{};
+    scissor.extent = {kShadowMapSize, kShadowMapSize};
+
+    for (const ShadowCascade& cascade : shadow_cascades_) {
+        VkRenderPassBeginInfo rp{};
+        rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        rp.renderPass = shadow_render_pass_;
+        rp.framebuffer = cascade.framebuffer;
+        rp.renderArea.offset = {0, 0};
+        rp.renderArea.extent = {kShadowMapSize, kShadowMapSize};
+        rp.clearValueCount = 1;
+        rp.pClearValues = &clear;
+        vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
+
+        vkCmdSetViewport(cmd, 0, 1, &viewport);
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+        for (const DrawItem& item : items) {
+            const auto mesh_it = meshes_.find(item.mesh);
+            if (mesh_it == meshes_.end()) {
+                continue;
+            }
+            const Mesh& mesh = mesh_it->second;
+            if (!mesh.ready || mesh.topology == Topology::Lines) {
+                continue;  // transfert en cours, ou géométrie filaire (ne porte pas d'ombre)
+            }
+
+            // model est déjà relatif à la caméra, et lightViewProj est cadrée dans ce
+            // même espace : le produit reste petit et précis.
+            const glm::mat4 light_mvp = cascade.light_view_proj * item.model;
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                              mesh.indexed ? shadow_pipeline_mesh_ : shadow_pipeline_legacy_);
+            vkCmdPushConstants(cmd, shadow_pipeline_layout_, VK_SHADER_STAGE_VERTEX_BIT, 0,
+                               sizeof(glm::mat4), &light_mvp);
+            VkDeviceSize offset = 0;
+            vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertex_buffer.buffer, &offset);
+            if (mesh.indexed) {
+                vkCmdBindIndexBuffer(cmd, mesh.index_buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
+                vkCmdDrawIndexed(cmd, mesh.index_count, 1, 0, 0, 0);
+            } else {
+                vkCmdDraw(cmd, mesh.vertex_count, 1, 0, 0);
+            }
+        }
+
+        vkCmdEndRenderPass(cmd);
+    }
+}
+
+void Renderer::destroy_shadow_resources() {
+    VkDevice dev = context_.device();
+    for (ShadowCascade& cascade : shadow_cascades_) {
+        if (cascade.framebuffer != VK_NULL_HANDLE) {
+            vkDestroyFramebuffer(dev, cascade.framebuffer, nullptr);
+            cascade.framebuffer = VK_NULL_HANDLE;
+        }
+        if (cascade.view != VK_NULL_HANDLE) {
+            vkDestroyImageView(dev, cascade.view, nullptr);
+            cascade.view = VK_NULL_HANDLE;
+        }
+        if (cascade.image != VK_NULL_HANDLE) {
+            context_.destroy_image(cascade.image, cascade.allocation);
+            cascade.image = VK_NULL_HANDLE;
+            cascade.allocation = nullptr;
+        }
+    }
 }
 
 // --- Textures / matériaux (M7 étape 3) --------------------------------------
@@ -1036,6 +1491,11 @@ void Renderer::record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     vkBeginCommandBuffer(cmd, &begin);
 
+    // Ombres d'abord : les cartes doivent être remplies avant que la passe principale
+    // ne les échantillonne (la synchro est portée par les dépendances de la render
+    // pass d'ombre). Le cadrage des cascades a été calculé dans draw_frame.
+    record_shadow_pass(cmd, items);
+
     std::array<VkClearValue, 2> clears{};
     clears[0].color = {{background_color_.r, background_color_.g, background_color_.b, 1.0f}};
     clears[1].depthStencil = {1.0f, 0};
@@ -1140,8 +1600,22 @@ void Renderer::draw_frame(const FrameUniforms& uniforms, const std::vector<DrawI
     // Le fond suit la couleur du brouillard (cohérence visuelle par temps couvert).
     background_color_ = glm::vec3(uniforms.fog_color_density);
 
-    // Mise à jour de l'UBO de CETTE frame (mapping persistant).
-    std::memcpy(uniform_buffers_[current_frame_].mapped, &uniforms, sizeof(FrameUniforms));
+    // Cadrage des cascades d'ombre pour cette frame (dépend de la caméra + du soleil).
+    update_shadow_cascades(uniforms);
+
+    // Mise à jour de l'UBO de CETTE frame (mapping persistant) : entrées de l'app
+    // + ce que le Renderer a calculé lui-même (matrices et portées des cascades).
+    GpuFrameUniforms gpu{};
+    gpu.view = uniforms.view;
+    gpu.proj = uniforms.proj;
+    gpu.fog_color_density = uniforms.fog_color_density;
+    gpu.params = uniforms.params;
+    gpu.sun_direction = uniforms.sun_direction;
+    for (std::uint32_t i = 0; i < kShadowCascades; ++i) {
+        gpu.light_view_proj[i] = shadow_cascades_[i].light_view_proj;
+        gpu.cascade_splits[static_cast<glm::length_t>(i)] = shadow_cascades_[i].split_depth;
+    }
+    std::memcpy(uniform_buffers_[current_frame_].mapped, &gpu, sizeof(GpuFrameUniforms));
 
     vkResetFences(dev, 1, &in_flight_[current_frame_]);
 
@@ -1267,6 +1741,25 @@ void Renderer::shutdown() {
     if (sampler_ != VK_NULL_HANDLE) {
         vkDestroySampler(dev, sampler_, nullptr);
         sampler_ = VK_NULL_HANDLE;
+    }
+
+    // Ombres (M8 étape 1) : framebuffers/vues/images, puis pipelines, layout, passe.
+    destroy_shadow_resources();
+    if (shadow_pipeline_mesh_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(dev, shadow_pipeline_mesh_, nullptr);
+        shadow_pipeline_mesh_ = VK_NULL_HANDLE;
+    }
+    if (shadow_pipeline_legacy_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(dev, shadow_pipeline_legacy_, nullptr);
+        shadow_pipeline_legacy_ = VK_NULL_HANDLE;
+    }
+    if (shadow_pipeline_layout_ != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(dev, shadow_pipeline_layout_, nullptr);
+        shadow_pipeline_layout_ = VK_NULL_HANDLE;
+    }
+    if (shadow_render_pass_ != VK_NULL_HANDLE) {
+        vkDestroyRenderPass(dev, shadow_render_pass_, nullptr);
+        shadow_render_pass_ = VK_NULL_HANDLE;
     }
 
     for (GpuBuffer& ubo : uniform_buffers_) {

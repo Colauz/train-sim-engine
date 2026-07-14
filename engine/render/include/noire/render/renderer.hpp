@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -24,13 +25,25 @@ struct RendererCreateInfo {
     std::function<VkExtent2D()> get_framebuffer_size;  // taille courante (redimensionnement)
 };
 
-// UBO GLOBAL envoyé au GPU (uniquement des float : l'origine flottante est déjà
-// résolue côté CPU). Contient les matrices caméra + les paramètres météo.
+// Ombres portées du soleil (M8) : cascades de shadow maps depth-only. Deux cascades
+// suffisent pour une sim ferroviaire (une proche très détaillée autour du train, une
+// large pour le paysage). Au-delà de kShadowDistance, plus d'ombre projetée.
+inline constexpr std::uint32_t kShadowCascades = 2;
+inline constexpr std::uint32_t kShadowMapSize = 2048;
+inline constexpr float kShadowDistance = 250.0f;  // portée max des ombres (m)
+
+// Paramètres d'ENTRÉE de la frame, fournis par l'app (uniquement des float :
+// l'origine flottante est déjà résolue côté CPU). Le Renderer en dérive l'UBO
+// réellement envoyé au GPU, en y ajoutant ce qu'il calcule lui-même (matrices
+// des cascades d'ombre).
 struct FrameUniforms {
     glm::mat4 view;
     glm::mat4 proj;
     glm::vec4 fog_color_density;  // rgb = couleur du brouillard, a = densité
     glm::vec4 params;             // x = wetness (humidité 0..1), reste = réserve
+    // xyz = direction VERS le soleil (normalisée, espace monde). Cadre les cascades
+    // d'ombre ET éclaire les modèles : une seule source de vérité pour le soleil.
+    glm::vec4 sun_direction{-0.4f, 0.8f, 0.3f, 0.0f};
 };
 
 // Un objet à dessiner : sa matrice Model (déjà relative à la caméra, en float),
@@ -112,6 +125,18 @@ private:
         bool ready = false;
     };
 
+    // Une cascade d'ombre : sa depth map + la matrice qui l'a cadrée cette frame.
+    // Taille fixe (kShadowMapSize) => indépendante de la swapchain, donc jamais
+    // recréée au redimensionnement.
+    struct ShadowCascade {
+        VkImage image = VK_NULL_HANDLE;
+        VmaAllocation allocation = nullptr;
+        VkImageView view = VK_NULL_HANDLE;
+        VkFramebuffer framebuffer = VK_NULL_HANDLE;
+        glm::mat4 light_view_proj{1.0f};
+        float split_depth = 0.0f;  // distance de vue où finit la cascade (m)
+    };
+
     bool create_descriptor_set_layout();
     bool create_pipeline_layout();
     bool create_pipelines();
@@ -135,6 +160,17 @@ private:
     // nullptr si même le fallback n'est pas encore prêt (toutes premières frames).
     [[nodiscard]] const Texture* resolve_texture(TextureId id) const;
     void free_texture(Texture& texture);  // libère descriptor + vue + image (device idle)
+
+    // Ombres (M8 étape 1) : passe depth-only du soleil, une par cascade.
+    bool create_shadow_render_pass();
+    bool create_shadow_resources();        // images + vues + framebuffers des cascades
+    bool create_shadow_pipeline_layout();  // push constant : lightViewProj * model
+    bool create_shadow_pipelines();
+    VkPipeline build_shadow_pipeline(std::uint32_t vertex_stride);
+    // Recalcule le cadrage des cascades pour cette frame (dans l'espace flottant).
+    void update_shadow_cascades(const FrameUniforms& uniforms);
+    void record_shadow_pass(VkCommandBuffer cmd, const std::vector<DrawItem>& items);
+    void destroy_shadow_resources();
 
     VkPipeline build_pipeline(Topology topology);
     VkPipeline build_textured_pipeline();
@@ -168,6 +204,15 @@ private:
     TextureId next_texture_id_ = 1;
     TextureId white_texture_ = 0;
     static constexpr std::uint32_t kMaxTextures = 128;
+
+    // --- Ombres du soleil (M8 étape 1) ---------------------------------------
+    // Passe depth-only rendue AVANT la passe principale. Deux pipelines car les deux
+    // formats de sommet ont la position à l'offset 0 mais des strides différents.
+    VkRenderPass shadow_render_pass_ = VK_NULL_HANDLE;
+    VkPipelineLayout shadow_pipeline_layout_ = VK_NULL_HANDLE;
+    VkPipeline shadow_pipeline_mesh_ = VK_NULL_HANDLE;    // MeshVertex (modèles indexés)
+    VkPipeline shadow_pipeline_legacy_ = VK_NULL_HANDLE;  // Vertex (rails, géométrie debug)
+    std::array<ShadowCascade, kShadowCascades> shadow_cascades_{};
 
     // Profondeur (partagée) pour le test de profondeur 3D.
     VkFormat depth_format_ = VK_FORMAT_D32_SFLOAT;
