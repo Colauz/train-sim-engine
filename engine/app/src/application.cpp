@@ -494,6 +494,18 @@ struct Application::Impl {
         const float rate = static_cast<float>(dt) * 0.7f;
         wetness += glm::clamp(wetness_target - wetness, -rate, rate);
 
+        // NOIRE_PIN_CAM : caméra verrouillée, pour les A/B à l'image. Sans elle, l'orbite
+        // suit la souris, dont la position n'est PAS reproductible d'un lancement à
+        // l'autre : deux runs cadrent des scènes différentes et toute comparaison entre
+        // configs est fausse. Ça a invalidé une campagne de mesures entière le 2026-07-16.
+        static const bool pinned = std::getenv("NOIRE_PIN_CAM") != nullptr;
+        if (pinned) {
+            orbit_yaw = 2.30f;
+            orbit_pitch = 0.32f;
+            orbit_distance = 38.0f;
+            window.consume_cursor_delta();  // vidange, sinon elle s'accumule
+            return;
+        }
         const platform::CursorDelta d = window.consume_cursor_delta();
         orbit_yaw += static_cast<float>(d.dx) * 0.005f;
         orbit_pitch = glm::clamp(orbit_pitch - static_cast<float>(d.dy) * 0.005f, -1.30f, 1.30f);
@@ -764,6 +776,8 @@ struct Application::Impl {
         const float aspect = static_cast<float>(size.width) / static_cast<float>(size.height);
         render::FrameUniforms uniforms;
         uniforms.view = camera.view_matrix();
+        // Ancre le snap des cascades sur le monde (cf. update_shadow_cascades).
+        uniforms.camera_world_position = camera.position();
         uniforms.proj = camera.projection_matrix(aspect);
         // Depuis le M8 étape 6b, la couleur de ciel n'est PLUS une valeur d'auteur : le
         // brouillard échantillonne la skybox elle-même. .rgb ne sert donc plus qu'au

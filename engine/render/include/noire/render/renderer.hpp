@@ -39,6 +39,11 @@ inline constexpr float kShadowDistance = 250.0f;  // portée max des ombres (m)
 struct FrameUniforms {
     glm::mat4 view;
     glm::mat4 proj;
+    // Position MONDE de la caméra, en double. Ne part PAS au GPU (les shaders travaillent
+    // en caméra-relatif) : elle sert à ancrer le snap des cascades d'ombre sur une grille
+    // de texels solidaire du MONDE. Sans elle, le snap se fait dans un repère qui suit la
+    // caméra — donc il ne snappe rien du tout (le centre y est constant).
+    glm::dvec3 camera_world_position{0.0, 0.0, 0.0};
     glm::vec4 fog_color_density;  // rgb = couleur du brouillard, a = densité
     glm::vec4 params;             // x = wetness (humidité 0..1), reste = réserve
     // xyz = direction VERS le soleil (normalisée, espace monde). Cadre les cascades

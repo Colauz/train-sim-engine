@@ -78,6 +78,16 @@ private:
         render::MeshId sleepers = 0;
         render::MeshId ballast = 0;
         bool has_mesh = false;
+        // Maillages créés mais dont le TRANSFERT GPU est encore en vol. Ils ne remplacent
+        // les précédents qu'une fois tous les trois `is_mesh_ready()`. Même sas que
+        // TerrainClipmap, et pour la même raison : `create_mesh_indexed` est asynchrone et
+        // le Renderer saute tout maillage non prêt — substituer tout de suite faisait
+        // disparaître la tuile le temps du téléversement.
+        render::MeshId up_rails = 0;
+        render::MeshId up_sleepers = 0;
+        render::MeshId up_ballast = 0;
+        bool uploading = false;
+        TrackLod uploading_lod = TrackLod::Distant;
         TrackLod lod = TrackLod::Distant;      // LOD des maillages ACTUELLEMENT affichés
         TrackLod building_lod = TrackLod::Distant;  // LOD que le worker est en train de bâtir
     };

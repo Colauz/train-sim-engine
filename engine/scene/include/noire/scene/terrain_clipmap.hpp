@@ -82,6 +82,15 @@ private:
 
     render::MeshId mesh_ = 0;
     WorldPosition origin_{};
+
+    // Maillage créé mais dont le transfert GPU est encore EN VOL. Il ne remplace `mesh_`
+    // qu'une fois `is_mesh_ready()`. Sans ce sas, on substituait un maillage non encore
+    // téléversé : le Renderer saute tout maillage non prêt, donc le terrain n'était
+    // dessiné par PERSONNE pendant l'upload — le sol disparaissait une frame entière tous
+    // les 16 m (mesuré : 1 frame sur 41 à 25 m/s, soit 1,5 clignotement par seconde).
+    render::MeshId uploading_ = 0;
+    WorldPosition uploading_origin_{};
+    glm::i64vec2 uploading_snap_{0, 0};
 };
 
 }  // namespace noire::scene

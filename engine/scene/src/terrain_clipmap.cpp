@@ -120,25 +120,37 @@ void TerrainClipmap::update(const WorldPosition& viewer, render::Renderer& rende
 
     const State state = state_.load(std::memory_order_acquire);
     if (state == State::CpuReady && pending_) {
+        // Le worker a fini la géométrie : on lance le téléversement, mais on NE substitue
+        // PAS encore. `create_mesh_indexed` est asynchrone.
         const render::MeshId fresh =
             renderer.create_mesh_indexed(pending_->vertices, pending_->indices);
         if (fresh != 0) {
-            // L'ancien maillage a été affiché jusqu'à cette frame incluse : sa
-            // destruction est DIFFÉRÉE côté Renderer, la substitution est donc sûre même
-            // s'il est encore référencé par une frame en vol.
-            if (mesh_ != 0) {
-                renderer.destroy_mesh(mesh_);
-            }
-            mesh_ = fresh;
-            origin_ = pending_->origin;
-            current_snap_ = pending_->snap;
-            has_snap_ = true;
+            uploading_ = fresh;
+            uploading_origin_ = pending_->origin;
+            uploading_snap_ = pending_->snap;
         }
         pending_.reset();
         state_.store(State::Idle, std::memory_order_relaxed);
     }
 
-    if (state_.load(std::memory_order_relaxed) == State::Idle &&
+    // LA substitution, et seulement quand le GPU a bel et bien le nouveau maillage.
+    // L'ancien reste affiché jusqu'à cet instant : il n'existe plus une seule frame sans
+    // terrain. Sa destruction est DIFFÉRÉE côté Renderer, donc la sortir ici est sûre même
+    // s'il est encore référencé par une frame en vol.
+    if (uploading_ != 0 && renderer.is_mesh_ready(uploading_)) {
+        if (mesh_ != 0) {
+            renderer.destroy_mesh(mesh_);
+        }
+        mesh_ = uploading_;
+        origin_ = uploading_origin_;
+        current_snap_ = uploading_snap_;
+        has_snap_ = true;
+        uploading_ = 0;
+    }
+
+    // Rien de neuf tant qu'un téléversement est en vol : sinon on empilerait des maillages
+    // que personne n'attend, et `uploading_` en perdrait un (fuite).
+    if (state_.load(std::memory_order_relaxed) == State::Idle && uploading_ == 0 &&
         (!has_snap_ || snap != current_snap_)) {
         request(snap, WorldPosition{static_cast<double>(snap.x) * step, 0.0,
                                     static_cast<double>(snap.y) * step});

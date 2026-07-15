@@ -77,8 +77,13 @@ constexpr VkFormat kShadowFormat = VK_FORMAT_D32_SFLOAT;
 // Depth bias slope-scaled : pousse les casters loin de la lumière au moment de
 // l'écriture de profondeur. Le terme « slope » monte avec l'inclinaison de la face
 // vis-à-vis du soleil, là où l'acné apparaît en premier (surfaces rasantes).
-constexpr float kDepthBiasConstant = 1.25f;
-constexpr float kDepthBiasSlope = 1.75f;
+// Relevés le 2026-07-16 sur du gazon SANS caster (où « ombres on » doit égaler « ombres
+// off » : tout écart y est de l'acné) : 1.25/1.75 laissait 0.77 % de pixels acnéiques,
+// 4/6 n'en laisse que 0.03 %, sans décollement mesurable de l'ombre. Les anciennes
+// valeurs n'étaient pas mauvaises — elles n'avaient JAMAIS été exercées, les cascades
+// étant dégénérées depuis le reverse-z du M9 (cf. update_shadow_cascades).
+constexpr float kDepthBiasConstant = 4.0f;
+constexpr float kDepthBiasSlope = 6.0f;
 
 // Marge (m) ajoutée devant chaque cascade le long de l'axe du soleil : capte les
 // casters situés HORS de la tranche de frustum mais qui projettent dedans.
@@ -1064,14 +1069,22 @@ void Renderer::update_shadow_cascades(const FrameUniforms& uniforms) {
     }
     to_sun = glm::normalize(to_sun);
 
-    // near/far de la projection perspective (profondeur 0..1) :
-    //   proj[2][2] = f/(n-f) et proj[3][2] = f*n/(n-f)
-    //   => n = proj[3][2] / proj[2][2] et f = proj[3][2] / (proj[2][2] + 1)
-    // (l'inversion de Y côté Vulkan ne touche pas ces deux termes)
+    // Plans near/far de la projection, SANS présumer de la convention de profondeur.
+    //   z_ndc = -p22 - p32/z_view  =>  la distance où z_ndc vaut d est p32/(d + p22).
+    // On évalue donc les deux plans du NDC (d=0 et d=1) et on les trie : le plan proche
+    // est le plus proche, par définition. C'est ce qui rend ce cadrage indifférent au
+    // REVERSE-Z — la version précédente codait en dur « d=0 est le near », convention que
+    // le reverse-z du M9 a inversée, et elle rendait alors near et far INTERVERTIS
+    // (mesuré : near=9999.9, far=0.1), d'où des cascades de 12 km et des texels de 12 m.
     const float p22 = uniforms.proj[2][2];
     const float p32 = uniforms.proj[3][2];
-    const float near_plane = p32 / p22;
-    const float far_plane = p32 / (p22 + 1.0f);
+    const float depth0 = p32 / p22;           // distance où z_ndc = 0
+    const float depth1 = p32 / (p22 + 1.0f);  // distance où z_ndc = 1
+    const float near_plane = std::min(depth0, depth1);
+    const float far_plane = std::max(depth0, depth1);
+    // z NDC de CHAQUE plan : c'est ce qui permet de déprojeter les coins dans le bon ordre.
+    const float ndc_near = depth1 < depth0 ? 1.0f : 0.0f;
+    const float ndc_far = depth1 < depth0 ? 0.0f : 1.0f;
     const float shadow_far = std::min(kShadowDistance, far_plane);
     const float depth_range = far_plane - near_plane;
 
@@ -1082,12 +1095,11 @@ void Renderer::update_shadow_cascades(const FrameUniforms& uniforms) {
     const glm::mat4 inv_view_proj = glm::inverse(uniforms.proj * uniforms.view);
     std::array<glm::vec3, 8> corners{};  // [0..3] = plan proche, [4..7] = plan lointain
     std::size_t index = 0;
-    for (int z = 0; z <= 1; ++z) {
+    for (const float z : {ndc_near, ndc_far}) {
         for (int y = -1; y <= 1; y += 2) {
             for (int x = -1; x <= 1; x += 2) {
-                const glm::vec4 p =
-                    inv_view_proj * glm::vec4(static_cast<float>(x), static_cast<float>(y),
-                                              static_cast<float>(z), 1.0f);
+                const glm::vec4 p = inv_view_proj * glm::vec4(static_cast<float>(x),
+                                                              static_cast<float>(y), z, 1.0f);
                 corners[index++] = glm::vec3(p) / p.w;
             }
         }
@@ -1138,8 +1150,28 @@ void Renderer::update_shadow_cascades(const FrameUniforms& uniforms) {
         // sans ça, un déplacement sub-texel fait grouiller le bord des ombres.
         glm::vec3 center_light(light_rotation * glm::vec4(center, 1.0f));
         const float units_per_texel = (2.0f * radius) / static_cast<float>(kShadowMapSize);
-        center_light.x = std::floor(center_light.x / units_per_texel) * units_per_texel;
-        center_light.y = std::floor(center_light.y / units_per_texel) * units_per_texel;
+        // Le snap doit ancrer la grille de texels sur le MONDE, pas sur la caméra. Or tout
+        // ce cadrage vit en caméra-relatif, où `center_light` est CONSTANT à orientation
+        // fixe : y appliquer floor() quantifiait une constante en une constante — un snap
+        // purement décoratif, qui ne se déclenchait jamais (vérifié en le journalisant sur
+        // un train en marche : valeur identique à 1e-6 près sur des centaines de frames).
+        // On ajoute donc la position monde de la caméra pour snapper en absolu, puis on la
+        // retire. En DOUBLE : elle vaut des centaines de milliers de mètres et on la
+        // compare à un texel de quelques centimètres — un float n'a pas les chiffres pour.
+        const glm::dmat4 light_rotation_d(light_rotation);
+        const glm::dvec3 cam_light(light_rotation_d *
+                                   glm::dvec4(uniforms.camera_world_position, 1.0));
+        const auto snap_axis = [](double camera_rel, double cam, double unit) {
+            return static_cast<float>(std::floor((camera_rel + cam) / unit) * unit - cam);
+        };
+        const double unit = static_cast<double>(units_per_texel);
+        center_light.x = snap_axis(center_light.x, cam_light.x, unit);
+        center_light.y = snap_axis(center_light.y, cam_light.y, unit);
+        // Le z AUSSI. Il fixe z_near/z_far, donc tout l'encodage de profondeur : le
+        // laisser glisser avec la caméra fait varier la profondeur stockée pour un même
+        // point du monde d'une frame à l'autre — et l'acné se remet à clignoter même
+        // avec x et y parfaitement ancrés.
+        center_light.z = snap_axis(center_light.z, cam_light.z, unit);
 
         // Ortho cadrée sur la sphère. La lumière regarde vers -Z : la profondeur croît
         // quand z décroît, d'où l'inversion de signe. kShadowCasterMargin recule le plan

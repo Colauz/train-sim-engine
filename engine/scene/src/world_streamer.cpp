@@ -87,30 +87,46 @@ void WorldStreamer::update(double wagon_chainage, render::Renderer& renderer) {
             auto upload = [&renderer](const RailMeshData& m) {
                 return m.empty() ? 0u : renderer.create_mesh_indexed(m.vertices, m.indices);
             };
-            const render::MeshId new_rails = upload(chunk->cpu_mesh.rails);
-            const render::MeshId new_sleepers = upload(chunk->cpu_mesh.sleepers);
-            const render::MeshId new_ballast = upload(chunk->cpu_mesh.ballast);
-
-            // Changement de LOD : les anciens maillages ont été affichés jusqu'à cette
-            // frame incluse. Leur destruction est DIFFÉRÉE côté Renderer, donc la
-            // substitution est sûre même s'ils sont encore référencés par une frame en vol.
-            if (chunk->has_mesh) {
-                for (const render::MeshId id :
-                     {chunk->rails, chunk->sleepers, chunk->ballast}) {
-                    if (id != 0) {
-                        renderer.destroy_mesh(id);
-                    }
-                }
-            }
-            chunk->rails = new_rails;
-            chunk->sleepers = new_sleepers;
-            chunk->ballast = new_ballast;
-            chunk->lod = chunk->building_lod;
-            chunk->has_mesh = true;
+            // On lance les téléversements, sans rien substituer : ils sont asynchrones.
+            chunk->up_rails = upload(chunk->cpu_mesh.rails);
+            chunk->up_sleepers = upload(chunk->cpu_mesh.sleepers);
+            chunk->up_ballast = upload(chunk->cpu_mesh.ballast);
+            chunk->uploading = true;
+            chunk->uploading_lod = chunk->building_lod;
             chunk->state.store(State::Active, std::memory_order_relaxed);
             chunk->cpu_mesh = TrackMeshData{};  // libère la RAM CPU une fois sur le GPU
             ++uploads;
         }
+    }
+
+    // 2 bis) LA substitution : seulement quand les TROIS maillages sont sur le GPU. Les
+    //        anciens restent affichés jusque-là — aucune frame sans voie. Les trois
+    //        ensemble parce qu'ils forment un tout : des rails sans ballast se verraient.
+    for (auto& [index, chunk_ptr] : chunks_) {
+        Chunk* chunk = chunk_ptr.get();
+        if (!chunk->uploading) {
+            continue;
+        }
+        const auto ready = [&renderer](render::MeshId id) {
+            return id == 0 || renderer.is_mesh_ready(id);  // 0 = sous-maillage vide, rien à attendre
+        };
+        if (!ready(chunk->up_rails) || !ready(chunk->up_sleepers) || !ready(chunk->up_ballast)) {
+            continue;
+        }
+        if (chunk->has_mesh) {
+            for (const render::MeshId id : {chunk->rails, chunk->sleepers, chunk->ballast}) {
+                if (id != 0) {
+                    renderer.destroy_mesh(id);  // destruction DIFFÉRÉE côté Renderer
+                }
+            }
+        }
+        chunk->rails = chunk->up_rails;
+        chunk->sleepers = chunk->up_sleepers;
+        chunk->ballast = chunk->up_ballast;
+        chunk->lod = chunk->uploading_lod;
+        chunk->has_mesh = true;
+        chunk->uploading = false;
+        chunk->up_rails = chunk->up_sleepers = chunk->up_ballast = 0;
     }
 
     // 3) Garbage collection : décharger les tuiles hors fenêtre (RAM + GPU).
@@ -125,6 +141,16 @@ void WorldStreamer::update(double wagon_chainage, render::Renderer& renderer) {
             if (c->has_mesh) {
                 // Destruction GPU DIFFÉRÉE (voir Renderer) : 0 est ignoré côté renderer.
                 for (const render::MeshId id : {c->rails, c->sleepers, c->ballast}) {
+                    if (id != 0) {
+                        renderer.destroy_mesh(id);
+                    }
+                }
+            }
+            // Une tuile déchargée ALORS QU'UN TÉLÉVERSEMENT EST EN VOL : ses maillages
+            // neufs n'ont jamais été affichés, mais ils existent bel et bien sur le GPU.
+            // Les oublier ici les ferait fuir jusqu'à la fermeture.
+            if (c->uploading) {
+                for (const render::MeshId id : {c->up_rails, c->up_sleepers, c->up_ballast}) {
                     if (id != 0) {
                         renderer.destroy_mesh(id);
                     }
