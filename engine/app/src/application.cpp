@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <cmath>
 #include <cstdint>
 #include <utility>
@@ -91,6 +92,17 @@ constexpr std::uint32_t kGroundTextureSize = 256;
 constexpr glm::vec3 kRailColor{0.55f, 0.57f, 0.62f};      // acier poli par les roues
 constexpr glm::vec3 kSleeperColor{0.28f, 0.27f, 0.25f};   // béton gris, un peu sale
 constexpr glm::vec3 kBallastColor{0.20f, 0.19f, 0.17f};   // gravier gris sombre
+
+// --- Semis de végétation (M11 phase 3) --------------------------------------
+// DÉTERMINISTE par construction : la position d'un arbre ne dépend QUE du hash de sa
+// cellule. Aucun état, aucun compteur, aucun aléa de frame — le train peut repasser, la
+// tuile être déchargée puis régénérée, l'app redémarrer : la forêt est identique. C'est
+// aussi ce qui permet de la semer depuis un worker sans la moindre synchronisation.
+constexpr double kTreeCell = 26.0;        // une cellule de semis, en mètres
+constexpr double kTreeHalfWidth = 260.0;  // portée latérale de part et d'autre de la voie
+// Au-delà, un arbre de 7 m couvre moins d'un pixel : le semer ne coûterait que des
+// triangles. C'est le seul garde-fou de budget.
+constexpr double kTreeRange = 620.0;
 
 // --- Calibrage des modèles importés (M9) ------------------------------------
 // Un modèle trouvé sur internet n'a JAMAIS la bonne échelle, la bonne orientation ni la
@@ -255,6 +267,7 @@ struct Application::Impl {
     // Pipeline d'assets (M7 étapes 4-5) : racine assets/ + cache/loaders asynchrones.
     resource::AssetPaths asset_paths;
     resource::ResourceManager resources;
+    resource::ModelHandle tree_model;
     resource::ModelHandle train_model;
     resource::AudioHandle rumble_clip;
     resource::EnvironmentHandle sky;
@@ -267,6 +280,20 @@ struct Application::Impl {
     // Splatting du terrain (M11 phase 2) : deux jeux PBR complets, herbe et craie.
     std::array<resource::TextureHandle, 6> terrain_maps;
     bool terrain_textured = false;
+
+    // Végétation : un seul tampon d'instances, refait quand le train a franchi une
+    // cellule. Le semis est purement fonction du hash, donc le refaire est idempotent.
+    render::InstanceBufferId tree_instances = 0;
+    std::uint32_t tree_count = 0;
+    WorldPosition tree_origin{};
+    long tree_snap_x = 0, tree_snap_z = 0;
+    bool tree_snap_valid = false;
+    double sim_time = 0.0;  // horloge du vent (s)
+    std::chrono::steady_clock::time_point perf_t0 = std::chrono::steady_clock::now();
+    int perf_frames = 0;
+    double perf_gpu_sum = 0.0;
+    double perf_fps = 0.0;
+    double perf_gpu_ms = 0.0;
     bool rumble_source_applied = false;
 
     // Sol : plan solide texturé (M8 étape 2), il reçoit l'ombre portée du train.
@@ -400,6 +427,7 @@ struct Application::Impl {
         // Motrice TGV procédurale (M10) : carrosserie loftée (superellipse + Béziers),
         // nez plongeant, vraies roues cylindriques. Remplace le gabarit-boîtes du M9.
         train_model = resources.load_model("models/tgv_procedural.glb");
+        tree_model = resources.load_model("models/tree.glb");
         rumble_clip = resources.load_audio("audio/roulement.wav");
 
         // Ballast (Poly Haven, CC0). L'ESPACE COLORIMÉTRIQUE est dicté par le RÔLE :
@@ -495,13 +523,74 @@ struct Application::Impl {
         in.speed = wagon.speed();
         in.curvature = curvature;
         rail_audio.update(audio, dt, in);
+        sim_time += dt;
 
         if (++telemetry_ticks % 120 == 0) {
-            log::info("v={:6.1f} km/h | pente={:+5.1f}% | {} | chunks={} | pluie={:.0f}%",
+            log::info("v={:6.1f} km/h | pente={:+5.1f}% | {} | chunks={} | pluie={:.0f}% | "
+                      "{:.0f} fps (GPU {:.1f} ms) | arbres={}",
                       wagon.speed() * 3.6, wagon.grade_percent(),
                       wagon.slipping() ? "PATINE   " : "adherent ", streamer.active_chunk_count(),
-                      wetness * 100.0f);
+                      wetness * 100.0f, perf_fps, perf_gpu_ms, tree_count);
         }
+    }
+
+    // Sème la végétation autour du train. Appelé quand le train change de cellule.
+    void reseed_vegetation() {
+        const WorldPosition wp = wagon.body_position();
+        std::vector<render::InstanceData> instances;
+        const auto cells = static_cast<long>(kTreeRange / kTreeCell) + 1;
+        const long cx0 = static_cast<long>(std::floor(wp.x / kTreeCell));
+        const long cz0 = static_cast<long>(std::floor(wp.z / kTreeCell));
+
+        for (long ci = cx0 - cells; ci <= cx0 + cells; ++ci) {
+            for (long cj = cz0 - cells; cj <= cz0 + cells; ++cj) {
+                // Hash de la cellule : 3 tirages indépendants (position, présence, taille).
+                const std::uint32_t h1 = hash_u32(static_cast<std::uint32_t>(ci) * 73856093u ^
+                                                  static_cast<std::uint32_t>(cj) * 19349663u);
+                const std::uint32_t h2 = hash_u32(h1 ^ 0x9e3779b9u);
+                const std::uint32_t h3 = hash_u32(h2 ^ 0x85ebca6bu);
+                // Densité : ~55 % des cellules portent un arbre. Le reste est en culture —
+                // la Champagne est une plaine agricole, pas une forêt.
+                if ((h1 & 0xffffu) > 36000u) {
+                    continue;
+                }
+                const double jx = static_cast<double>((h2 >> 8) & 0xffffu) / 65535.0;
+                const double jz = static_cast<double>((h3 >> 8) & 0xffffu) / 65535.0;
+                const double wx = (static_cast<double>(ci) + jx) * kTreeCell;
+                const double wz = (static_cast<double>(cj) + jz) * kTreeCell;
+
+                if (std::hypot(wx - wp.x, wz - wp.z) > kTreeRange) {
+                    continue;
+                }
+                // EXCLUSION DE LA VOIE. `corridor_inner` est exactement la largeur de la
+                // plateforme aplanie : au-delà, le terrain redescend en talus, donc c'est
+                // la borne naturelle. Aucun arbre ne peut traverser le TGV.
+                const double d = terrain.distance_to_track(wx, wz);
+                if (d < terrain.config().corridor_inner || std::abs(wz - wp.z) > kTreeHalfWidth) {
+                    continue;
+                }
+
+                render::InstanceData inst;
+                const double h = terrain.height(wx, wz);
+                inst.position_scale = glm::vec4(glm::vec3(glm::dvec3(wx, h, wz) - wp),
+                                                0.75f + 0.5f * (static_cast<float>(h3 & 0xffu) / 255.0f));
+                // La phase de vent vient de la position MONDE : deux arbres voisins ne
+                // peuvent pas onduler en cadence, et la phase ne change JAMAIS, même
+                // quand le semis est refait.
+                inst.rotation_phase =
+                    glm::vec4(static_cast<float>((h2 & 0xffffu) / 65535.0 * 6.2831853),
+                              static_cast<float>(std::fmod(wx * 0.37 + wz * 0.21, 6.2831853)),
+                              0.0f, 0.0f);
+                instances.push_back(inst);
+            }
+        }
+
+        if (tree_instances != 0) {
+            renderer.destroy_instances(tree_instances);
+        }
+        tree_instances = renderer.create_instances(instances);
+        tree_count = static_cast<std::uint32_t>(instances.size());
+        tree_origin = wp;
     }
 
     void render_frame() {
@@ -584,6 +673,21 @@ struct Application::Impl {
         streamer.update(wagon.chainage(), renderer);
         clipmap.update(wagon.body_position(), renderer);
 
+        // Végétation : re-semée quand le train franchit une cellule. Le semis étant
+        // déterministe, les arbres déjà présents retombent EXACTEMENT au même endroit —
+        // seuls ceux qui entrent ou sortent de portée changent.
+        if (tree_model && tree_model->ready) {
+            const WorldPosition wp = wagon.body_position();
+            const long sx = static_cast<long>(std::floor(wp.x / kTreeCell));
+            const long sz = static_cast<long>(std::floor(wp.z / kTreeCell));
+            if (!tree_snap_valid || sx != tree_snap_x || sz != tree_snap_z) {
+                reseed_vegetation();
+                tree_snap_x = sx;
+                tree_snap_z = sz;
+                tree_snap_valid = true;
+            }
+        }
+
         const auto size = window.framebuffer_size();
         if (size.width == 0 || size.height == 0) {
             window.wait_events();
@@ -622,6 +726,23 @@ struct Application::Impl {
         prev_render_valid = true;
         if (dt_render < 1e-4) dt_render = 1e-4;
 
+        // FPS et temps GPU moyens. Comptés ICI, dans le rendu : les compter dans
+        // update_physics reviendrait à mesurer le pas fixe (120 Hz par construction), ce
+        // qui ne dit rien du rendu. La MOYENNE, pas un échantillon : une frame isolée
+        // varie du simple au double (préemption, fréquences de l'iGPU).
+        {
+            ++perf_frames;
+            perf_gpu_sum += renderer.last_gpu_ms();
+            const double el = std::chrono::duration<double>(now - perf_t0).count();
+            if (el >= 1.0) {
+                perf_fps = perf_frames / el;
+                perf_gpu_ms = perf_gpu_sum / perf_frames;
+                perf_frames = 0;
+                perf_gpu_sum = 0.0;
+                perf_t0 = now;
+            }
+        }
+
         // Caméra orbitale qui suit le wagon.
         const WorldPosition target = wagon.body_position();
         const glm::vec3 dir(std::cos(orbit_yaw) * std::cos(orbit_pitch), std::sin(orbit_pitch),
@@ -656,7 +777,8 @@ struct Application::Impl {
         // 0.00008 l'horizon reste à ~55 % de voile à 10 km : brumeux mais lisible.
         const float fog_density = glm::mix(0.00008f, 0.010f, wetness);
         uniforms.fog_color_density = glm::vec4(fog_color, fog_density);
-        uniforms.params = glm::vec4(wetness, 0.0f, 0.0f, 0.0f);
+        // y = temps : c'est l'horloge du vent (mesh_instanced.vert).
+        uniforms.params = glm::vec4(wetness, static_cast<float>(sim_time), 0.0f, 0.0f);
 
         // Soleil : direction VERS l'astre, source de vérité unique (elle éclaire les
         // modèles ET cadre les cascades d'ombre). Depuis l'étape 6b elle est EXTRAITE du
@@ -702,6 +824,22 @@ struct Application::Impl {
                 if (mesh != 0) {
                     items.push_back(render::DrawItem{model, mesh, material});
                 }
+            }
+        }
+
+        // Végétation, dessinée APRÈS le terrain et la voie : son fragment fait `discard`,
+        // ce qui INTERDIT l'early-z sur ce pipeline. En la mettant en dernier, au moins le
+        // depth-test rejette tout ce que le sol cache déjà.
+        if (tree_model && tree_model->ready && tree_instances != 0 && tree_count > 0) {
+            const glm::mat4 group = camera.relative_model(tree_origin);
+            for (const resource::Model::Primitive& prim : tree_model->primitives) {
+                render::DrawItem item;
+                item.model = group;
+                item.mesh = prim.mesh;
+                item.material = prim.material ? prim.material->id : 0;
+                item.instances = tree_instances;
+                item.instance_count = tree_count;
+                items.push_back(item);
             }
         }
 

@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 
 #include "noire/core/log.hpp"
@@ -15,6 +16,8 @@
 #include "shaders/mesh.frag.spv.h"
 #include "shaders/mesh.vert.spv.h"
 #include "shaders/mesh_textured.frag.spv.h"
+#include "shaders/foliage.frag.spv.h"
+#include "shaders/mesh_instanced.vert.spv.h"
 #include "shaders/mesh_textured.vert.spv.h"
 #include "shaders/prefilter_env.comp.spv.h"
 #include "shaders/shadow.vert.spv.h"
@@ -143,7 +146,9 @@ bool Renderer::initialize(const RendererCreateInfo& info) {
     }
     pipeline_textured_ = build_textured_pipeline();
     pipeline_terrain_ = build_terrain_pipeline();
-    if (pipeline_textured_ == VK_NULL_HANDLE || pipeline_terrain_ == VK_NULL_HANDLE) {
+    pipeline_foliage_ = build_foliage_pipeline();
+    if (pipeline_textured_ == VK_NULL_HANDLE || pipeline_terrain_ == VK_NULL_HANDLE ||
+        pipeline_foliage_ == VK_NULL_HANDLE) {
         return false;
     }
     if (!create_default_textures() || !create_default_material() || !create_default_environment()) {
@@ -152,6 +157,25 @@ bool Renderer::initialize(const RendererCreateInfo& info) {
 
     if (!create_skybox_pipeline_layout() || !create_skybox_pipeline()) {
         return false;
+    }
+
+    // Chronométrage GPU. timestampPeriod donne les nanosecondes par tick : il VARIE d'un
+    // pilote à l'autre, une différence brute de ticks ne veut donc rien dire sans lui.
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(context_.physical_device(), &props);
+    timestamp_period_ = props.limits.timestampPeriod;
+    if (timestamp_period_ <= 0.0f) {
+        // Le device ne sait pas horodater : on renonce, sans faire échouer le rendu.
+        log::warn("Renderer : timestamps GPU indisponibles, profil désactivé");
+    } else {
+        VkQueryPoolCreateInfo qp{};
+        qp.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+        qp.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qp.queryCount = kFramesInFlight * 2;  // début + fin par frame en vol
+        if (vkCreateQueryPool(context_.device(), &qp, nullptr, &timestamp_pool_) != VK_SUCCESS) {
+            timestamp_pool_ = VK_NULL_HANDLE;
+            log::warn("Renderer : création du query pool échouée, profil désactivé");
+        }
     }
 
     log::info("Renderer 3D prêt : {} images, {}x{}", swapchain_.image_count(),
@@ -1169,6 +1193,16 @@ void Renderer::record_shadow_pass(VkCommandBuffer cmd, const std::vector<DrawIte
             if (!mesh.ready || mesh.topology == Topology::Lines) {
                 continue;  // transfert en cours, ou géométrie filaire (ne porte pas d'ombre)
             }
+            // La végétation ne passe PAS par cette boucle. Elle ne le peut pas : ce
+            // pipeline n'a qu'un binding de sommets (il dessinerait UN arbre à l'origine
+            // du groupe, pas les 454), et surtout il n'a AUCUN fragment shader — donc
+            // aucun test alpha, donc chaque carte de feuillage projetterait l'ombre d'un
+            // RECTANGLE plein. Les deux manques se corrigent ensemble (vert instancié +
+            // frag à discard + set 1), pas séparément. En attendant, la végétation ne
+            // porte pas d'ombre — c'est un manque assumé, pas un oubli.
+            if (item.instances != 0 && item.instance_count > 0) {
+                continue;
+            }
 
             // model est déjà relatif à la caméra, et lightViewProj est cadrée dans ce
             // même espace : le produit reste petit et précis.
@@ -1388,6 +1422,148 @@ bool Renderer::create_textured_pipeline_layout() {
 // Le pipeline terrain est le pipeline texturé à DEUX différences près : son fragment
 // (terrain.frag, qui mélange deux jeux) et son layout (set 1 à 6 bindings). Le VERTEX
 // est partagé — la géométrie du terrain est un MeshVertex comme les autres.
+// Pipeline de végétation : mêmes sets et push constants que le texturé (donc même
+// layout), mais un vertex dédié (binding 1 par INSTANCE + vent) et un fragment qui
+// discard. On ne peut donc pas passer par build_surface_pipeline, dont l'entrée de
+// sommets est figée.
+VkPipeline Renderer::build_foliage_pipeline() {
+    VkShaderModule vert = create_shader_module(mesh_instanced_vert_spv, mesh_instanced_vert_spv_size);
+    VkShaderModule frag = create_shader_module(foliage_frag_spv, foliage_frag_spv_size);
+    if (vert == VK_NULL_HANDLE || frag == VK_NULL_HANDLE) {
+        return VK_NULL_HANDLE;
+    }
+    VkPipelineShaderStageCreateInfo vs{};
+    vs.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    vs.stage = VK_SHADER_STAGE_VERTEX_BIT;
+    vs.module = vert;
+    vs.pName = "main";
+    VkPipelineShaderStageCreateInfo fs{};
+    fs.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    fs.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    fs.module = frag;
+    fs.pName = "main";
+    const std::array<VkPipelineShaderStageCreateInfo, 2> stages{vs, fs};
+
+    // DEUX bindings : le maillage (par sommet) et les instances (par INSTANCE). C'est
+    // tout le mécanisme — l'arbre est lu une fois, ses centaines de copies ne coûtent
+    // qu'un jeu de 32 octets chacune.
+    std::array<VkVertexInputBindingDescription, 2> bindings{};
+    bindings[0].binding = 0;
+    bindings[0].stride = sizeof(MeshVertex);
+    bindings[0].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+    bindings[1].binding = 1;
+    bindings[1].stride = sizeof(InstanceData);
+    bindings[1].inputRate = VK_VERTEX_INPUT_RATE_INSTANCE;
+
+    std::array<VkVertexInputAttributeDescription, 6> attrs{};
+    attrs[0] = {0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(MeshVertex, position)};
+    attrs[1] = {1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(MeshVertex, normal)};
+    attrs[2] = {2, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(MeshVertex, uv)};
+    attrs[3] = {3, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(MeshVertex, tangent)};
+    attrs[4] = {4, 1, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(InstanceData, position_scale)};
+    attrs[5] = {5, 1, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(InstanceData, rotation_phase)};
+
+    VkPipelineVertexInputStateCreateInfo vi{};
+    vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vi.vertexBindingDescriptionCount = static_cast<std::uint32_t>(bindings.size());
+    vi.pVertexBindingDescriptions = bindings.data();
+    vi.vertexAttributeDescriptionCount = static_cast<std::uint32_t>(attrs.size());
+    vi.pVertexAttributeDescriptions = attrs.data();
+
+    VkPipelineInputAssemblyStateCreateInfo ia{};
+    ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vp{};
+    vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    vp.viewportCount = 1;
+    vp.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs{};
+    rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;  // une carte de feuillage se voit des DEUX côtés
+    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms{};
+    ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineDepthStencilStateCreateInfo ds{};
+    ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    ds.depthTestEnable = VK_TRUE;
+    ds.depthWriteEnable = VK_TRUE;
+    ds.depthCompareOp = VK_COMPARE_OP_GREATER;  // REVERSE-Z
+    VkPipelineColorBlendAttachmentState ba{};
+    ba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                        VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    // Pas de blending : le discard suffit, et il ne demande AUCUN tri par profondeur —
+    // c'est précisément pourquoi on le préfère à la transparence pour du feuillage.
+    ba.blendEnable = VK_FALSE;
+    VkPipelineColorBlendStateCreateInfo cb{};
+    cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    cb.attachmentCount = 1;
+    cb.pAttachments = &ba;
+    const std::array<VkDynamicState, 2> dyn_states{VK_DYNAMIC_STATE_VIEWPORT,
+                                                   VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dyn{};
+    dyn.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dyn.dynamicStateCount = static_cast<std::uint32_t>(dyn_states.size());
+    dyn.pDynamicStates = dyn_states.data();
+
+    VkGraphicsPipelineCreateInfo pipe{};
+    pipe.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pipe.stageCount = static_cast<std::uint32_t>(stages.size());
+    pipe.pStages = stages.data();
+    pipe.pVertexInputState = &vi;
+    pipe.pInputAssemblyState = &ia;
+    pipe.pViewportState = &vp;
+    pipe.pRasterizationState = &rs;
+    pipe.pMultisampleState = &ms;
+    pipe.pDepthStencilState = &ds;
+    pipe.pColorBlendState = &cb;
+    pipe.pDynamicState = &dyn;
+    pipe.layout = textured_pipeline_layout_;
+    pipe.renderPass = render_pass_;
+    pipe.subpass = 0;
+
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    const VkResult res =
+        vkCreateGraphicsPipelines(context_.device(), VK_NULL_HANDLE, 1, &pipe, nullptr, &pipeline);
+    vkDestroyShaderModule(context_.device(), frag, nullptr);
+    vkDestroyShaderModule(context_.device(), vert, nullptr);
+    if (res != VK_SUCCESS) {
+        log::error("Vulkan : création du pipeline de végétation échouée");
+        return VK_NULL_HANDLE;
+    }
+    return pipeline;
+}
+
+InstanceBufferId Renderer::create_instances(const std::vector<InstanceData>& instances) {
+    if (instances.empty()) {
+        return 0;
+    }
+    const VkDeviceSize size = sizeof(InstanceData) * instances.size();
+    GpuBuffer buffer;
+    if (!context_.create_buffer(size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, /*host_visible=*/true,
+                                buffer)) {
+        log::error("Renderer : allocation d'un tampon d'instances échouée");
+        return 0;
+    }
+    std::memcpy(buffer.mapped, instances.data(), static_cast<std::size_t>(size));
+    const InstanceBufferId id = next_instance_id_++;
+    instance_buffers_.emplace(id, buffer);
+    return id;
+}
+
+void Renderer::destroy_instances(InstanceBufferId id) {
+    const auto it = instance_buffers_.find(id);
+    if (it == instance_buffers_.end()) {
+        return;
+    }
+    // Même règle que les maillages : destruction DIFFÉRÉE, le tampon peut encore être
+    // référencé par une frame en vol.
+    pending_deletes_.push_back(PendingDelete{it->second, frame_index_ + kFramesInFlight + 1});
+    instance_buffers_.erase(it);
+}
+
 VkPipeline Renderer::build_terrain_pipeline() {
     return build_surface_pipeline(terrain_frag_spv, terrain_frag_spv_size,
                                   terrain_pipeline_layout_);
@@ -2558,6 +2734,20 @@ void Renderer::record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     vkBeginCommandBuffer(cmd, &begin);
 
+    // Le reset doit être commandé sur la file, PAS depuis le CPU : les deux requêtes du
+    // slot ont été relues juste avant, et leur ancienne valeur doit disparaître avant
+    // d'être réécrite — sinon vkGetQueryPoolResults rendrait un résultat périmé.
+    const std::uint32_t query_base = current_frame_ * 2;
+    if (timestamp_pool_ != VK_NULL_HANDLE) {
+        vkCmdResetQueryPool(cmd, timestamp_pool_, query_base, 2);
+        // TOP_OF_PIPE : dès que la commande entre dans la file. Le pendant BOTTOM_OF_PIPE
+        // n'est écrit qu'une fois TOUT le travail précédent retiré — l'intervalle couvre
+        // donc bien l'exécution complète, ombres comprises.
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timestamp_pool_,
+                            query_base + 0);
+        timestamp_written_[current_frame_] = true;
+    }
+
     // Ombres d'abord : les cartes doivent être remplies avant que la passe principale
     // ne les échantillonne (la synchro est portée par les dépendances de la render
     // pass d'ombre). Le cadrage des cascades a été calculé dans draw_frame.
@@ -2627,7 +2817,15 @@ void Renderer::record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
             }
             // Le terrain a son propre pipeline et son propre layout (set 1 à 6 bindings) ;
             // tout le reste — vertex, sets 0 et 2, push constants — est commun.
-            const VkPipeline pipeline = material.terrain ? pipeline_terrain_ : pipeline_textured_;
+            const bool instanced = item.instances != 0 && item.instance_count > 0;
+            const auto inst_it = instanced ? instance_buffers_.find(item.instances)
+                                           : instance_buffers_.end();
+            if (instanced && inst_it == instance_buffers_.end()) {
+                continue;  // tampon détruit entre-temps
+            }
+            const VkPipeline pipeline = instanced          ? pipeline_foliage_
+                                        : material.terrain ? pipeline_terrain_
+                                                           : pipeline_textured_;
             const VkPipelineLayout layout =
                 material.terrain ? terrain_pipeline_layout_ : textured_pipeline_layout_;
             const std::array<VkDescriptorSet, 3> sets{frame_ubo, material.descriptor, env_set};
@@ -2639,8 +2837,11 @@ void Renderer::record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
                                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                                sizeof(push), &push);
             vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertex_buffer.buffer, &offset);
+            if (instanced) {
+                vkCmdBindVertexBuffers(cmd, 1, 1, &inst_it->second.buffer, &offset);
+            }
             vkCmdBindIndexBuffer(cmd, mesh.index_buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
-            vkCmdDrawIndexed(cmd, mesh.index_count, 1, 0, 0, 0);
+            vkCmdDrawIndexed(cmd, mesh.index_count, instanced ? item.instance_count : 1, 0, 0, 0);
         } else {
             // Géométrie debug (grille, rails, cubes de secours) : couleur par sommet.
             VkPipeline pipeline =
@@ -2661,6 +2862,11 @@ void Renderer::record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
     record_skybox(cmd);
 
     vkCmdEndRenderPass(cmd);
+
+    if (timestamp_pool_ != VK_NULL_HANDLE) {
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestamp_pool_,
+                            query_base + 1);
+    }
     vkEndCommandBuffer(cmd);
 }
 
@@ -2678,6 +2884,19 @@ void Renderer::draw_frame(const FrameUniforms& uniforms, const std::vector<DrawI
     update_pending_materials();
 
     vkWaitForFences(dev, 1, &in_flight_[current_frame_], VK_TRUE, UINT64_MAX);
+
+    // Le fence vient de garantir que la précédente utilisation de CE slot est terminée :
+    // ses deux timestamps sont donc disponibles, et on les lit SANS attendre. Les
+    // premières frames n'ont encore rien écrit -> VK_NOT_READY, qu'on ignore.
+    if (timestamp_pool_ != VK_NULL_HANDLE && timestamp_written_[current_frame_]) {
+        std::array<std::uint64_t, 2> ticks{};
+        const VkResult qres = vkGetQueryPoolResults(
+            dev, timestamp_pool_, current_frame_ * 2, 2, sizeof(ticks), ticks.data(),
+            sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT);
+        if (qres == VK_SUCCESS && ticks[1] > ticks[0]) {
+            last_gpu_ms_ = static_cast<float>(ticks[1] - ticks[0]) * timestamp_period_ * 1e-6f;
+        }
+    }
 
     std::uint32_t image_index = 0;
     VkResult acquire = vkAcquireNextImageKHR(dev, swapchain_.handle(), UINT64_MAX,
@@ -2795,6 +3014,11 @@ void Renderer::shutdown() {
     }
     vkDeviceWaitIdle(dev);
 
+    if (timestamp_pool_ != VK_NULL_HANDLE) {
+        vkDestroyQueryPool(dev, timestamp_pool_, nullptr);
+        timestamp_pool_ = VK_NULL_HANDLE;
+    }
+
     for (auto& [id, mesh] : meshes_) {
         context_.destroy_buffer(mesh.vertex_buffer);
         if (mesh.indexed) {
@@ -2831,6 +3055,14 @@ void Renderer::shutdown() {
         vkDestroyPipeline(dev, pipeline_terrain_, nullptr);
         pipeline_terrain_ = VK_NULL_HANDLE;
     }
+    if (pipeline_foliage_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(dev, pipeline_foliage_, nullptr);
+        pipeline_foliage_ = VK_NULL_HANDLE;
+    }
+    for (auto& [id, buffer] : instance_buffers_) {
+        context_.destroy_buffer(buffer);
+    }
+    instance_buffers_.clear();
     if (terrain_pipeline_layout_ != VK_NULL_HANDLE) {
         vkDestroyPipelineLayout(dev, terrain_pipeline_layout_, nullptr);
         terrain_pipeline_layout_ = VK_NULL_HANDLE;

@@ -44,6 +44,19 @@ using TextureId = std::uint32_t;
 // DrawItem => le matériau par défaut (tout en textures de secours).
 using MaterialId = std::uint32_t;
 
+// Identifiant opaque d'un tampon d'instances (M11 phase 3). 0 = aucun.
+using InstanceBufferId = std::uint32_t;
+
+// Une instance de végétation. 32 octets alignés, lus en VK_VERTEX_INPUT_RATE_INSTANCE
+// (un jeu par ARBRE, pas par sommet) : c'est tout l'intérêt de l'instanciation.
+struct InstanceData {
+    // xyz = position RELATIVE à l'origine du DrawItem (origine flottante), w = échelle.
+    glm::vec4 position_scale{0.0f, 0.0f, 0.0f, 1.0f};
+    // x = lacet (rad), y = phase de vent, zw = réserve. La phase est calculée depuis la
+    // position MONDE au semis : sans elle, toute la forêt ondulerait à l'unisson.
+    glm::vec4 rotation_phase{0.0f, 0.0f, 0.0f, 0.0f};
+};
+
 // Identifiant opaque d'un environnement (= la cubemap HDR du ciel, M8 étape 6a). 0 =
 // aucun : le Renderer retombe alors sur son nettoyage à la couleur de fond.
 using EnvironmentId = std::uint32_t;

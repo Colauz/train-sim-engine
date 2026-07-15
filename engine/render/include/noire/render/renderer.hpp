@@ -91,6 +91,11 @@ struct DrawItem {
     glm::mat4 model;
     MeshId mesh;
     MaterialId material = 0;
+    // Végétation (M11 phase 3) : si `instances` != 0, le maillage est dessiné
+    // `instance_count` fois, chaque copie étant placée par le tampon d'instances. Le
+    // pipeline change (entrée de sommets différente + vent), pas le matériau.
+    InstanceBufferId instances = 0;
+    std::uint32_t instance_count = 0;
 };
 
 // Renderer générique : il ne connaît PAS la scène. L'app crée des maillages puis
@@ -156,9 +161,22 @@ public:
     // fond). Tant qu'il n'est pas prêt, la skybox n'est simplement pas dessinée.
     void set_environment(EnvironmentId id) { active_environment_ = id; }
 
+    // Tampon d'instances (M11 phase 3). Host-visible et immédiatement utilisable : les
+    // données sont écrites une fois au semis et ne changent plus, et un accès par
+    // INSTANCE (pas par sommet) supporte très bien la mémoire non device-local.
+    InstanceBufferId create_instances(const std::vector<InstanceData>& instances);
+    void destroy_instances(InstanceBufferId id);
+
     void draw_frame(const FrameUniforms& uniforms, const std::vector<DrawItem>& items);
     void wait_idle();
     void notify_resized() { framebuffer_resized_ = true; }
+
+    // Temps GPU de la dernière frame achevée, en millisecondes. À ne PAS confondre avec
+    // le temps de frame CPU : celui-ci est plafonné par le VSync (FIFO), donc il mesure
+    // l'ATTENTE, pas le travail. Les timestamps, eux, chronomètrent l'exécution réelle du
+    // command buffer et ignorent le VSync — c'est la seule mesure honnête de la marge.
+    // 0 tant qu'aucune mesure n'est revenue (les toutes premières frames).
+    [[nodiscard]] float last_gpu_ms() const { return last_gpu_ms_; }
 
 private:
     struct Mesh {
@@ -261,6 +279,7 @@ private:
     bool create_sampler();
     bool create_material_descriptor_layout();  // set=1 : 3 combined image samplers (frag)
     bool create_terrain_descriptor_layout();   // set=1 : 6 (deux jeux PBR)
+    VkPipeline build_foliage_pipeline();       // instancié + discard alpha
     bool create_terrain_pipeline_layout();
     VkPipeline build_terrain_pipeline();
     bool create_material_descriptor_pool();
@@ -357,6 +376,11 @@ private:
     VkDescriptorSetLayout terrain_set_layout_ = VK_NULL_HANDLE;   // set=1 (6 bindings)
     VkPipelineLayout terrain_pipeline_layout_ = VK_NULL_HANDLE;
     VkPipeline pipeline_terrain_ = VK_NULL_HANDLE;
+    // Végétation : même layout que le pipeline texturé (set 1 = 3 textures), seule
+    // l'entrée de sommets diffère (binding 1 par instance) et le fragment discard.
+    VkPipeline pipeline_foliage_ = VK_NULL_HANDLE;
+    std::unordered_map<InstanceBufferId, GpuBuffer> instance_buffers_;
+    InstanceBufferId next_instance_id_ = 1;
     std::unordered_map<TextureId, Texture> textures_;
     std::unordered_map<MaterialId, Material> materials_;
     TextureId next_texture_id_ = 1;
@@ -457,6 +481,17 @@ private:
 
     // Couleur de fond = couleur du brouillard (mise à jour depuis les uniforms).
     glm::vec3 background_color_{0.01f, 0.01f, 0.03f};
+
+    // Chronométrage GPU : 2 timestamps (début/fin du command buffer) par frame en vol.
+    // On relit ceux du slot courant APRÈS son fence — donc les valeurs datent de
+    // kFramesInFlight frames, ce qui est sans importance pour un profil.
+    VkQueryPool timestamp_pool_ = VK_NULL_HANDLE;
+    float timestamp_period_ = 0.0f;  // ns par tick (limite du device)
+    float last_gpu_ms_ = 0.0f;
+    // Un slot n'est lisible qu'une fois SA première frame enregistrée : relire une requête
+    // jamais écrite est une faute (VUID-vkGetQueryPoolResults-None-09401), et pas
+    // seulement une valeur douteuse.
+    std::array<bool, kFramesInFlight> timestamp_written_{};
 
     std::uint32_t current_frame_ = 0;
     bool framebuffer_resized_ = false;
