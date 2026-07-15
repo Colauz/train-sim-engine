@@ -28,16 +28,51 @@ layout(location = 3) in vec4 fragTangent;
 
 layout(location = 0) out vec4 outColor;
 
-// Le grain des textures : 1 unité UV = 8 m côté clipmap, mais une herbe qui se répète
-// tous les 8 m se lit comme un damier. On la répète plus vite (petites touffes) et on
-// laisse le BRUIT, à bien plus grande échelle, casser la régularité.
-const float kDetailRepeat = 4.0;
+// Le grain des textures. 1 unité fragUV = uv_period = 8 m, donc la texture se répète tous
+// les 8/kDetailRepeat mètres.
+//
+// Ce facteur valait 4 — soit une répétition tous les DEUX MÈTRES — au motif qu'« une herbe
+// qui se répète tous les 8 m se lit comme un damier ». C'était l'exact contraire : à 2 m,
+// l'oeil voit des dizaines de copies dans un seul regard et le damier saute aux yeux ; à
+// 8 m il n'en voit que quelques-unes et le motif se dissout. Vérifié à l'image, le réseau
+// de losanges à mi-distance disparaît complètement.
+// `aerial_grass_rock` est d'ailleurs une texture AÉRIENNE, photographiée depuis le ciel :
+// elle est faite pour couvrir plusieurs mètres, pas 2 m.
+const float kDetailRepeat = 1.0;
 
-// Échelles du bruit de transition, en unités UV (donc x8 pour des mètres). Deux octaves
-// très écartées : la grande dessine les PLAQUES (champs, zones rocailleuses), la petite
-// dentelle leurs bords pour qu'aucune frontière ne soit un trait net.
-const float kPatchScale = 0.018;  // ~ 7 m d'UV => plaques de ~55 m
-const float kEdgeScale = 0.30;    // ~ 3 m : dentelle des bords
+// Échelles des bruits, exprimées en 1/(unités fragUV). Une cellule de bruit mesure
+// 1/scale unités fragUV, et 1 unité fragUV = uv_period = 8 M : la longueur d'onde en
+// mètres vaut donc 8/scale. (Les commentaires précédents lisaient 1/scale comme des
+// mètres — ils sous-estimaient d'un facteur 8.)
+// Deux octaves très écartées : la grande dessine les PLAQUES (champs, zones rocailleuses),
+// la petite dentelle leurs bords pour qu'aucune frontière ne soit un trait net.
+const float kPatchScale = 0.018;  // 8/0.018 = ~444 m : les grandes plaques
+const float kEdgeScale = 0.30;    // 8/0.30  = ~27 m  : dentelle des bords
+
+// --- MACRO-VARIATION -----------------------------------------------------------
+// Le carrelage se VOIT à mi-distance, en réseau de losanges : `uv = fragUV * 4` et
+// 1 fragUV = 8 m, donc la texture se répète tous les DEUX MÈTRES. Le tuilage stochastique
+// casse cette grille de près, mais il s'efface avec la distance (ses poids crénellent, cf.
+// common/stochastic.glsl) — et la grille réapparaît exactement là où il abdique.
+//
+// Le remède ici ne cherche PAS à cacher la maille de 2 m : à 200 m de longueur d'onde, on
+// en est à cent fois trop grand pour ça. Il attaque l'autre moitié du problème — l'UNIFORMITÉ.
+// Un « papier peint » se trahit autant par sa régularité locale que par le fait que TOUT
+// se ressemble d'un bout à l'autre du champ. De vastes plages plus claires et plus sombres
+// (variations géologiques de la craie, épaisseur d'herbe) rendent le champ hétérogène, et
+// l'oeil cesse de chercher la grille.
+//
+// Deux octaves, toutes deux TRÈS basses fréquences : c'est ce qui garantit l'absence de
+// grésillement. Un bruit dont la longueur d'onde vaut des centaines de mètres reste étalé
+// sur des dizaines de pixels même à l'horizon — il ne peut PAS créneler, contrairement aux
+// poids barycentriques du stochastique (cellules de 0,58 m) qui, eux, tombaient sous le
+// pixel et grésillaient.
+const float kMacroScaleA = 0.033;  // 8/0.033 = ~240 m
+const float kMacroScaleB = 0.089;  // 8/0.089 = ~90 m
+// Un bruit de gradient culmine à ±0.25 (mesuré, PAS ±0.5) : avec la 2e octave à 0.5, la
+// somme couvre ±0.375, et ce gain la ramène à ±0.17 d'albédo. « Légèrement » : au-delà, le
+// sol se met à ressembler à un ciel nuageux peint au sol, ce qui trahit autant qu'une grille.
+const float kMacroStrength = 0.45;
 
 // Teinte de l'herbe. Nécessaire, et pas cosmétique : TOUTES les textures de sol de Poly
 // Haven sont photographiées en lumière naturelle et tirent vers l'ocre désaturé —
@@ -97,6 +132,17 @@ void main() {
     }
 
     vec3 albedo = mix(gBase * kGrassTint, cBase, chalk);
+
+    // Macro-variation, appliquée PARTOUT et non « seulement au loin ». La réserver à la
+    // distance ferait apparaître puis disparaître les plages à mesure que le train avance :
+    // un artefact MOBILE, donc bien pire que le défaut soigné. Une variation géologique ne
+    // dépend pas de qui la regarde.
+    float macro = gradientNoise(fragUV * kMacroScaleA) +
+                  0.5 * gradientNoise(fragUV * kMacroScaleB);
+    // MULTIPLICATIVE : c'est une variation de RÉFLECTANCE (plus ou moins d'herbe, craie plus
+    // ou moins affleurante), pas une lumière ajoutée. Un additif délaverait les zones sombres
+    // et casserait la cohérence avec l'éclairage.
+    albedo *= max(1.0 + macro * kMacroStrength, 0.0);
     // La RUGOSITÉ est interpolée elle aussi : c'est ce qui fait que le soleil accroche
     // différemment l'herbe (mate) et la craie (plus minérale). Mélanger l'albédo seul
     // donnerait deux couleurs sur un même matériau — l'oeil le voit tout de suite.
