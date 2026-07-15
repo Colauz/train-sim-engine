@@ -49,6 +49,8 @@ void main() {
     // IBL prise sous terre => la moitié du feuillage rendait NOIR. C'était la vraie cause
     // des arbres charbon, bien avant l'albédo.
 
-    // foliage = 1 : active le diffus enveloppé et la transmission (cf. common/pbr.glsl).
-    outColor = vec4(shadeSurfaceEx(base.rgb, metallic, roughness, N, cameraRelPos, 1.0), 1.0);
+    // Le pipeline instancié sert AUSSI les poteaux caténaire (M12), qui ne veulent ni
+    // diffus enveloppé ni transmission : c'est le matériau qui tranche, via pbrFactors.w.
+    outColor = vec4(
+        shadeSurfaceEx(base.rgb, metallic, roughness, N, cameraRelPos, object.pbrFactors.w), 1.0);
 }

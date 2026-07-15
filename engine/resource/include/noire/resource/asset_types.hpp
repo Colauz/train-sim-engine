@@ -31,6 +31,12 @@ struct MaterialData {
     float metallic_factor = 1.0f;
     float roughness_factor = 1.0f;
     float normal_scale = 1.0f;
+    // glTF alphaMode == MASK. Dans ce moteur, c'est le drapeau du FEUILLAGE : il est la
+    // seule chose qui distingue l'écorce (opaque) des cartes de folioles (découpées) dans
+    // un même arbre, et il pilote À LA FOIS le discard et l'éclairage traversant. Il était
+    // jusqu'ici ignoré par le loader, et le feuillage se déduisait de « l'item est
+    // instancié » — ce qui aurait donné de la transmission à un poteau d'acier (M12).
+    bool alpha_mask = false;
 };
 
 // Cubemap d'environnement décodée (CPU), produite par le loader HDR sur un worker.

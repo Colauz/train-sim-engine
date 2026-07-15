@@ -1,4 +1,5 @@
 add_library(noire_scene
+    src/catenary.cpp
     src/track_mesh.cpp
     src/world_streamer.cpp
     src/terrain_clipmap.cpp)

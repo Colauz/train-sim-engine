@@ -34,6 +34,8 @@ noire_add_shaders(noire_render
     shaders/skybox.vert
     shaders/skybox.frag
     shaders/terrain.frag
+    shaders/wire.vert
+    shaders/wire.frag
     shaders/mesh_instanced.vert
     shaders/foliage.frag
     shaders/shadow_instanced.vert

@@ -24,6 +24,8 @@
 #include "shaders/shadow_foliage.frag.spv.h"
 #include "shaders/shadow_instanced.vert.spv.h"
 #include "shaders/terrain.frag.spv.h"
+#include "shaders/wire.frag.spv.h"
+#include "shaders/wire.vert.spv.h"
 #include "shaders/skybox.frag.spv.h"
 #include "shaders/skybox.vert.spv.h"
 
@@ -175,8 +177,9 @@ bool Renderer::initialize(const RendererCreateInfo& info) {
     pipeline_textured_ = build_textured_pipeline();
     pipeline_terrain_ = build_terrain_pipeline();
     pipeline_foliage_ = build_foliage_pipeline();
+    pipeline_wire_ = build_wire_pipeline();
     if (pipeline_textured_ == VK_NULL_HANDLE || pipeline_terrain_ == VK_NULL_HANDLE ||
-        pipeline_foliage_ == VK_NULL_HANDLE) {
+        pipeline_foliage_ == VK_NULL_HANDLE || pipeline_wire_ == VK_NULL_HANDLE) {
         return false;
     }
     if (!create_default_textures() || !create_default_material() || !create_default_environment()) {
@@ -1393,6 +1396,18 @@ void Renderer::record_shadow_pass(VkCommandBuffer cmd, const std::vector<DrawIte
             if (!mesh.ready || mesh.topology == Topology::Lines) {
                 continue;  // transfert en cours, ou géométrie filaire (ne porte pas d'ombre)
             }
+            // Les CÂBLES ne portent pas d'ombre, et ne le peuvent pas : leur ruban est déplié
+            // face à la CAMÉRA par le vertex shader, alors que cette passe regarde depuis le
+            // SOLEIL. Ce pipeline les dessinerait à leur ligne médiane — deux sommets
+            // confondus, donc des triangles dégénérés. L'ombre d'un fil de 15 mm est de
+            // toute façon sous-pixel : on ne perd rien qu'on puisse voir.
+            {
+                const MaterialId mid = item.material != 0 ? item.material : default_material_;
+                const auto mit = materials_.find(mid);
+                if (mit != materials_.end() && mit->second.shading == Shading::Wire) {
+                    continue;
+                }
+            }
             // model est déjà relatif à la caméra, et lightViewProj est cadrée dans ce
             // même espace : le produit reste petit et précis.
             const glm::mat4 light_mvp = cascade.light_view_proj * item.model;
@@ -1576,7 +1591,7 @@ MaterialId Renderer::create_terrain_material(const TerrainMaterialDesc& desc) {
     material.textures = {desc.grass_base, desc.grass_metallic_rough, desc.grass_normal,
                          desc.chalk_base, desc.chalk_metallic_rough, desc.chalk_normal};
     material.texture_count = kTerrainTextures;
-    material.terrain = true;
+    material.shading = Shading::Terrain;
     // Le terrain ne pousse aucun facteur : ses deux jeux portent tout. Les push constants
     // restent envoyés (même layout) mais terrain.frag ne lit que `model`.
     material.base_color_factor = glm::vec4(1.0f);
@@ -1788,6 +1803,124 @@ void Renderer::destroy_instances(InstanceBufferId id) {
     // référencé par une frame en vol.
     pending_deletes_.push_back(PendingDelete{it->second, frame_index_ + kFramesInFlight + 1});
     instance_buffers_.erase(it);
+}
+
+// Pipeline des câbles (M12). Il ne peut pas passer par build_surface_pipeline : son vertex
+// déplie un ruban face-caméra et son fragment sort une COUVERTURE en alpha, donc il lui faut
+// un mélange — ce que la fabrique commune ne fait pas.
+VkPipeline Renderer::build_wire_pipeline() {
+    VkShaderModule vert = create_shader_module(wire_vert_spv, wire_vert_spv_size);
+    VkShaderModule frag = create_shader_module(wire_frag_spv, wire_frag_spv_size);
+    if (vert == VK_NULL_HANDLE || frag == VK_NULL_HANDLE) {
+        return VK_NULL_HANDLE;
+    }
+    VkPipelineShaderStageCreateInfo vs{};
+    vs.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    vs.stage = VK_SHADER_STAGE_VERTEX_BIT;
+    vs.module = vert;
+    vs.pName = "main";
+    VkPipelineShaderStageCreateInfo fs{};
+    fs.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    fs.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    fs.module = frag;
+    fs.pName = "main";
+    const std::array<VkPipelineShaderStageCreateInfo, 2> stages{vs, fs};
+
+    // Entrée de sommets : un MeshVertex ORDINAIRE, réutilisé tel quel. uv.x y porte le côté
+    // du ruban et uv.y le rayon vrai — pas de format de sommet supplémentaire à décrire,
+    // pas de chemin de téléversement à dupliquer.
+    VkVertexInputBindingDescription binding{};
+    binding.binding = 0;
+    binding.stride = sizeof(MeshVertex);
+    binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+    std::array<VkVertexInputAttributeDescription, 4> attrs{};
+    attrs[0] = {0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(MeshVertex, position)};
+    attrs[1] = {1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(MeshVertex, normal)};
+    attrs[2] = {2, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(MeshVertex, uv)};
+    attrs[3] = {3, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(MeshVertex, tangent)};
+
+    VkPipelineVertexInputStateCreateInfo vi{};
+    vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vi.vertexBindingDescriptionCount = 1;
+    vi.pVertexBindingDescriptions = &binding;
+    vi.vertexAttributeDescriptionCount = static_cast<std::uint32_t>(attrs.size());
+    vi.pVertexAttributeDescriptions = attrs.data();
+
+    VkPipelineInputAssemblyStateCreateInfo ia{};
+    ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vp{};
+    vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    vp.viewportCount = 1;
+    vp.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs{};
+    rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;  // le ruban se retourne selon l'angle de vue
+    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms{};
+    ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineDepthStencilStateCreateInfo ds{};
+    ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    ds.depthTestEnable = VK_TRUE;
+    // PAS d'écriture de profondeur : un fragment à 30 % de couverture n'a pas « occupé » sa
+    // profondeur, et l'y inscrire ferait disparaître ce qui passe derrière. Le TEST, lui,
+    // reste actif : un câble derrière un talus est bien rejeté.
+    ds.depthWriteEnable = VK_FALSE;
+    ds.depthCompareOp = VK_COMPARE_OP_GREATER;  // REVERSE-Z
+
+    VkPipelineColorBlendAttachmentState ba{};
+    ba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                        VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    // Mélange « over » classique : la couverture EST l'alpha.
+    ba.blendEnable = VK_TRUE;
+    ba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+    ba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    ba.colorBlendOp = VK_BLEND_OP_ADD;
+    ba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    ba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    ba.alphaBlendOp = VK_BLEND_OP_ADD;
+    VkPipelineColorBlendStateCreateInfo cb{};
+    cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    cb.attachmentCount = 1;
+    cb.pAttachments = &ba;
+
+    const std::array<VkDynamicState, 2> dyn_states{VK_DYNAMIC_STATE_VIEWPORT,
+                                                   VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dyn{};
+    dyn.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dyn.dynamicStateCount = static_cast<std::uint32_t>(dyn_states.size());
+    dyn.pDynamicStates = dyn_states.data();
+
+    VkGraphicsPipelineCreateInfo pipe{};
+    pipe.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pipe.stageCount = static_cast<std::uint32_t>(stages.size());
+    pipe.pStages = stages.data();
+    pipe.pVertexInputState = &vi;
+    pipe.pInputAssemblyState = &ia;
+    pipe.pViewportState = &vp;
+    pipe.pRasterizationState = &rs;
+    pipe.pMultisampleState = &ms;
+    pipe.pDepthStencilState = &ds;
+    pipe.pColorBlendState = &cb;
+    pipe.pDynamicState = &dyn;
+    pipe.layout = textured_pipeline_layout_;
+    pipe.renderPass = render_pass_;
+    pipe.subpass = 0;
+
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    const VkResult res =
+        vkCreateGraphicsPipelines(context_.device(), VK_NULL_HANDLE, 1, &pipe, nullptr, &pipeline);
+    vkDestroyShaderModule(context_.device(), frag, nullptr);
+    vkDestroyShaderModule(context_.device(), vert, nullptr);
+    if (res != VK_SUCCESS) {
+        log::error("Vulkan : création du pipeline de câble échouée");
+        return VK_NULL_HANDLE;
+    }
+    return pipeline;
 }
 
 VkPipeline Renderer::build_terrain_pipeline() {
@@ -2079,8 +2212,11 @@ MaterialId Renderer::create_material(const MaterialDesc& desc) {
     material.textures = {desc.base_color, desc.metallic_roughness, desc.normal, 0, 0, 0};
     material.texture_count = kMaterialTextures;
     material.base_color_factor = desc.base_color_factor;
-    material.pbr_factors =
-        glm::vec4(desc.metallic_factor, desc.roughness_factor, desc.normal_scale, 0.0f);
+    material.shading = desc.shading;
+    // .w porte l'« être du feuillage ». Le mettre dans le MATÉRIAU et non dans le pipeline
+    // est ce qui permet à l'arbre et au poteau de partager le pipeline instancié.
+    material.pbr_factors = glm::vec4(desc.metallic_factor, desc.roughness_factor,
+                                     desc.normal_scale, desc.foliage ? 1.0f : 0.0f);
 
     VkDescriptorSetAllocateInfo alloc{};
     alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
@@ -3049,11 +3185,14 @@ void Renderer::record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
             if (instanced && inst_it == instance_buffers_.end()) {
                 continue;  // tampon détruit entre-temps
             }
-            const VkPipeline pipeline = instanced          ? pipeline_foliage_
-                                        : material.terrain ? pipeline_terrain_
-                                                           : pipeline_textured_;
+            const bool terrain = material.shading == Shading::Terrain;
+            const VkPipeline pipeline =
+                material.shading == Shading::Wire ? pipeline_wire_
+                : terrain                         ? pipeline_terrain_
+                : instanced                       ? pipeline_foliage_
+                                                  : pipeline_textured_;
             const VkPipelineLayout layout =
-                material.terrain ? terrain_pipeline_layout_ : textured_pipeline_layout_;
+                terrain ? terrain_pipeline_layout_ : textured_pipeline_layout_;
             const std::array<VkDescriptorSet, 3> sets{frame_ubo, material.descriptor, env_set};
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0,
@@ -3150,6 +3289,11 @@ void Renderer::draw_frame(const FrameUniforms& uniforms, const std::vector<DrawI
     gpu.proj = uniforms.proj;
     gpu.fog_color_density = uniforms.fog_color_density;
     gpu.params = uniforms.params;
+    // z,w = taille du viewport en pixels. Renseignée ICI et pas par l'app : le Renderer est
+    // le seul à connaître l'étendue réelle de la swapchain, et elle change au redimensionnement.
+    // wire.vert en a besoin pour convertir une largeur en MÈTRES en une largeur en PIXELS.
+    gpu.params.z = static_cast<float>(swapchain_.extent().width);
+    gpu.params.w = static_cast<float>(swapchain_.extent().height);
     gpu.sun_direction = uniforms.sun_direction;
     gpu.sun_color = uniforms.sun_color;
     for (std::size_t i = 0; i < uniforms.sh.size(); ++i) {
@@ -3284,6 +3428,10 @@ void Renderer::shutdown() {
     if (pipeline_foliage_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(dev, pipeline_foliage_, nullptr);
         pipeline_foliage_ = VK_NULL_HANDLE;
+    }
+    if (pipeline_wire_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(dev, pipeline_wire_, nullptr);
+        pipeline_wire_ = VK_NULL_HANDLE;
     }
     for (auto& [id, buffer] : instance_buffers_) {
         context_.destroy_buffer(buffer);

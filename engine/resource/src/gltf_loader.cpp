@@ -87,6 +87,7 @@ int resolve_material(const cgltf_material* material, const std::string& gltf_dir
     }
 
     MaterialData data;
+    data.alpha_mask = material->alpha_mode == cgltf_alpha_mode_mask;
     if (material->has_pbr_metallic_roughness) {
         const cgltf_pbr_metallic_roughness& pbr = material->pbr_metallic_roughness;
         data.base_color_factor =

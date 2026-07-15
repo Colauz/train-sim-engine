@@ -29,7 +29,9 @@ mat3 foliageYaw(float yaw) {
 // Position d'un sommet DANS le repère de l'instance : échelle, lacet, puis vent.
 //   inPosition        : sommet du maillage d'arbre (lu une fois, partagé par toutes)
 //   instPositionScale : xyz = position relative au groupe, w = échelle
-//   instRotationPhase : x = lacet (rad), y = phase de vent
+//   instRotationPhase : x = lacet (rad), y = phase de vent, z = AMPLITUDE du vent
+//                       (1 = arbre, 0 = mât rigide : un poteau caténaire d'acier partage ce
+//                        pipeline et ne doit pas ployer)
 //   t                 : temps (s)
 //
 // La phase vient de la POSITION MONDE de l'instance (calculée au semis) : sans elle,
@@ -46,6 +48,7 @@ vec3 foliageLocal(vec3 inPosition, vec4 instPositionScale, vec4 instRotationPhas
     float phase = instRotationPhase.y;
     // Deux fréquences incommensurables : une seule sinusoïde se lit comme un métronome.
     float sway = (sin(t * kWindSpeed + phase) + 0.45 * sin(t * kWindSpeed * 2.37 + phase * 1.7));
+    sway *= instRotationPhase.z;  // 0 => rigide
     local.x += sway * kWindAmplitude * weight;
     local.z += sway * kWindAmplitude * 0.55 * weight;
     return local;

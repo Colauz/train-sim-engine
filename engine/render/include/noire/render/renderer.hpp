@@ -66,6 +66,16 @@ struct FrameUniforms {
 // l'app à create_material(). Chaque texture peut valoir 0 => texture de secours du
 // rôle correspondant, ce qui laisse le facteur seul décider (ex. un rail = pas de
 // texture + base_color_factor gris acier).
+// Quel pipeline dessine une surface. Ce choix NE PEUT PAS se déduire du reste : un poteau
+// caténaire est instancié mais s'éclaire comme n'importe quelle surface, alors qu'un arbre
+// instancié veut le vent et la transmission. Avant le M12, « instancié » valait « feuillage »
+// — les deux étaient confondus, et le premier poteau se serait balancé dans le vent.
+enum class Shading {
+    Textured,  // surface opaque ordinaire (set 1 = 3 textures)
+    Terrain,   // set 1 = 6 textures (2 jeux PBR) + splatting
+    Wire,      // câble : ruban face-caméra, largeur clampée au pixel + couverture (M12)
+};
+
 struct MaterialDesc {
     TextureId base_color = 0;          // sRGB
     TextureId metallic_roughness = 0;  // linéaire — G = roughness, B = metallic (glTF)
@@ -75,6 +85,11 @@ struct MaterialDesc {
     float metallic_factor = 1.0f;   // défauts glTF
     float roughness_factor = 1.0f;
     float normal_scale = 1.0f;
+    Shading shading = Shading::Textured;
+    // Feuillage : diffus enveloppé + transmission (cf. shadeSurfaceEx). Porté par le
+    // MATÉRIAU et non par le pipeline, pour que le pipeline instancié serve aussi bien un
+    // arbre qu'un poteau d'acier.
+    bool foliage = false;
 };
 
 // Matériau de terrain : deux jeux PBR complets (M11 phase 2). Chaque texture peut valoir
@@ -217,7 +232,7 @@ private:
         // 3 textures (matériau ordinaire) ou 6 (terrain : herbe + craie).
         std::array<TextureId, 6> textures{};
         std::uint32_t texture_count = 3;
-        bool terrain = false;  // => set layout et pipeline terrain
+        Shading shading = Shading::Textured;
         glm::vec4 base_color_factor{1.0f};
         glm::vec4 pbr_factors{1.0f, 1.0f, 1.0f, 0.0f};  // x=metallic, y=roughness, z=normal_scale
         bool written = false;
@@ -284,7 +299,8 @@ private:
     bool create_sampler();
     bool create_material_descriptor_layout();  // set=1 : 3 combined image samplers (frag)
     bool create_terrain_descriptor_layout();   // set=1 : 6 (deux jeux PBR)
-    VkPipeline build_foliage_pipeline();       // instancié + discard alpha
+    VkPipeline build_foliage_pipeline();
+    VkPipeline build_wire_pipeline();       // instancié + discard alpha
     bool create_terrain_pipeline_layout();
     VkPipeline build_terrain_pipeline();
     bool create_material_descriptor_pool();
@@ -387,7 +403,11 @@ private:
     VkPipeline pipeline_terrain_ = VK_NULL_HANDLE;
     // Végétation : même layout que le pipeline texturé (set 1 = 3 textures), seule
     // l'entrée de sommets diffère (binding 1 par instance) et le fragment discard.
+    // Pipeline INSTANCIÉ (entrée de sommets à 2 bindings). Sert la végétation ET les
+    // poteaux caténaire : ce qui les distingue est dans le matériau (foliage) et dans
+    // l'instance (amplitude du vent), pas dans le pipeline.
     VkPipeline pipeline_foliage_ = VK_NULL_HANDLE;
+    VkPipeline pipeline_wire_ = VK_NULL_HANDLE;  // câbles (M12) : ruban + fondu alpha
     std::unordered_map<InstanceBufferId, GpuBuffer> instance_buffers_;
     InstanceBufferId next_instance_id_ = 1;
     std::unordered_map<TextureId, Texture> textures_;

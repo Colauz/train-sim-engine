@@ -24,6 +24,7 @@
 #include "noire/render/vertex.hpp"
 #include "noire/resource/asset_paths.hpp"
 #include "noire/resource/resource_manager.hpp"
+#include "noire/scene/catenary.hpp"
 #include "noire/scene/track_mesh.hpp"
 #include "noire/scene/terrain_clipmap.hpp"
 #include "noire/scene/world_streamer.hpp"
@@ -96,6 +97,13 @@ constexpr glm::vec3 kBallastColor{0.20f, 0.19f, 0.17f};   // gravier gris sombre
 // cellule. Aucun état, aucun compteur, aucun aléa de frame — le train peut repasser, la
 // tuile être déchargée puis régénérée, l'app redémarrer : la forêt est identique. C'est
 // aussi ce qui permet de la semer depuis un worker sans la moindre synchronisation.
+// --- Caténaire (M12) ---
+// Fenêtre engendrée de part et d'autre du train, et pas de re-génération. La fenêtre est
+// LARGE parce que c'est justement au loin que le rendu des câbles se joue : à 2 km, un fil
+// de contact fait 0,005 pixel, et c'est là qu'on veut le voir tenir.
+constexpr double kCatenaryRange = 2000.0;
+constexpr double kCatenaryStep = 200.0;
+
 constexpr double kTreeCell = 26.0;        // une cellule de semis, en mètres
 constexpr double kTreeHalfWidth = 260.0;  // portée latérale de part et d'autre de la voie
 // Au-delà, un arbre de 7 m couvre moins d'un pixel : le semer ne coûterait que des
@@ -287,6 +295,23 @@ struct Application::Impl {
     // Voie : trois matériaux partagés par toutes les tuiles (M9). Sans texture pour
     // l'instant — les UV sont générés et à l'échelle physique, prêts à en recevoir.
     render::MaterialId rail_material = 0;
+    // --- Caténaire (M12) ---
+    scene::CatenaryProfile catenary_profile{};
+    render::MeshId pole_mesh = 0;          // un seul poteau, instancié le long de la ligne
+    render::MaterialId pole_material = 0;
+    render::MaterialId wire_material = 0;
+    render::MeshId catenary_mesh = 0;      // les fils : rubans, pipeline câble
+    render::MeshId catenary_uploading = 0; // sas : cf. TerrainClipmap (le sol clignotait)
+    WorldPosition catenary_origin{};
+    WorldPosition catenary_uploading_origin{};
+    render::InstanceBufferId pole_instances = 0;
+    std::uint32_t pole_count = 0;
+    // Origine PROPRE aux poteaux : leurs instances sont écrites tout de suite, alors que les
+    // fils attendent le sas. Les deux origines divergent donc pendant un téléversement, et
+    // partager `catenary_origin` décalerait les poteaux de la longueur du pas.
+    WorldPosition pole_origin{};
+    long catenary_snap = 0;
+    bool catenary_valid = false;
     render::MaterialId sleeper_material = 0;
     render::MaterialId ballast_material = 0;
     // Terrain : secours = le sol procédural, remplacé par le splatting dès qu'il est prêt.
@@ -393,6 +418,30 @@ struct Application::Impl {
         ballast_desc.metallic_factor = 0.0f;   // gravier : diélectrique
         ballast_desc.roughness_factor = 0.95f;  // aucun reflet spéculaire net
         ballast_material = renderer.create_material(ballast_desc);
+
+        // --- Caténaire (M12) ---
+        // Le poteau : acier galvanisé, mat et clair. `foliage` reste FAUX — il partage le
+        // pipeline instancié avec les arbres, mais ni le vent ni la transmission.
+        render::MaterialDesc pole_desc;
+        pole_desc.base_color_factor = glm::vec4(0.52f, 0.54f, 0.56f, 1.0f);
+        pole_desc.metallic_factor = 1.0f;
+        pole_desc.roughness_factor = 0.62f;  // galvanisé : mat, pas un miroir
+        pole_material = renderer.create_material(pole_desc);
+
+        // Les fils : cuivre patiné pour le contact, acier pour le porteur. Un seul matériau
+        // pour les trois — à 0,005 pixel de large, la nuance ne se lit pas ; ce qui se lit,
+        // c'est le CONTRASTE sur le ciel.
+        render::MaterialDesc wire_desc;
+        wire_desc.shading = render::Shading::Wire;
+        wire_desc.base_color_factor = glm::vec4(0.28f, 0.20f, 0.15f, 1.0f);  // cuivre oxydé
+        wire_desc.metallic_factor = 1.0f;
+        wire_desc.roughness_factor = 0.45f;
+        wire_material = renderer.create_material(wire_desc);
+
+        const scene::RailMeshData pole = scene::generate_pole_mesh(catenary_profile);
+        pole_mesh = renderer.create_mesh_indexed(pole.vertices, pole.indices);
+        log::info("M12 : poteau caténaire — {} sommets, {} triangles", pole.vertices.size(),
+                  pole.indices.size() / 3);
 
         bogie_mesh = renderer.create_mesh(make_box_vertices(glm::vec3(0.85f, 0.15f, 0.15f)),
                                           render::Topology::Triangles);
@@ -577,10 +626,12 @@ struct Application::Impl {
                 // La phase de vent vient de la position MONDE : deux arbres voisins ne
                 // peuvent pas onduler en cadence, et la phase ne change JAMAIS, même
                 // quand le semis est refait.
+                // z = 1 : AMPLITUDE du vent. Le pipeline instancié sert aussi les poteaux
+                // caténaire, qui la mettent à 0 — c'est l'instance qui décide de ployer ou non.
                 inst.rotation_phase =
                     glm::vec4(static_cast<float>((h2 & 0xffffu) / 65535.0 * 6.2831853),
                               static_cast<float>(std::fmod(wx * 0.37 + wz * 0.21, 6.2831853)),
-                              0.0f, 0.0f);
+                              1.0f, 0.0f);
                 instances.push_back(inst);
             }
         }
@@ -591,6 +642,53 @@ struct Application::Impl {
         tree_instances = renderer.create_instances(instances);
         tree_count = static_cast<std::uint32_t>(instances.size());
         tree_origin = wp;
+    }
+
+    // Caténaire : ré-engendrée quand le train a franchi kCatenaryStep. Les poteaux étant
+    // calés sur une grille ABSOLUE de chainage, deux fenêtres successives replacent les
+    // mêmes poteaux aux mêmes endroits : rien ne saute.
+    void update_catenary() {
+        // LE SAS, comme TerrainClipmap : create_mesh_indexed est ASYNCHRONE et le Renderer
+        // saute tout maillage non prêt. Substituer tout de suite ferait DISPARAÎTRE la
+        // caténaire le temps du téléversement — exactement le bug qui faisait clignoter le
+        // sol tous les 16 m.
+        if (catenary_uploading != 0 && renderer.is_mesh_ready(catenary_uploading)) {
+            if (catenary_mesh != 0) {
+                renderer.destroy_mesh(catenary_mesh);
+            }
+            catenary_mesh = catenary_uploading;
+            catenary_origin = catenary_uploading_origin;
+            catenary_uploading = 0;
+            catenary_valid = true;
+        }
+        const long snap = std::lround(wagon.chainage() / kCatenaryStep);
+        if (catenary_uploading != 0 || (catenary_valid && snap == catenary_snap)) {
+            return;
+        }
+
+        const double center = static_cast<double>(snap) * kCatenaryStep;
+        glm::dvec3 pos, tangent;
+        track.sample(center, pos, tangent);
+        const WorldPosition origin{pos};
+        const scene::CatenaryData data = scene::generate_catenary(
+            track, center - kCatenaryRange, center + kCatenaryRange, origin, catenary_profile);
+
+        const render::MeshId fresh =
+            renderer.create_mesh_indexed(data.wires.vertices, data.wires.indices);
+        if (fresh != 0) {
+            catenary_uploading = fresh;
+            catenary_uploading_origin = origin;
+            catenary_snap = snap;
+        }
+        // Les poteaux, eux, sont un tampon HOST-VISIBLE : il est écrit et lisible tout de
+        // suite, sans transfert asynchrone. Aucun sas nécessaire, et la substitution ne peut
+        // rien faire disparaître.
+        if (pole_instances != 0) {
+            renderer.destroy_instances(pole_instances);
+        }
+        pole_instances = renderer.create_instances(data.poles);
+        pole_count = static_cast<std::uint32_t>(data.poles.size());
+        pole_origin = origin;
     }
 
     void render_frame() {
@@ -677,6 +775,7 @@ struct Application::Impl {
 
         // Streaming (thread principal), toujours exécuté (même minimisé).
         streamer.update(wagon.chainage(), renderer);
+        update_catenary();
         clipmap.update(wagon.body_position(), renderer);
 
         // Végétation : re-semée quand le train franchit une cellule. Le semis étant
@@ -859,6 +958,18 @@ struct Application::Impl {
             }
         }
 
+        // Poteaux caténaire (M12) : OPAQUES, donc avec le reste. Un seul draw call pour
+        // toute la ligne visible — même mât, seuls sa position et son lacet changent.
+        if (pole_mesh != 0 && pole_instances != 0 && pole_count > 0) {
+            render::DrawItem item;
+            item.model = camera.relative_model(pole_origin);
+            item.mesh = pole_mesh;
+            item.material = pole_material;
+            item.instances = pole_instances;
+            item.instance_count = pole_count;
+            items.push_back(item);
+        }
+
         // Locomotive : dessinée avec le transform EXACT de la caisse — position,
         // orientation, pitch et heave issus de la physique multi-corps (M4) — suivi du
         // CALIBRAGE du modèle (M9). Ce dernier facteur est le point d'insertion pour un
@@ -885,6 +996,14 @@ struct Application::Impl {
                                          wagon.body_orientation() *
                                          glm::scale(glm::mat4(1.0f), glm::vec3(2.8f, 2.6f, 18.0f));
             items.push_back(render::DrawItem{body_model, body_mesh});
+        }
+
+        // LES CÂBLES EN DERNIER, et ce n'est pas un détail : ils sont MÉLANGÉS et n'écrivent
+        // pas la profondeur. Tout ce qui est opaque doit donc déjà avoir posé la sienne,
+        // sans quoi un fil se peindrait par-dessus un talus qui le cache.
+        if (catenary_mesh != 0) {
+            items.push_back(render::DrawItem{camera.relative_model(catenary_origin),
+                                             catenary_mesh, wire_material});
         }
 
         renderer.draw_frame(uniforms, items);
