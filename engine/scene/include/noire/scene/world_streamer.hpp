@@ -28,9 +28,14 @@ struct StreamerConfig {
     RailProfile rail_profile{};
 };
 
-// Info de rendu d'un chunk : son mesh + son origine (pour l'origine flottante).
+// Info de rendu d'un chunk : ses maillages + son origine (pour l'origine flottante).
+// TROIS maillages depuis le M9 : un maillage ne porte qu'un descriptor set, et acier /
+// béton / gravier sont trois matériaux distincts. Un identifiant peut valoir 0 (partie
+// vide, ex. pas de traverse dans une tuile plus courte que l'entraxe).
 struct ChunkRenderInfo {
-    render::MeshId mesh = 0;
+    render::MeshId rails = 0;
+    render::MeshId sleepers = 0;
+    render::MeshId ballast = 0;
     WorldPosition origin{};
 };
 
@@ -64,8 +69,10 @@ private:
         double x_end = 0.0;
         WorldPosition origin{};
         std::atomic<State> state{State::Generating};
-        RailMeshData cpu_mesh;  // rempli par le worker (sommets PBR + indices)
-        render::MeshId mesh = 0;
+        TrackMeshData cpu_mesh;  // rempli par le worker (rails + traverses + ballast)
+        render::MeshId rails = 0;
+        render::MeshId sleepers = 0;
+        render::MeshId ballast = 0;
         bool has_mesh = false;
     };
 

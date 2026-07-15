@@ -7,68 +7,182 @@ namespace noire::scene {
 
 namespace {
 
-// Une section transversale du rail : 4 coins + le centre de la section, qui sert à
-// orienter les normales vers l'EXTÉRIEUR sans avoir à raisonner sur le winding.
-struct Ring {
-    glm::vec3 bl, br, tr, tl;
-    glm::vec3 mid;
-    float u = 0.0f;  // coordonnée de texture le long du rail
+// Repère local de la voie en un point de chainage. `center` est sur le PLAN DE ROULEMENT
+// (cf. la convention en tête de track_mesh.hpp) : tout se construit en dessous.
+struct Frame {
+    glm::vec3 center;
+    glm::vec3 right;
+    glm::vec3 up;
+    float u = 0.0f;  // coordonnée de texture le long de la voie
 };
 
-Ring make_ring(const glm::vec3& center, const glm::vec3& right, float half_width, float height,
-               float u) {
-    const glm::vec3 up(0.0f, 1.0f, 0.0f);
-    Ring ring;
-    ring.bl = center - right * half_width;
-    ring.br = center + right * half_width;
-    ring.tr = center + right * half_width + up * height;
-    ring.tl = center - right * half_width + up * height;
-    ring.mid = center + up * (height * 0.5f);
-    ring.u = u;
-    return ring;
+// Un point du profil transversal, dans le plan (lateral, vertical) de la voie.
+struct P2 {
+    float s;  // latéral (+ = vers la droite de la voie)
+    float t;  // vertical (0 = plan de roulement, négatif = vers le bas)
+};
+
+glm::vec3 world_of(const Frame& f, const P2& p, float lateral_offset) {
+    return f.center + f.right * (p.s + lateral_offset) + f.up * p.t;
 }
 
-// Émet un quad (a,b,c,d) où a->b suit le rail (u croissant) et a->d traverse la face
-// (v croissant). Normale et tangente sont déduites de la GÉOMÉTRIE : la normale est
-// retournée si besoin pour pointer à l'opposé de `mid`, donc toujours vers l'extérieur.
-void add_quad(RailMeshData& out, const glm::vec3& a, const glm::vec3& b, const glm::vec3& c,
-              const glm::vec3& d, float u_a, float u_b, const glm::vec3& mid) {
-    const glm::vec3 tangent = glm::normalize(b - a);    // sens des u
-    const glm::vec3 across = glm::normalize(d - a);     // sens des v
-    glm::vec3 normal = glm::normalize(glm::cross(tangent, across));
-
-    const glm::vec3 quad_center = (a + b + c + d) * 0.25f;
-    if (glm::dot(normal, quad_center - mid) < 0.0f) {
-        normal = -normal;
+// Extrude un profil le long des frames.
+//
+// NORMALES : elles viennent du WINDING du profil, PAS d'un « à l'opposé du centre ».
+// L'ancienne astuce (M8) marchait sur une boîte convexe mais ment sur un profil en I :
+// la face supérieure du patin pointerait vers le bas, puisqu'elle est plus proche du
+// bord que du centre de section. Ici, profil parcouru dans le sens TRIGONOMÉTRIQUE
+// (s vers la droite, t vers le haut) => la normale sortante d'une arête d est
+// (d.t, -d.s). Vérification : arête du bas parcourue vers +s => normale (0,-1), soit
+// vers le bas. Correct.
+//
+// Les sommets ne sont JAMAIS partagés entre faces : chaque quad porte sa propre normale,
+// donc toutes les arêtes restent franches (un rail est anguleux, pas lissé).
+void extrude(RailMeshData& out, const std::vector<Frame>& frames, const std::vector<P2>& profile,
+             bool closed, float lateral_offset, float uv_period) {
+    if (frames.size() < 2 || profile.size() < 2) {
+        return;
     }
-    // Handedness glTF : la bitangente reconstruite par cross(N,T)*w doit suivre v.
-    const float w = glm::dot(glm::cross(normal, tangent), across) < 0.0f ? -1.0f : 1.0f;
-    const glm::vec4 tangent4(tangent, w);
+    const std::size_t edges = closed ? profile.size() : profile.size() - 1;
 
-    const auto base = static_cast<std::uint32_t>(out.vertices.size());
-    out.vertices.push_back(render::MeshVertex{a, normal, {u_a, 0.0f}, tangent4});
-    out.vertices.push_back(render::MeshVertex{b, normal, {u_b, 0.0f}, tangent4});
-    out.vertices.push_back(render::MeshVertex{c, normal, {u_b, 1.0f}, tangent4});
-    out.vertices.push_back(render::MeshVertex{d, normal, {u_a, 1.0f}, tangent4});
-    out.indices.insert(out.indices.end(),
-                       {base, base + 1, base + 2, base, base + 2, base + 3});
+    // v = distance cumulée LE LONG DU PROFIL / période : la texture garde la même
+    // échelle physique en travers qu'en long.
+    std::vector<float> v_coord(profile.size() + 1, 0.0f);
+    for (std::size_t j = 0; j < edges; ++j) {
+        const P2& p0 = profile[j];
+        const P2& p1 = profile[(j + 1) % profile.size()];
+        const float len = std::sqrt((p1.s - p0.s) * (p1.s - p0.s) + (p1.t - p0.t) * (p1.t - p0.t));
+        v_coord[j + 1] = v_coord[j] + len / uv_period;
+    }
+
+    for (std::size_t i = 0; i + 1 < frames.size(); ++i) {
+        const Frame& f0 = frames[i];
+        const Frame& f1 = frames[i + 1];
+        for (std::size_t j = 0; j < edges; ++j) {
+            const P2& p0 = profile[j];
+            const P2& p1 = profile[(j + 1) % profile.size()];
+
+            const float ds = p1.s - p0.s;
+            const float dt = p1.t - p0.t;
+            const float len = std::sqrt(ds * ds + dt * dt);
+            if (len < 1e-6f) {
+                continue;  // arête dégénérée : rien à extruder
+            }
+            // Normale sortante 2D, ramenée dans le repère monde de la voie.
+            const glm::vec3 normal =
+                glm::normalize(f0.right * (dt / len) + f0.up * (-ds / len));
+
+            const glm::vec3 a = world_of(f0, p0, lateral_offset);
+            const glm::vec3 b = world_of(f1, p0, lateral_offset);
+            const glm::vec3 c = world_of(f1, p1, lateral_offset);
+            const glm::vec3 d = world_of(f0, p1, lateral_offset);
+
+            const glm::vec3 tangent = glm::normalize(b - a);  // sens des u (le long du rail)
+            // Handedness glTF : cross(N,T)*w doit suivre les v croissants (a -> d).
+            const float w = glm::dot(glm::cross(normal, tangent), d - a) < 0.0f ? -1.0f : 1.0f;
+            const glm::vec4 tangent4(tangent, w);
+
+            const auto base = static_cast<std::uint32_t>(out.vertices.size());
+            out.vertices.push_back(render::MeshVertex{a, normal, {f0.u, v_coord[j]}, tangent4});
+            out.vertices.push_back(render::MeshVertex{b, normal, {f1.u, v_coord[j]}, tangent4});
+            out.vertices.push_back(render::MeshVertex{c, normal, {f1.u, v_coord[j + 1]}, tangent4});
+            out.vertices.push_back(render::MeshVertex{d, normal, {f0.u, v_coord[j + 1]}, tangent4});
+            out.indices.insert(out.indices.end(),
+                               {base, base + 1, base + 2, base, base + 2, base + 3});
+        }
+    }
 }
 
-// Relie deux sections par les 4 faces du rail. Les sommets ne sont PAS partagés entre
-// faces : chaque face garde sa propre normale => arêtes franches (un rail est anguleux).
-void connect(RailMeshData& out, const Ring& a, const Ring& b) {
-    const glm::vec3 mid = (a.mid + b.mid) * 0.5f;
-    add_quad(out, a.bl, b.bl, b.br, a.br, a.u, b.u, mid);  // dessous
-    add_quad(out, a.br, b.br, b.tr, a.tr, a.u, b.u, mid);  // flanc
-    add_quad(out, a.tr, b.tr, b.tl, a.tl, a.u, b.u, mid);  // dessus (table de roulement)
-    add_quad(out, a.tl, b.tl, b.bl, a.bl, a.u, b.u, mid);  // flanc opposé
+// Boîte orientée (traverse) : 6 faces, normales explicites, sommets non partagés.
+void add_box(RailMeshData& out, const glm::vec3& center, const glm::vec3& right,
+             const glm::vec3& forward, const glm::vec3& up, const glm::vec3& half,
+             float uv_period) {
+    const glm::vec3 x = right * half.x;
+    const glm::vec3 y = up * half.y;
+    const glm::vec3 z = forward * half.z;
+
+    // Chaque face : sa normale, son axe u et son axe v (avec leurs demi-longueurs).
+    const struct {
+        glm::vec3 n, uu, vv, offset;
+        float ul, vl;
+    } faces[6] = {
+        {up, right, forward, y, half.x, half.z},          // dessus
+        {-up, right, -forward, -y, half.x, half.z},       // dessous
+        {right, forward, up, x, half.z, half.y},          // flanc droit
+        {-right, -forward, up, -x, half.z, half.y},       // flanc gauche
+        {forward, right, up, z, half.x, half.y},          // bout avant
+        {-forward, -right, up, -z, half.x, half.y},       // bout arrière
+    };
+
+    for (const auto& f : faces) {
+        const glm::vec3 c = center + f.offset;
+        const glm::vec3 du = f.uu * f.ul;
+        const glm::vec3 dv = f.vv * f.vl;
+        const glm::vec3 a = c - du - dv;
+        const glm::vec3 b = c + du - dv;
+        const glm::vec3 cc = c + du + dv;
+        const glm::vec3 d = c - du + dv;
+
+        const glm::vec3 tangent = glm::normalize(f.uu);
+        const float w = glm::dot(glm::cross(f.n, tangent), f.vv) < 0.0f ? -1.0f : 1.0f;
+        const glm::vec4 tangent4(tangent, w);
+        // UV en MÈTRES / période : le grain du béton ne dépend pas de la face.
+        const float us = f.ul * 2.0f / uv_period;
+        const float vs = f.vl * 2.0f / uv_period;
+
+        const auto base = static_cast<std::uint32_t>(out.vertices.size());
+        out.vertices.push_back(render::MeshVertex{a, f.n, {0.0f, 0.0f}, tangent4});
+        out.vertices.push_back(render::MeshVertex{b, f.n, {us, 0.0f}, tangent4});
+        out.vertices.push_back(render::MeshVertex{cc, f.n, {us, vs}, tangent4});
+        out.vertices.push_back(render::MeshVertex{d, f.n, {0.0f, vs}, tangent4});
+        out.indices.insert(out.indices.end(),
+                           {base, base + 1, base + 2, base, base + 2, base + 3});
+    }
+}
+
+// Profil du rail : polyligne FERMÉE, sens trigonométrique, t = 0 au plan de roulement.
+// Silhouette en I : patin large, âme mince, champignon. Les congés réels sont des arcs ;
+// on les réduit à un chanfrein droit, invisible à l'échelle où l'on voit un rail.
+std::vector<P2> make_rail_profile(const RailProfile& p) {
+    const float top = 0.0f;                 // plan de roulement
+    const float bottom = -p.rail_height;    // dessous du patin
+    const float foot_top = bottom + 0.030f; // épaisseur du patin
+    const float head_bottom = top - 0.040f; // hauteur du champignon
+    const float fillet = 0.012f;            // chanfrein patin -> âme et âme -> champignon
+
+    return {
+        {-p.rail_foot_half, bottom},               // patin, dessous gauche
+        {p.rail_foot_half, bottom},                // patin, dessous droit
+        {p.rail_foot_half, foot_top - fillet},     // chant du patin
+        {p.rail_web_half, foot_top + fillet},      // congé vers l'âme
+        {p.rail_web_half, head_bottom - fillet},   // âme, côté droit
+        {p.rail_head_half, head_bottom + fillet},  // évasement du champignon
+        {p.rail_head_half, top},                   // champignon, dessus droit
+        {-p.rail_head_half, top},                  // plan de roulement
+        {-p.rail_head_half, head_bottom + fillet},
+        {-p.rail_web_half, head_bottom - fillet},  // âme, côté gauche
+        {-p.rail_web_half, foot_top + fillet},
+        {-p.rail_foot_half, foot_top - fillet},
+    };
+}
+
+// Profil du ballast : polyligne OUVERTE (le dessous est enterré, on ne le maille pas).
+// Parcourue de DROITE à GAUCHE, ce qui correspond au sens trigonométrique pour une
+// surface supérieure — la même formule de normale que le rail s'applique donc.
+std::vector<P2> make_ballast_profile(const RailProfile& p) {
+    return {
+        {p.ballast_base_half, p.ballast_base_y},    // pied du talus droit
+        {p.ballast_crown_half, p.ballast_crown_y},  // arête du plateau, droite
+        {-p.ballast_crown_half, p.ballast_crown_y}, // plateau
+        {-p.ballast_base_half, p.ballast_base_y},   // pied du talus gauche
+    };
 }
 
 }  // namespace
 
-RailMeshData generate_rail_mesh(const TrackSource& track, double x_start, double x_end,
-                                const WorldPosition& origin, const RailProfile& profile) {
-    RailMeshData out;
+TrackMeshData generate_track_mesh(const TrackSource& track, double x_start, double x_end,
+                                  const WorldPosition& origin, const RailProfile& profile) {
+    TrackMeshData out;
     const double span = x_end - x_start;
     if (span <= 0.0) {
         return out;
@@ -77,39 +191,62 @@ RailMeshData generate_rail_mesh(const TrackSource& track, double x_start, double
     const double step = (profile.sample_step > 0.01) ? profile.sample_step : 1.0;
     const int count = std::max(2, static_cast<int>(std::ceil(span / step)) + 1);
     const glm::vec3 world_up(0.0f, 1.0f, 0.0f);
-    const float half_gauge = static_cast<float>(profile.gauge * 0.5);
     const float uv_period = profile.uv_period > 0.01f ? profile.uv_period : 1.0f;
 
-    std::vector<Ring> rail_a;
-    std::vector<Ring> rail_b;
-    rail_a.reserve(static_cast<std::size_t>(count));
-    rail_b.reserve(static_cast<std::size_t>(count));
-
+    // Échantillonnage : un repère par section.
+    std::vector<Frame> frames;
+    frames.reserve(static_cast<std::size_t>(count));
     for (int i = 0; i < count; ++i) {
         const double x = x_start + (static_cast<double>(i) / (count - 1)) * span;
         glm::dvec3 pos_world;
         glm::dvec3 tangent;
         track.sample(x, pos_world, tangent);
 
-        const glm::vec3 center = glm::vec3(pos_world - origin);  // monde double -> local float
+        Frame f;
+        f.center = glm::vec3(pos_world - origin);  // monde double -> local float
         const glm::vec3 forward = glm::vec3(glm::normalize(tangent));
-        const glm::vec3 right = glm::normalize(glm::cross(forward, world_up));
-        // u suit le CHAINAGE absolu : deux tuiles voisines raccordent sans couture.
-        const float u = static_cast<float>((x - x_start) / static_cast<double>(uv_period));
-
-        rail_a.push_back(make_ring(center + right * half_gauge, right, profile.rail_half_width,
-                                   profile.rail_height, u));
-        rail_b.push_back(make_ring(center - right * half_gauge, right, profile.rail_half_width,
-                                   profile.rail_height, u));
+        f.right = glm::normalize(glm::cross(forward, world_up));
+        f.up = glm::normalize(glm::cross(f.right, forward));
+        // u RELATIF au début de la tuile : garde les UV petits malgré un chainage à 7
+        // chiffres. Les tuiles raccordent car chunk_length est un multiple de uv_period.
+        f.u = static_cast<float>((x - x_start) / static_cast<double>(uv_period));
+        frames.push_back(f);
     }
 
-    // 2 rails x 4 faces x 4 sommets (et 6 indices) par intervalle.
-    const auto segments = static_cast<std::size_t>(count - 1);
-    out.vertices.reserve(segments * 2 * 4 * 4);
-    out.indices.reserve(segments * 2 * 4 * 6);
-    for (std::size_t i = 0; i + 1 < static_cast<std::size_t>(count); ++i) {
-        connect(out, rail_a[i], rail_a[i + 1]);
-        connect(out, rail_b[i], rail_b[i + 1]);
+    // --- Rails : le profil en I, extrudé deux fois -----------------------------
+    // L'écartement se mesure entre FACES INTERNES des champignons : l'axe de chaque rail
+    // est donc à gauge/2 + demi-champignon de l'axe de voie.
+    const std::vector<P2> rail_profile = make_rail_profile(profile);
+    const float rail_axis = static_cast<float>(profile.gauge * 0.5) + profile.rail_head_half;
+    extrude(out.rails, frames, rail_profile, /*closed=*/true, rail_axis, uv_period);
+    extrude(out.rails, frames, rail_profile, /*closed=*/true, -rail_axis, uv_period);
+
+    // --- Ballast --------------------------------------------------------------
+    extrude(out.ballast, frames, make_ballast_profile(profile), /*closed=*/false, 0.0f, uv_period);
+
+    // --- Traverses ------------------------------------------------------------
+    // Échantillonnées à leur PROPRE pas (60 cm), indépendant de celui de la voie : une
+    // traverse est un objet discret, pas une extrusion.
+    const double spacing = profile.sleeper_spacing > 0.01f ? profile.sleeper_spacing : 0.6;
+    // Ancrées sur le chainage ABSOLU : sans ça, deux tuiles voisines auraient chacune
+    // leur propre phase et l'espacement sauterait à la jointure.
+    const double first = std::ceil(x_start / spacing) * spacing;
+    const glm::vec3 sleeper_half(profile.sleeper_half_length, profile.sleeper_thickness * 0.5f,
+                                 profile.sleeper_half_width);
+    for (double x = first; x < x_end; x += spacing) {
+        glm::dvec3 pos_world;
+        glm::dvec3 tangent;
+        track.sample(x, pos_world, tangent);
+        const glm::vec3 center = glm::vec3(pos_world - origin);
+        const glm::vec3 forward = glm::vec3(glm::normalize(tangent));
+        const glm::vec3 right = glm::normalize(glm::cross(forward, world_up));
+        const glm::vec3 up = glm::normalize(glm::cross(right, forward));
+
+        // Le dessus de la traverse porte le patin du rail : il affleure donc le dessous
+        // du rail, et le centre de la boîte est une demi-épaisseur plus bas.
+        const glm::vec3 box_center =
+            center - up * (profile.rail_height + profile.sleeper_thickness * 0.5f);
+        add_box(out.sleepers, box_center, right, forward, up, sleeper_half, uv_period);
     }
     return out;
 }

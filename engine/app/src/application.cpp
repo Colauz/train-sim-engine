@@ -77,9 +77,41 @@ constexpr float kGroundHalfExtent = 2500.0f;
 constexpr float kGroundUvPeriod = 20.0f;
 constexpr std::uint32_t kGroundTextureSize = 256;
 
-// Gris acier des rails : porté par le base_color_factor de leur matériau (M8 étape 3),
-// là où c'était une couleur par sommet avant. Valeur LINÉAIRE.
-constexpr glm::vec3 kRailColor{0.55f, 0.57f, 0.62f};
+// Couleurs de la voie, portées par le base_color_factor de leur matériau (M8 étape 3).
+// Valeurs LINÉAIRES (la conversion sRGB est matérielle).
+constexpr glm::vec3 kRailColor{0.55f, 0.57f, 0.62f};      // acier poli par les roues
+constexpr glm::vec3 kSleeperColor{0.28f, 0.27f, 0.25f};   // béton gris, un peu sale
+constexpr glm::vec3 kBallastColor{0.20f, 0.19f, 0.17f};   // gravier gris sombre
+
+// --- Calibrage des modèles importés (M9) ------------------------------------
+// Un modèle trouvé sur internet n'a JAMAIS la bonne échelle, la bonne orientation ni la
+// bonne assiette : centimètres au lieu de mètres, +X vers l'avant au lieu de -Z, origine
+// au sol plutôt qu'au centre de caisse... Plutôt que de patcher le .glb, on corrige à
+// l'affichage. La transformation s'insère ENTRE la physique (bogies M4) et le modèle :
+//
+//   monde = relative_model(body_position) * body_orientation * ModelTransform::matrix()
+//
+// La physique n'en sait donc rien : elle continue de raisonner sur une caisse abstraite,
+// et le calibrage ne déplace QUE les triangles.
+struct ModelTransform {
+    float scale = 1.0f;       // ex. 0.01 pour un modèle exporté en centimètres
+    float offset_y = 0.0f;    // remonte/descend la caisse pour poser les roues sur le rail
+    float rotation_y = 0.0f;  // radians, autour de la verticale : oriente l'avant du modèle
+    // Ordre VOULU : rotation d'abord, translation ensuite. L'inverse ferait décrire un
+    // arc à l'offset au lieu de rester vertical.
+    [[nodiscard]] glm::mat4 matrix() const {
+        glm::mat4 m = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, offset_y, 0.0f));
+        m = glm::rotate(m, rotation_y, glm::vec3(0.0f, 1.0f, 0.0f));
+        return glm::scale(m, glm::vec3(scale));
+    }
+};
+
+// Calibrage de la locomotive actuelle (tools/gen_train.py). Le modèle est déjà en mètres
+// et dans le repère caisse, donc échelle 1 et rotation nulle.
+// offset_y = -0.05 : le M9 a fait de la courbe de voie le PLAN DE ROULEMENT (avant, elle
+// était le pied du rail). Le modèle place le bas de ses roues à y = -2.15 alors que
+// body_height vaut 2.2 : sans correction, il flotterait de 5 cm au-dessus du rail.
+constexpr ModelTransform kLocoTransform{1.0f, -0.05f, 0.0f};
 
 void make_ground_plane(std::vector<render::MeshVertex>& vertices,
                        std::vector<std::uint32_t>& indices) {
@@ -205,8 +237,11 @@ struct Application::Impl {
     render::MeshId ground_mesh = 0;
     render::TextureId ground_texture = 0;
     render::MaterialId ground_material = 0;
-    // Voie : un seul matériau partagé par toutes les tuiles (acier, sans texture).
+    // Voie : trois matériaux partagés par toutes les tuiles (M9). Sans texture pour
+    // l'instant — les UV sont générés et à l'échelle physique, prêts à en recevoir.
     render::MaterialId rail_material = 0;
+    render::MaterialId sleeper_material = 0;
+    render::MaterialId ballast_material = 0;
 
     // Cubes de debug M4, dessinés uniquement en fallback / pendant le chargement.
     render::MeshId bogie_mesh = 0;
@@ -267,13 +302,25 @@ struct Application::Impl {
         ground_desc.roughness_factor = 0.95f;  // totalement mat
         ground_material = renderer.create_material(ground_desc);
 
-        // Voie : pas de texture, la couleur vient du seul base_color_factor (le secours
-        // blanc 1x1 le laisse passer tel quel). Acier => metallic 1.
+        // Voie (M9) : pas de texture, la couleur vient du seul base_color_factor (le
+        // secours blanc 1x1 le laisse passer tel quel).
         render::MaterialDesc rail_desc;
         rail_desc.base_color_factor = glm::vec4(kRailColor, 1.0f);
-        rail_desc.metallic_factor = 1.0f;
-        rail_desc.roughness_factor = 0.35f;  // poli par le passage des roues
+        rail_desc.metallic_factor = 1.0f;     // acier nu
+        rail_desc.roughness_factor = 0.35f;   // poli par le passage des roues
         rail_material = renderer.create_material(rail_desc);
+
+        render::MaterialDesc sleeper_desc;
+        sleeper_desc.base_color_factor = glm::vec4(kSleeperColor, 1.0f);
+        sleeper_desc.metallic_factor = 0.0f;   // béton : diélectrique
+        sleeper_desc.roughness_factor = 0.85f;
+        sleeper_material = renderer.create_material(sleeper_desc);
+
+        render::MaterialDesc ballast_desc;
+        ballast_desc.base_color_factor = glm::vec4(kBallastColor, 1.0f);
+        ballast_desc.metallic_factor = 0.0f;   // gravier : diélectrique
+        ballast_desc.roughness_factor = 0.95f;  // aucun reflet spéculaire net
+        ballast_material = renderer.create_material(ballast_desc);
 
         bogie_mesh = renderer.create_mesh(make_box_vertices(glm::vec3(0.85f, 0.15f, 0.15f)),
                                           render::Topology::Triangles);
@@ -483,20 +530,29 @@ struct Application::Impl {
         items.push_back(
             render::DrawItem{camera.relative_model(ground_center), ground_mesh, ground_material});
 
-        // Rails streamés (une origine par tuile), tous sur le même matériau acier.
+        // Voie streamée (une origine par tuile) : 3 sous-maillages, 3 matériaux (M9).
         for (const scene::ChunkRenderInfo& chunk : streamer.renderables()) {
-            items.push_back(
-                render::DrawItem{camera.relative_model(chunk.origin), chunk.mesh, rail_material});
+            const glm::mat4 model = camera.relative_model(chunk.origin);
+            const std::pair<render::MeshId, render::MaterialId> parts[3] = {
+                {chunk.ballast, ballast_material},
+                {chunk.sleepers, sleeper_material},
+                {chunk.rails, rail_material},
+            };
+            for (const auto& [mesh, material] : parts) {
+                if (mesh != 0) {
+                    items.push_back(render::DrawItem{model, mesh, material});
+                }
+            }
         }
 
-        // Locomotive (M7 finalisé) : dès que le modèle .glb est chargé, il remplace les
-        // cubes de debug. Il est dessiné avec le transform EXACT de la caisse — position,
-        // orientation, pitch et heave issus de la physique multi-corps (M4). Le modèle
-        // est déjà en mètres et dans le repère caisse (+Z arrière, +Y haut), donc aucun
-        // ajustement d'échelle/rotation/hauteur n'est nécessaire.
+        // Locomotive : dessinée avec le transform EXACT de la caisse — position,
+        // orientation, pitch et heave issus de la physique multi-corps (M4) — suivi du
+        // CALIBRAGE du modèle (M9). Ce dernier facteur est le point d'insertion pour un
+        // vrai tgv.glb : régler kLocoTransform suffit à le mettre à l'échelle, le
+        // retourner et poser ses roues sur le rail, sans toucher ni la physique ni l'asset.
         if (train_model && train_model->ready) {
-            const glm::mat4 loco =
-                camera.relative_model(wagon.body_position()) * wagon.body_orientation();
+            const glm::mat4 loco = camera.relative_model(wagon.body_position()) *
+                                   wagon.body_orientation() * kLocoTransform.matrix();
             for (const resource::Model::Primitive& prim : train_model->primitives) {
                 const render::MaterialId mat = prim.material ? prim.material->id : 0;
                 items.push_back(render::DrawItem{loco, prim.mesh, mat});

@@ -34,7 +34,7 @@ void WorldStreamer::request_chunk(long index) {
     const WorldPosition origin = raw->origin;
     const RailProfile profile = config_.rail_profile;
     jobs_.submit([this, raw, x0, x1, origin, profile] {
-        raw->cpu_mesh = generate_rail_mesh(track_, x0, x1, origin, profile);
+        raw->cpu_mesh = generate_track_mesh(track_, x0, x1, origin, profile);
         // Barrière release : rend visibles les écritures ci-dessus au thread principal.
         raw->state.store(State::CpuReady, std::memory_order_release);
     });
@@ -59,14 +59,19 @@ void WorldStreamer::update(double wagon_chainage, render::Renderer& renderer) {
             break;
         }
         if (!chunk->has_mesh && chunk->state.load(std::memory_order_acquire) == State::CpuReady) {
-            // Chemin indexé device-local : la voie est désormais au format PBR
-            // (MeshVertex) => elle passe par le pipeline texturé, donc s'éclaire et
-            // REÇOIT les ombres, en plus d'en projeter.
-            chunk->mesh = renderer.create_mesh_indexed(chunk->cpu_mesh.vertices,
-                                                       chunk->cpu_mesh.indices);
+            // Chemin indexé device-local : la voie est au format PBR (MeshVertex) => elle
+            // passe par le pipeline texturé, donc s'éclaire et REÇOIT les ombres, en plus
+            // d'en projeter. Les 3 sous-maillages partent ensemble : ils forment un tout
+            // visuel, en séparer l'upload ferait apparaître des rails sans ballast.
+            auto upload = [&renderer](const RailMeshData& m) {
+                return m.empty() ? 0u : renderer.create_mesh_indexed(m.vertices, m.indices);
+            };
+            chunk->rails = upload(chunk->cpu_mesh.rails);
+            chunk->sleepers = upload(chunk->cpu_mesh.sleepers);
+            chunk->ballast = upload(chunk->cpu_mesh.ballast);
             chunk->has_mesh = true;
             chunk->state.store(State::Active, std::memory_order_relaxed);
-            chunk->cpu_mesh = RailMeshData{};  // libère la RAM CPU une fois sur le GPU
+            chunk->cpu_mesh = TrackMeshData{};  // libère la RAM CPU une fois sur le GPU
             ++uploads;
         }
     }
@@ -81,7 +86,12 @@ void WorldStreamer::update(double wagon_chainage, render::Renderer& renderer) {
         const State state = c->state.load(std::memory_order_acquire);
         if (out_of_range && state != State::Generating) {
             if (c->has_mesh) {
-                renderer.destroy_mesh(c->mesh);  // destruction GPU DIFFÉRÉE (voir Renderer)
+                // Destruction GPU DIFFÉRÉE (voir Renderer) : 0 est ignoré côté renderer.
+                for (const render::MeshId id : {c->rails, c->sleepers, c->ballast}) {
+                    if (id != 0) {
+                        renderer.destroy_mesh(id);
+                    }
+                }
             }
             it = chunks_.erase(it);
         } else {
@@ -93,7 +103,8 @@ void WorldStreamer::update(double wagon_chainage, render::Renderer& renderer) {
     renderables_.clear();
     for (auto& [index, chunk] : chunks_) {
         if (chunk->has_mesh) {
-            renderables_.push_back(ChunkRenderInfo{chunk->mesh, chunk->origin});
+            renderables_.push_back(
+                ChunkRenderInfo{chunk->rails, chunk->sleepers, chunk->ballast, chunk->origin});
         }
     }
 }

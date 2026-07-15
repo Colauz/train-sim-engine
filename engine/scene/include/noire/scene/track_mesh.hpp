@@ -9,30 +9,65 @@
 
 namespace noire::scene {
 
+// CONVENTION VERTICALE (M9) : la courbe rendue par TrackSource::sample EST le PLAN DE
+// ROULEMENT — le dessus du champignon du rail, là où porte la roue. Tout le reste
+// (âme, patin, traverses, ballast) est construit VERS LE BAS depuis ce plan.
+//
+// C'est la convention ferroviaire naturelle, et elle donne un sens physique à
+// `body_height` (hauteur de caisse au-dessus du rail). Avant le M9 la courbe était le
+// PIED du rail, ce qui enfonçait les roues de 7 cm dans le champignon.
 struct RailProfile {
-    double gauge = 1.435;
-    float rail_half_width = 0.06f;
-    float rail_height = 0.12f;
+    double gauge = 1.435;      // écartement standard, mesuré entre faces internes
     double sample_step = 1.0;  // pas d'échantillonnage le long de la voie (m)
-    // Période de répétition de l'UV le long du rail (m) : u = chainage / uv_period.
+    // Période de répétition des UV (m) : 1 unité UV = uv_period mètres, dans les deux
+    // sens. Les textures gardent donc une taille PHYSIQUE constante d'un élément à
+    // l'autre — un ballast et une traverse ne peuvent pas avoir deux échelles de grain.
     float uv_period = 2.0f;
+
+    // --- Rail (profil en I, inspiré d'un UIC 60 simplifié) ---
+    float rail_height = 0.172f;      // du dessous du patin au plan de roulement
+    float rail_head_half = 0.036f;   // demi-largeur du champignon
+    float rail_web_half = 0.010f;    // demi-largeur de l'âme
+    float rail_foot_half = 0.075f;   // demi-largeur du patin
+
+    // --- Traverses ---
+    float sleeper_spacing = 0.60f;   // entraxe (norme française courante)
+    float sleeper_half_length = 1.30f;  // demi-longueur, en travers de la voie
+    float sleeper_half_width = 0.15f;   // demi-largeur, le long de la voie
+    float sleeper_thickness = 0.22f;
+
+    // --- Ballast ---
+    // Trapèze : plateau puis talus latéraux. La base tombe à -0.80, ce qui correspond
+    // EXACTEMENT au plan de sol de l'app (body_position.y - 3.0, soit rail - 0.8) :
+    // le ballast s'y raccorde au lieu de flotter.
+    float ballast_crown_y = -0.30f;      // hauteur du plateau, sous le plan de roulement
+    float ballast_crown_half = 1.90f;    // demi-largeur du plateau
+    float ballast_base_y = -0.80f;       // pied du talus (= niveau du sol)
+    float ballast_base_half = 2.65f;     // demi-largeur au pied (pente ~1:1.5)
 };
 
-// Maillage de voie généré : sommets PBR + indices, prêts pour create_mesh_indexed.
-// La COULEUR n'est plus portée par les sommets (M8 étape 3) : elle appartient au
-// matériau (base_color_factor), et l'éclairage réel remplace l'ancien ombrage par face.
+// Un sous-maillage : sommets PBR + indices, prêts pour create_mesh_indexed.
 struct RailMeshData {
     std::vector<render::MeshVertex> vertices;
     std::vector<std::uint32_t> indices;
     [[nodiscard]] bool empty() const { return vertices.empty() || indices.empty(); }
 };
 
-// Extrude deux rails le long de la voie sur la plage de chainage [x_start, x_end].
-// Sommets exprimés RELATIVEMENT à `origin` (float) => compatible origine flottante,
-// chaque chunk ayant sa propre origine. Fonction PURE (aucun état, aucune API GPU)
-// => appelable depuis un worker thread.
-[[nodiscard]] RailMeshData generate_rail_mesh(const TrackSource& track, double x_start,
-                                              double x_end, const WorldPosition& origin,
-                                              const RailProfile& profile = {});
+// La voie complète d'une tuile, séparée PAR MATÉRIAU : un maillage ne peut porter qu'un
+// seul descriptor set, et acier / béton / gravier n'ont rien en commun.
+struct TrackMeshData {
+    RailMeshData rails;     // acier : metallic 1, poli par les roues
+    RailMeshData sleepers;  // béton : diélectrique mat
+    RailMeshData ballast;   // gravier : diélectrique très rugueux
+    [[nodiscard]] bool empty() const { return rails.empty(); }
+};
+
+// Génère la voie 3D complète sur la plage de chainage [x_start, x_end] : rails en I,
+// traverses et lit de ballast. Sommets exprimés RELATIVEMENT à `origin` (float) =>
+// compatible origine flottante, chaque tuile ayant la sienne. Fonction PURE (aucun état,
+// aucune API GPU) => appelable depuis un worker du JobSystem.
+[[nodiscard]] TrackMeshData generate_track_mesh(const TrackSource& track, double x_start,
+                                                double x_end, const WorldPosition& origin,
+                                                const RailProfile& profile = {});
 
 }  // namespace noire::scene
