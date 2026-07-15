@@ -112,12 +112,12 @@ struct ModelTransform {
     }
 };
 
-// Calibrage de la locomotive actuelle (tools/gen_train.py). Le modèle est déjà en mètres
-// et dans le repère caisse, donc échelle 1 et rotation nulle.
-// offset_y = -0.05 : le M9 a fait de la courbe de voie le PLAN DE ROULEMENT (avant, elle
-// était le pied du rail). Le modèle place le bas de ses roues à y = -2.15 alors que
-// body_height vaut 2.2 : sans correction, il flotterait de 5 cm au-dessus du rail.
-constexpr ModelTransform kLocoTransform{1.0f, -0.05f, 0.0f};
+// Calibrage de la motrice (tools/gen_tgv_procedural.py). Le modèle est généré DANS le
+// repère caisse et en mètres : échelle 1, rotation nulle.
+// offset_y = 0 : le script pose le bas des roues exactement sur y = -2.20 = -body_height,
+// c'est-à-dire sur le plan de roulement (vérifié : bbox acier y[-2.20, -1.15]). Un modèle
+// importé, lui, aura presque toujours besoin des trois champs.
+constexpr ModelTransform kLocoTransform{1.0f, 0.0f, 0.0f};
 
 void make_ground_plane(std::vector<render::MeshVertex>& vertices,
                        std::vector<std::uint32_t>& indices) {
@@ -376,9 +376,9 @@ struct Application::Impl {
         // est absent, synthèse M6 si le .wav est absent — le moteur ne crashe jamais.
         asset_paths = resource::AssetPaths::discover();
         resources.set_upload_budget(2);
-        // Gabarit TGV (M9) : cotes réelles d'une motrice (22,15 m). Il remplace la
-        // locomotive-boîte du M7 — c'est lui qui donne le sens de l'échelle.
-        train_model = resources.load_model("models/tgv_gabarit.glb");
+        // Motrice TGV procédurale (M10) : carrosserie loftée (superellipse + Béziers),
+        // nez plongeant, vraies roues cylindriques. Remplace le gabarit-boîtes du M9.
+        train_model = resources.load_model("models/tgv_procedural.glb");
         rumble_clip = resources.load_audio("audio/roulement.wav");
 
         // Ballast (Poly Haven, CC0). L'ESPACE COLORIMÉTRIQUE est dicté par le RÔLE :
@@ -503,7 +503,7 @@ struct Application::Impl {
         }
 
         if (!model_ready_reported && train_model && train_model->ready) {
-            log::info("M7 : locomotive 'models/train.glb' chargée — {} primitive(s), cubes masqués",
+            log::info("M10 : motrice TGV procédurale chargée — {} primitive(s), cubes masqués",
                       train_model->primitives.size());
             model_ready_reported = true;
         }
