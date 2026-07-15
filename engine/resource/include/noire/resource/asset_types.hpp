@@ -32,6 +32,19 @@ struct MaterialData {
     float normal_scale = 1.0f;
 };
 
+// Cubemap d'environnement décodée (CPU), produite par le loader HDR sur un worker.
+// Les 6 faces sont contiguës dans l'ORDRE VULKAN (+X, -X, +Y, -Y, +Z, -Z), chacune
+// `size * size` texels RGBA en HALF-float (d'où l'uint16 : 2 octets par canal) — c'est
+// déjà le format GPU (R16G16B16A16_SFLOAT), donc l'upload est une simple memcpy.
+// L'équirectangulaire source, lui, ne monte JAMAIS sur le GPU.
+struct CubemapData {
+    std::uint32_t size = 0;             // côté d'une face, en texels
+    std::vector<std::uint16_t> texels;  // 6 * size * size * 4
+    [[nodiscard]] bool valid() const {
+        return size > 0 && texels.size() == static_cast<std::size_t>(size) * size * 6u * 4u;
+    }
+};
+
 // Une primitive de modèle décodée (CPU) : sommets + indices + matériau.
 struct PrimitiveData {
     std::vector<render::MeshVertex> vertices;

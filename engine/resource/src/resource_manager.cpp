@@ -10,6 +10,7 @@
 #include "noire/resource/asset_paths.hpp"
 #include "noire/resource/asset_types.hpp"
 #include "noire/resource/gltf_loader.hpp"
+#include "noire/resource/hdr_loader.hpp"
 #include "noire/resource/image_loader.hpp"
 
 namespace noire::resource {
@@ -38,6 +39,14 @@ struct ResourceManager::AudioSlot {
     std::vector<float> cpu;  // PCM décodé par le worker
 };
 
+struct ResourceManager::EnvironmentSlot {
+    EnvironmentHandle handle;
+    std::string full_path;
+    std::uint32_t face_size = 1024;
+    std::atomic<ResourceState> state{ResourceState::Queued};
+    CubemapData cpu;  // 6 faces RGBA16F produites par le worker (équirect -> cube)
+};
+
 ResourceManager::ResourceManager(render::Renderer& renderer, JobSystem& jobs,
                                  const AssetPaths& paths)
     : renderer_(renderer), jobs_(jobs), paths_(paths), recycler_(std::make_shared<Recycler>()) {}
@@ -55,6 +64,17 @@ TextureHandle ResourceManager::make_texture_handle() {
             rec->textures.push_back(t->id);
         }
         delete t;
+    });
+}
+
+EnvironmentHandle ResourceManager::make_environment_handle() {
+    std::shared_ptr<Recycler> rec = recycler_;
+    return EnvironmentHandle(new Environment(), [rec](Environment* e) {
+        if (e->id != 0) {
+            std::lock_guard<std::mutex> lock(rec->mutex);
+            rec->environments.push_back(e->id);
+        }
+        delete e;
     });
 }
 
@@ -158,6 +178,45 @@ TextureHandle ResourceManager::load_texture(const std::string& relative_path) {
     return texture;
 }
 
+EnvironmentHandle ResourceManager::load_environment(const std::string& relative_path,
+                                                    std::uint32_t face_size) {
+    const auto cached = environment_cache_.find(relative_path);
+    if (cached != environment_cache_.end()) {
+        if (EnvironmentHandle alive = cached->second.lock()) {
+            return alive;
+        }
+    }
+
+    EnvironmentHandle env = make_environment_handle();
+    environment_cache_[relative_path] = env;
+
+    auto slot = std::make_shared<EnvironmentSlot>();
+    slot->handle = env;
+    slot->full_path = paths_.resolve(relative_path);
+    slot->face_size = face_size;
+    loading_environments_.push_back(slot);
+
+    if (!paths_.exists(relative_path)) {
+        log::warn("Asset introuvable : '{}' — pas de ciel HDR (fond uni conservé)", relative_path);
+        slot->state.store(ResourceState::Failed, std::memory_order_relaxed);
+        return env;
+    }
+
+    // Décodage .hdr + rééchantillonnage équirect -> 6 faces de cube sur un worker : c'est
+    // du pur calcul CPU (~6 M texels en 1024), il n'a rien à faire sur le thread de rendu.
+    jobs_.submit([slot] {
+        slot->state.store(ResourceState::Loading, std::memory_order_relaxed);
+        CubemapData data;
+        if (load_environment_file(slot->full_path, slot->face_size, data) && data.valid()) {
+            slot->cpu = std::move(data);
+            slot->state.store(ResourceState::CpuReady, std::memory_order_release);
+        } else {
+            slot->state.store(ResourceState::Failed, std::memory_order_release);
+        }
+    });
+    return env;
+}
+
 AudioHandle ResourceManager::load_audio(const std::string& relative_path) {
     const auto cached = audio_cache_.find(relative_path);
     if (cached != audio_cache_.end()) {
@@ -198,11 +257,16 @@ void ResourceManager::drain_recycler() {
     std::vector<render::MeshId> meshes;
     std::vector<render::TextureId> textures;
     std::vector<render::MaterialId> materials;
+    std::vector<render::EnvironmentId> environments;
     {
         std::lock_guard<std::mutex> lock(recycler_->mutex);
         meshes.swap(recycler_->meshes);
         textures.swap(recycler_->textures);
         materials.swap(recycler_->materials);
+        environments.swap(recycler_->environments);
+    }
+    for (render::EnvironmentId id : environments) {
+        renderer_.destroy_environment(id);
     }
     for (render::MeshId id : meshes) {
         renderer_.destroy_mesh(id);
@@ -213,6 +277,32 @@ void ResourceManager::drain_recycler() {
     }
     for (render::TextureId id : textures) {
         renderer_.destroy_texture(id);
+    }
+}
+
+void ResourceManager::pump_environments(int& budget) {
+    for (auto it = loading_environments_.begin(); it != loading_environments_.end();) {
+        EnvironmentSlot& slot = **it;
+        const ResourceState state = slot.state.load(std::memory_order_acquire);
+
+        if (state == ResourceState::Failed) {
+            it = loading_environments_.erase(it);  // handle->id reste 0 => pas de skybox
+            continue;
+        }
+        if (state == ResourceState::CpuReady && budget > 0) {
+            slot.handle->id = renderer_.create_environment(slot.cpu.size, slot.cpu.texels.data());
+            slot.cpu = CubemapData{};  // ~48 Mio rendus au système dès le staging fait
+            slot.state.store(ResourceState::Uploading, std::memory_order_relaxed);
+            --budget;
+        }
+        if (slot.state.load(std::memory_order_relaxed) == ResourceState::Uploading &&
+            (slot.handle->id == 0 || renderer_.is_environment_ready(slot.handle->id))) {
+            slot.handle->ready = slot.handle->id != 0;
+            slot.state.store(ResourceState::GpuReady, std::memory_order_relaxed);
+            it = loading_environments_.erase(it);
+            continue;
+        }
+        ++it;
     }
 }
 
@@ -361,6 +451,9 @@ void ResourceManager::pump_audio() {
 void ResourceManager::pump() {
     drain_recycler();
     int budget = upload_budget_ > 0 ? upload_budget_ : 1;
+    // L'environnement en premier : c'est le plus gros staging du moteur (~48 Mio), autant
+    // qu'il parte tôt dans la frame plutôt que derrière une file de petites textures.
+    pump_environments(budget);
     pump_textures(budget);
     pump_models(budget);
     pump_audio();

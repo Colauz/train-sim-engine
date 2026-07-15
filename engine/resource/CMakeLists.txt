@@ -5,6 +5,7 @@
 add_library(noire_resource
     src/asset_paths.cpp
     src/image_loader.cpp
+    src/hdr_loader.cpp
     src/gltf_loader.cpp
     src/resource_manager.cpp
     src/cgltf_impl.cpp

@@ -122,6 +122,17 @@ public:
     [[nodiscard]] bool is_material_ready(MaterialId id) const;
     void destroy_material(MaterialId id);
 
+    // Crée la cubemap HDR d'environnement (M8 étape 6a) à partir des 6 faces déjà
+    // rééchantillonnées côté CPU. `faces_rgba16f` = 6 * face_size² * 4 half-floats, dans
+    // l'ordre Vulkan (+X, -X, +Y, -Y, +Z, -Z). Téléversement ASYNCHRONE, puis la chaîne
+    // de mips est engendrée sur le GPU par vkCmdBlitImage. 0 = échec.
+    EnvironmentId create_environment(std::uint32_t face_size, const void* faces_rgba16f);
+    [[nodiscard]] bool is_environment_ready(EnvironmentId id) const;
+    void destroy_environment(EnvironmentId id);
+    // Environnement affiché en skybox. 0 = aucun (retour au nettoyage à la couleur de
+    // fond). Tant qu'il n'est pas prêt, la skybox n'est simplement pas dessinée.
+    void set_environment(EnvironmentId id) { active_environment_ = id; }
+
     void draw_frame(const FrameUniforms& uniforms, const std::vector<DrawItem>& items);
     void wait_idle();
     void notify_resized() { framebuffer_resized_ = true; }
@@ -164,6 +175,21 @@ private:
         bool written = false;
     };
 
+    // Environnement GPU (M8 étape 6a) : la cubemap HDR du ciel + son descriptor set.
+    // Contrairement à un matériau, son set est écrit DÈS la création : il ne référence
+    // qu'une seule vue, qui existe déjà à cet instant (rien à attendre). C'est le DRAW
+    // qui est conditionné par `ready`, pas l'écriture du set — donc on ne réécrit
+    // jamais un set en vol non plus. Un set PAR environnement : changer de ciel = lier
+    // un autre set, jamais réécrire celui-ci.
+    struct Environment {
+        VkImage image = VK_NULL_HANDLE;
+        VmaAllocation allocation = nullptr;
+        VkImageView view = VK_NULL_HANDLE;
+        VkDescriptorSet descriptor = VK_NULL_HANDLE;
+        std::uint32_t mips = 1;
+        bool ready = false;  // true quand copie + blits + transition finale sont terminés
+    };
+
     // Une cascade d'ombre : sa depth map + la matrice qui l'a cadrée cette frame.
     // Taille fixe (kShadowMapSize) => indépendante de la swapchain, donc jamais
     // recréée au redimensionnement.
@@ -202,6 +228,19 @@ private:
     // Écrit le set 1 des matériaux dont toutes les textures viennent d'être téléversées.
     void update_pending_materials();
     void free_texture(Texture& texture);  // libère vue + image (device idle)
+
+    // Environnement / skybox (M8 étape 6a).
+    bool create_env_sampler();             // linéaire + mips + CLAMP_TO_EDGE
+    bool create_env_descriptor_layout();   // set=1 du pipeline skybox : 1 samplerCube
+    bool create_env_descriptor_pool();
+    bool create_skybox_pipeline_layout();  // set0 (UBO) + set1 (cubemap), pas de push
+    bool create_skybox_pipeline();
+    // Engendre la chaîne de mips par blits successifs et laisse l'image en
+    // SHADER_READ_ONLY. Enregistré dans le command buffer d'un transfert.
+    void record_environment_mips(VkCommandBuffer cmd, VkImage image, std::uint32_t face_size,
+                                 std::uint32_t mips);
+    void record_skybox(VkCommandBuffer cmd);
+    void destroy_environment_gpu(Environment& env);
 
     // Ombres (M8 étape 1) : passe depth-only du soleil, une par cascade.
     bool create_shadow_render_pass();
@@ -255,6 +294,20 @@ private:
     static constexpr std::uint32_t kMaxTextures = 128;
     static constexpr std::uint32_t kMaxMaterials = 64;
     static constexpr std::uint32_t kMaterialTextures = 3;  // bindings du set 1
+
+    // --- Environnement / skybox (M8 étape 6a) --------------------------------
+    // Dessinée EN DERNIER dans la passe principale : la géométrie déjà en profondeur
+    // rejette le ciel en early-z, donc on ne paie le fragment du ciel que sur les
+    // pixels réellement vides.
+    VkSampler env_sampler_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout env_set_layout_ = VK_NULL_HANDLE;
+    VkDescriptorPool env_pool_ = VK_NULL_HANDLE;
+    VkPipelineLayout skybox_pipeline_layout_ = VK_NULL_HANDLE;
+    VkPipeline skybox_pipeline_ = VK_NULL_HANDLE;
+    std::unordered_map<EnvironmentId, Environment> environments_;
+    EnvironmentId next_environment_id_ = 1;
+    EnvironmentId active_environment_ = 0;
+    static constexpr std::uint32_t kMaxEnvironments = 4;
 
     // --- Ombres du soleil (M8 étape 1) ---------------------------------------
     // Passe depth-only rendue AVANT la passe principale. Deux pipelines car les deux

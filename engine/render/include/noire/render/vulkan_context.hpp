@@ -54,9 +54,13 @@ public:
                        GpuBuffer& out) const;
     void destroy_buffer(GpuBuffer& buffer) const;
 
+    // Les 3 derniers paramètres n'ont de valeur non triviale que pour la cubemap
+    // d'environnement (M8 étape 6a) : 6 layers + CUBE_COMPATIBLE + chaîne de mips.
+    // Les défauts reproduisent exactement le comportement d'avant (2D, 1 mip, 1 layer).
     bool create_image(std::uint32_t width, std::uint32_t height, VkFormat format,
-                      VkImageUsageFlags usage, VkImage& out_image,
-                      VmaAllocation& out_allocation) const;
+                      VkImageUsageFlags usage, VkImage& out_image, VmaAllocation& out_allocation,
+                      std::uint32_t mip_levels = 1, std::uint32_t array_layers = 1,
+                      VkImageCreateFlags flags = 0) const;
     void destroy_image(VkImage image, VmaAllocation allocation) const;
 
 private:

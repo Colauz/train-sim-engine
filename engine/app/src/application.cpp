@@ -198,6 +198,7 @@ struct Application::Impl {
     resource::ResourceManager resources;
     resource::ModelHandle train_model;
     resource::AudioHandle rumble_clip;
+    resource::EnvironmentHandle sky;
     bool rumble_source_applied = false;
 
     // Sol : plan solide texturé (M8 étape 2), il reçoit l'ombre portée du train.
@@ -212,6 +213,7 @@ struct Application::Impl {
     render::MeshId body_mesh = 0;
 
     bool model_ready_reported = false;
+    bool sky_ready_reported = false;
 
     float orbit_yaw = 3.14159f;
     float orbit_pitch = 0.30f;
@@ -285,6 +287,9 @@ struct Application::Impl {
         resources.set_upload_budget(2);
         train_model = resources.load_model("models/train.glb");
         rumble_clip = resources.load_audio("audio/roulement.wav");
+        // Ciel HDR (M8 étape 6a). 1024 par face => ~64 Mio de VRAM avec les mips, le
+        // compromis retenu pour un iGPU. Absent => le fond uni est conservé.
+        sky = resources.load_environment("textures/sky/kloofendal_puresky_2k.hdr", 1024);
 
         wagon.attach(&track);
         wagon.place_at(0.0);
@@ -363,6 +368,14 @@ struct Application::Impl {
     void render_frame() {
         // M7 finalisé : signale une fois la locomotive entièrement chargée et téléversée
         // (cgltf async -> ResourceManager -> GPU), remplaçant les cubes de debug.
+        // Le ciel n'est lié qu'une fois sa cubemap réellement sur le GPU : d'ici là le
+        // Renderer garde son nettoyage à la couleur de fond.
+        if (!sky_ready_reported && sky && sky->ready) {
+            renderer.set_environment(sky->id);
+            log::info("M8 étape 6a : skybox HDR liée (environnement {})", sky->id);
+            sky_ready_reported = true;
+        }
+
         if (!model_ready_reported && train_model && train_model->ready) {
             log::info("M7 : locomotive 'models/train.glb' chargée — {} primitive(s), cubes masqués",
                       train_model->primitives.size());

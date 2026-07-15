@@ -30,6 +30,8 @@ noire_add_shaders(noire_render
     shaders/mesh.frag
     shaders/mesh_textured.vert
     shaders/mesh_textured.frag
-    shaders/shadow.vert)
+    shaders/shadow.vert
+    shaders/skybox.vert
+    shaders/skybox.frag)
 
 noire_set_warnings(noire_render)

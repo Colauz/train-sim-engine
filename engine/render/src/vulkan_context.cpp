@@ -128,14 +128,18 @@ void VulkanContext::destroy_buffer(GpuBuffer& buffer) const {
 
 bool VulkanContext::create_image(std::uint32_t width, std::uint32_t height, VkFormat format,
                                  VkImageUsageFlags usage, VkImage& out_image,
-                                 VmaAllocation& out_allocation) const {
+                                 VmaAllocation& out_allocation, std::uint32_t mip_levels,
+                                 std::uint32_t array_layers, VkImageCreateFlags flags) const {
     VkImageCreateInfo image_info{};
     image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    // Une cubemap reste une image 2D : ce sont ses 6 layers + CUBE_COMPATIBLE (dans
+    // `flags`) qui la rendent échantillonnable par une vue de type CUBE.
+    image_info.flags = flags;
     image_info.imageType = VK_IMAGE_TYPE_2D;
     image_info.format = format;
     image_info.extent = {width, height, 1};
-    image_info.mipLevels = 1;
-    image_info.arrayLayers = 1;
+    image_info.mipLevels = mip_levels;
+    image_info.arrayLayers = array_layers;
     image_info.samples = VK_SAMPLE_COUNT_1_BIT;
     image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
     image_info.usage = usage;

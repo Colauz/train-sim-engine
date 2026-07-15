@@ -15,6 +15,8 @@
 #include "shaders/mesh_textured.frag.spv.h"
 #include "shaders/mesh_textured.vert.spv.h"
 #include "shaders/shadow.vert.spv.h"
+#include "shaders/skybox.frag.spv.h"
+#include "shaders/skybox.vert.spv.h"
 
 namespace noire::render {
 
@@ -119,6 +121,13 @@ bool Renderer::initialize(const RendererCreateInfo& info) {
         return false;
     }
     if (!create_default_textures() || !create_default_material()) {
+        return false;
+    }
+
+    // Environnement / skybox (étape 6a) : la cubemap elle-même arrive plus tard (chargement
+    // asynchrone), mais tout ce qui ne dépend pas de son contenu se crée dès maintenant.
+    if (!create_env_sampler() || !create_env_descriptor_layout() || !create_env_descriptor_pool() ||
+        !create_skybox_pipeline_layout() || !create_skybox_pipeline()) {
         return false;
     }
 
@@ -1642,6 +1651,426 @@ void Renderer::free_texture(Texture& texture) {
     }
 }
 
+// =============================================================================
+// Environnement / skybox (M8 étape 6a)
+// =============================================================================
+
+bool Renderer::create_env_sampler() {
+    VkSamplerCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    info.magFilter = VK_FILTER_LINEAR;
+    info.minFilter = VK_FILTER_LINEAR;
+    // Le premier sampler du moteur à réellement consommer des mips (le sampler des
+    // matériaux est encore à maxLod = 0) : LINEAR entre niveaux, c'est ce qui donnera un
+    // fondu continu en fonction de la rugosité à l'étape 6b.
+    info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    // CLAMP_TO_EDGE : sur une cubemap, Vulkan filtre nativement à travers les arêtes
+    // (seamless), le mode d'adressage ne sert qu'à ne pas déborder.
+    info.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    info.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    info.anisotropyEnable = VK_FALSE;  // inutile : on n'échantillonne jamais en rasant
+    info.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
+    info.compareEnable = VK_FALSE;
+    info.minLod = 0.0f;
+    info.maxLod = VK_LOD_CLAMP_NONE;  // toute la chaîne, quelle que soit sa longueur
+    if (vkCreateSampler(context_.device(), &info, nullptr, &env_sampler_) != VK_SUCCESS) {
+        log::error("Renderer : création du sampler d'environnement échouée");
+        return false;
+    }
+    return true;
+}
+
+bool Renderer::create_env_descriptor_layout() {
+    VkDescriptorSetLayoutBinding binding{};
+    binding.binding = 0;
+    binding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    binding.descriptorCount = 1;
+    binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+    VkDescriptorSetLayoutCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    info.bindingCount = 1;
+    info.pBindings = &binding;
+    if (vkCreateDescriptorSetLayout(context_.device(), &info, nullptr, &env_set_layout_) !=
+        VK_SUCCESS) {
+        log::error("Renderer : création du layout de set d'environnement échouée");
+        return false;
+    }
+    return true;
+}
+
+bool Renderer::create_env_descriptor_pool() {
+    VkDescriptorPoolSize size{};
+    size.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    size.descriptorCount = kMaxEnvironments;
+
+    VkDescriptorPoolCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    info.maxSets = kMaxEnvironments;
+    info.poolSizeCount = 1;
+    info.pPoolSizes = &size;
+    if (vkCreateDescriptorPool(context_.device(), &info, nullptr, &env_pool_) != VK_SUCCESS) {
+        log::error("Renderer : création du pool de descripteurs d'environnement échouée");
+        return false;
+    }
+    return true;
+}
+
+bool Renderer::create_skybox_pipeline_layout() {
+    // set 0 = UBO global (le vertex y lit view/proj), set 1 = la cubemap. Aucun push
+    // constant : le ciel n'a ni modèle ni matériau.
+    const std::array<VkDescriptorSetLayout, 2> layouts{descriptor_set_layout_, env_set_layout_};
+    VkPipelineLayoutCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    info.setLayoutCount = static_cast<std::uint32_t>(layouts.size());
+    info.pSetLayouts = layouts.data();
+    if (vkCreatePipelineLayout(context_.device(), &info, nullptr, &skybox_pipeline_layout_) !=
+        VK_SUCCESS) {
+        log::error("Renderer : création du pipeline layout de la skybox échouée");
+        return false;
+    }
+    return true;
+}
+
+bool Renderer::create_skybox_pipeline() {
+    VkShaderModule vert = create_shader_module(skybox_vert_spv, skybox_vert_spv_size);
+    VkShaderModule frag = create_shader_module(skybox_frag_spv, skybox_frag_spv_size);
+    if (vert == VK_NULL_HANDLE || frag == VK_NULL_HANDLE) {
+        return false;
+    }
+
+    VkPipelineShaderStageCreateInfo vs{};
+    vs.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    vs.stage = VK_SHADER_STAGE_VERTEX_BIT;
+    vs.module = vert;
+    vs.pName = "main";
+
+    VkPipelineShaderStageCreateInfo fs{};
+    fs.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    fs.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    fs.module = frag;
+    fs.pName = "main";
+    const std::array<VkPipelineShaderStageCreateInfo, 2> stages{vs, fs};
+
+    // AUCUN tampon de sommets : le triangle plein écran est déduit de gl_VertexIndex.
+    VkPipelineVertexInputStateCreateInfo vertex_input{};
+    vertex_input.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+
+    VkPipelineInputAssemblyStateCreateInfo input_asm{};
+    input_asm.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    input_asm.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkPipelineViewportStateCreateInfo viewport_state{};
+    viewport_state.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    viewport_state.viewportCount = 1;
+    viewport_state.scissorCount = 1;
+
+    VkPipelineRasterizationStateCreateInfo raster{};
+    raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    raster.polygonMode = VK_POLYGON_MODE_FILL;
+    raster.cullMode = VK_CULL_MODE_NONE;
+    raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    raster.lineWidth = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo multisample{};
+    multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineDepthStencilStateCreateInfo depth_stencil{};
+    depth_stencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    depth_stencil.depthTestEnable = VK_TRUE;
+    // Le ciel n'écrit PAS la profondeur : il est infiniment loin, rien ne doit être
+    // testé contre lui. Le test, lui, reste actif en LESS_OR_EQUAL — le ciel sort à
+    // exactement 1.0, donc il ne survit que là où la profondeur est encore au clear.
+    depth_stencil.depthWriteEnable = VK_FALSE;
+    depth_stencil.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+    VkPipelineColorBlendAttachmentState blend_attachment{};
+    blend_attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                      VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    blend_attachment.blendEnable = VK_FALSE;
+
+    VkPipelineColorBlendStateCreateInfo blend{};
+    blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    blend.attachmentCount = 1;
+    blend.pAttachments = &blend_attachment;
+
+    const std::array<VkDynamicState, 2> dynamic_states{VK_DYNAMIC_STATE_VIEWPORT,
+                                                       VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamic{};
+    dynamic.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynamic.dynamicStateCount = static_cast<std::uint32_t>(dynamic_states.size());
+    dynamic.pDynamicStates = dynamic_states.data();
+
+    VkGraphicsPipelineCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    info.stageCount = static_cast<std::uint32_t>(stages.size());
+    info.pStages = stages.data();
+    info.pVertexInputState = &vertex_input;
+    info.pInputAssemblyState = &input_asm;
+    info.pViewportState = &viewport_state;
+    info.pRasterizationState = &raster;
+    info.pMultisampleState = &multisample;
+    info.pDepthStencilState = &depth_stencil;
+    info.pColorBlendState = &blend;
+    info.pDynamicState = &dynamic;
+    info.layout = skybox_pipeline_layout_;
+    info.renderPass = render_pass_;
+    info.subpass = 0;
+
+    const VkResult res = vkCreateGraphicsPipelines(context_.device(), VK_NULL_HANDLE, 1, &info,
+                                                   nullptr, &skybox_pipeline_);
+    vkDestroyShaderModule(context_.device(), frag, nullptr);
+    vkDestroyShaderModule(context_.device(), vert, nullptr);
+    if (res != VK_SUCCESS) {
+        log::error("Renderer : création du pipeline skybox échouée");
+        return false;
+    }
+    return true;
+}
+
+void Renderer::record_environment_mips(VkCommandBuffer cmd, VkImage image,
+                                       std::uint32_t face_size, std::uint32_t mips) {
+    // À l'entrée : TOUS les niveaux sont en TRANSFER_DST et seul le mip 0 est rempli.
+    // Chaque itération réduit le niveau précédent de moitié par un blit filtré
+    // linéairement. Les 6 layers sont traités d'un seul blit (layerCount = 6).
+    auto extent = static_cast<std::int32_t>(face_size);
+    for (std::uint32_t level = 1; level < mips; ++level) {
+        // Le niveau source vient d'être écrit : on l'amène en TRANSFER_SRC et on rend
+        // cette écriture visible à la lecture du blit.
+        VkImageMemoryBarrier to_src{};
+        to_src.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        to_src.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        to_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        to_src.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        to_src.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        to_src.image = image;
+        to_src.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, level - 1u, 1u, 0u, 6u};
+        to_src.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        to_src.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                             0, nullptr, 0, nullptr, 1, &to_src);
+
+        const std::int32_t next = extent > 1 ? extent / 2 : 1;
+        VkImageBlit blit{};
+        blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level - 1u, 0u, 6u};
+        blit.srcOffsets[0] = {0, 0, 0};
+        blit.srcOffsets[1] = {extent, extent, 1};
+        blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0u, 6u};
+        blit.dstOffsets[0] = {0, 0, 0};
+        blit.dstOffsets[1] = {next, next, 1};
+        vkCmdBlitImage(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+        extent = next;
+    }
+
+    // Transition finale vers l'échantillonnage. Deux plages distinctes car elles ne sont
+    // PAS dans le même layout : tous les niveaux sauf le dernier ont servi de source de
+    // blit (TRANSFER_SRC), le dernier n'a été qu'une destination (TRANSFER_DST).
+    std::array<VkImageMemoryBarrier, 2> finals{};
+    std::uint32_t count = 0;
+    if (mips > 1) {
+        VkImageMemoryBarrier& src = finals[count++];
+        src.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        src.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        src.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        src.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        src.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        src.image = image;
+        src.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, mips - 1u, 0u, 6u};
+        src.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        src.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    }
+    VkImageMemoryBarrier& last = finals[count++];
+    last.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    last.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    last.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    last.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    last.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    last.image = image;
+    last.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, mips - 1u, 1u, 0u, 6u};
+    last.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    last.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                         0, 0, nullptr, 0, nullptr, count, finals.data());
+}
+
+EnvironmentId Renderer::create_environment(std::uint32_t face_size, const void* faces_rgba16f) {
+    if (face_size == 0 || faces_rgba16f == nullptr) {
+        return 0;
+    }
+
+    Environment env;
+    env.mips = static_cast<std::uint32_t>(std::floor(std::log2(static_cast<float>(face_size)))) + 1u;
+
+    const VkFormat format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    // TRANSFER_SRC en plus de TRANSFER_DST : chaque mip est la SOURCE du blit qui
+    // engendre le suivant. L'oublier est l'erreur classique de ce chemin.
+    const VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    if (!context_.create_image(face_size, face_size, format, usage, env.image, env.allocation,
+                               env.mips, 6u, VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT)) {
+        log::error("Renderer : création de l'image d'environnement échouée");
+        return 0;
+    }
+
+    VkImageViewCreateInfo view_info{};
+    view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view_info.image = env.image;
+    view_info.viewType = VK_IMAGE_VIEW_TYPE_CUBE;  // les 6 layers vus comme un cube
+    view_info.format = format;
+    view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, env.mips, 0u, 6u};
+    if (vkCreateImageView(context_.device(), &view_info, nullptr, &env.view) != VK_SUCCESS) {
+        log::error("Renderer : création de la vue cube d'environnement échouée");
+        context_.destroy_image(env.image, env.allocation);
+        return 0;
+    }
+
+    VkDescriptorSetAllocateInfo alloc{};
+    alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    alloc.descriptorPool = env_pool_;
+    alloc.descriptorSetCount = 1;
+    alloc.pSetLayouts = &env_set_layout_;
+    if (vkAllocateDescriptorSets(context_.device(), &alloc, &env.descriptor) != VK_SUCCESS) {
+        log::error("Renderer : allocation du set d'environnement échouée");
+        vkDestroyImageView(context_.device(), env.view, nullptr);
+        context_.destroy_image(env.image, env.allocation);
+        return 0;
+    }
+
+    // Le set est écrit TOUT DE SUITE : contrairement à un matériau, il ne référence qu'une
+    // vue, qui existe déjà. Le layout annoncé (SHADER_READ_ONLY) ne sera vrai qu'à la fin
+    // du transfert, mais c'est au moment de l'ACCÈS qu'il doit l'être — et on ne dessine
+    // la skybox que lorsque `ready`. Aucun risque de réécrire un set en vol.
+    VkDescriptorImageInfo image_info{};
+    image_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    image_info.imageView = env.view;
+    image_info.sampler = env_sampler_;
+
+    VkWriteDescriptorSet write{};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = env.descriptor;
+    write.dstBinding = 0;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write.descriptorCount = 1;
+    write.pImageInfo = &image_info;
+    vkUpdateDescriptorSets(context_.device(), 1, &write, 0, nullptr);
+
+    // 6 faces contiguës, RGBA half => 8 octets par texel.
+    const VkDeviceSize size =
+        static_cast<VkDeviceSize>(face_size) * face_size * 6u * 4u * sizeof(std::uint16_t);
+    GpuBuffer staging;
+    if (!context_.create_buffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, /*host_visible=*/true,
+                                staging)) {
+        log::error("Renderer : staging d'environnement ({} Mio) refusé",
+                   size / (1024u * 1024u));
+        vkFreeDescriptorSets(context_.device(), env_pool_, 1, &env.descriptor);
+        vkDestroyImageView(context_.device(), env.view, nullptr);
+        context_.destroy_image(env.image, env.allocation);
+        return 0;
+    }
+    std::memcpy(staging.mapped, faces_rgba16f, static_cast<std::size_t>(size));
+
+    const EnvironmentId id = next_environment_id_++;
+    TransferManager::Transfer t = transfer_.begin();
+
+    // 1) TOUS les niveaux et TOUS les layers : UNDEFINED -> TRANSFER_DST.
+    VkImageMemoryBarrier to_dst{};
+    to_dst.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    to_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    to_dst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_dst.image = env.image;
+    to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, env.mips, 0u, 6u};
+    to_dst.srcAccessMask = 0;
+    to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(t.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                         0, nullptr, 0, nullptr, 1, &to_dst);
+
+    // 2) Une seule copie pour les 6 faces : elles sont contiguës dans le staging, dans
+    //    l'ordre des layers (+X, -X, +Y, -Y, +Z, -Z).
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 6u};
+    region.imageExtent = {face_size, face_size, 1u};
+    vkCmdCopyBufferToImage(t.cmd, staging.buffer, env.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                           &region);
+
+    // 3) Chaîne de mips + transition finale vers SHADER_READ_ONLY.
+    record_environment_mips(t.cmd, env.image, face_size, env.mips);
+
+    transfer_.stage(t, staging);
+    transfer_.on_complete(t, [this, id] {
+        const auto it = environments_.find(id);
+        if (it != environments_.end()) {
+            it->second.ready = true;
+        }
+    });
+    transfer_.submit(t);
+
+    environments_.emplace(id, env);
+    log::info("Environnement : cubemap {}x{}, {} mips ({:.1f} Mio VRAM) — téléversement lancé",
+              face_size, face_size, env.mips,
+              static_cast<double>(size) * 4.0 / 3.0 / (1024.0 * 1024.0));
+    return id;
+}
+
+bool Renderer::is_environment_ready(EnvironmentId id) const {
+    const auto it = environments_.find(id);
+    return it != environments_.end() && it->second.ready;
+}
+
+void Renderer::destroy_environment_gpu(Environment& env) {
+    if (env.descriptor != VK_NULL_HANDLE) {
+        vkFreeDescriptorSets(context_.device(), env_pool_, 1, &env.descriptor);
+        env.descriptor = VK_NULL_HANDLE;
+    }
+    if (env.view != VK_NULL_HANDLE) {
+        vkDestroyImageView(context_.device(), env.view, nullptr);
+        env.view = VK_NULL_HANDLE;
+    }
+    if (env.image != VK_NULL_HANDLE) {
+        context_.destroy_image(env.image, env.allocation);
+        env.image = VK_NULL_HANDLE;
+        env.allocation = nullptr;
+    }
+}
+
+void Renderer::destroy_environment(EnvironmentId id) {
+    const auto it = environments_.find(id);
+    if (it == environments_.end()) {
+        return;
+    }
+    // Un environnement se détruit rarement (changement de ciel). On paie donc une
+    // synchro franche plutôt que d'ajouter une file de destruction différée de plus.
+    vkDeviceWaitIdle(context_.device());
+    if (active_environment_ == id) {
+        active_environment_ = 0;
+    }
+    destroy_environment_gpu(it->second);
+    environments_.erase(it);
+}
+
+void Renderer::record_skybox(VkCommandBuffer cmd) {
+    if (active_environment_ == 0) {
+        return;
+    }
+    const auto it = environments_.find(active_environment_);
+    if (it == environments_.end() || !it->second.ready) {
+        return;  // pas encore téléversée : le clear tient lieu de fond
+    }
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, skybox_pipeline_);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, skybox_pipeline_layout_, 0, 1,
+                            &descriptor_sets_[current_frame_], 0, nullptr);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, skybox_pipeline_layout_, 1, 1,
+                            &it->second.descriptor, 0, nullptr);
+    vkCmdDraw(cmd, 3, 1, 0, 0);  // triangle plein écran, sans tampon de sommets
+}
+
 void Renderer::destroy_texture(TextureId id) {
     const auto it = textures_.find(id);
     if (it == textures_.end()) {
@@ -1743,6 +2172,11 @@ void Renderer::record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
             vkCmdDraw(cmd, mesh.vertex_count, 1, 0, 0);
         }
     }
+
+    // Le ciel EN DERNIER, volontairement : toute la géométrie a déjà écrit sa profondeur,
+    // donc l'early-z rejette le ciel partout où elle est passée. Le dessiner en premier
+    // coûterait un fragment plein écran systématiquement.
+    record_skybox(cmd);
 
     vkCmdEndRenderPass(cmd);
     vkEndCommandBuffer(cmd);
@@ -1923,6 +2357,35 @@ void Renderer::shutdown() {
     if (sampler_ != VK_NULL_HANDLE) {
         vkDestroySampler(dev, sampler_, nullptr);
         sampler_ = VK_NULL_HANDLE;
+    }
+
+    // Environnement / skybox (étape 6a). Les sets partent avec le pool : on ne libère
+    // ici que vues + images (destroy_environment_gpu les remettrait au pool inutilement).
+    for (auto& [id, env] : environments_) {
+        env.descriptor = VK_NULL_HANDLE;  // rendu par la destruction du pool ci-dessous
+        destroy_environment_gpu(env);
+    }
+    environments_.clear();
+    active_environment_ = 0;
+    if (skybox_pipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(dev, skybox_pipeline_, nullptr);
+        skybox_pipeline_ = VK_NULL_HANDLE;
+    }
+    if (skybox_pipeline_layout_ != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(dev, skybox_pipeline_layout_, nullptr);
+        skybox_pipeline_layout_ = VK_NULL_HANDLE;
+    }
+    if (env_pool_ != VK_NULL_HANDLE) {
+        vkDestroyDescriptorPool(dev, env_pool_, nullptr);  // libère aussi les sets
+        env_pool_ = VK_NULL_HANDLE;
+    }
+    if (env_set_layout_ != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(dev, env_set_layout_, nullptr);
+        env_set_layout_ = VK_NULL_HANDLE;
+    }
+    if (env_sampler_ != VK_NULL_HANDLE) {
+        vkDestroySampler(dev, env_sampler_, nullptr);
+        env_sampler_ = VK_NULL_HANDLE;
     }
 
     // Ombres (M8) : framebuffers/vues/images, puis sampler, pipelines, layout, passe.

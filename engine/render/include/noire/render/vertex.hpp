@@ -44,6 +44,10 @@ using TextureId = std::uint32_t;
 // DrawItem => le matériau par défaut (tout en textures de secours).
 using MaterialId = std::uint32_t;
 
+// Identifiant opaque d'un environnement (= la cubemap HDR du ciel, M8 étape 6a). 0 =
+// aucun : le Renderer retombe alors sur son nettoyage à la couleur de fond.
+using EnvironmentId = std::uint32_t;
+
 // Espace colorimétrique d'une texture — détermine le format Vulkan, donc si le
 // matériel applique la conversion sRGB->linéaire à l'échantillonnage.
 //   SrgbColor  : couleurs vues par l'œil (base color)         => R8G8B8A8_SRGB
