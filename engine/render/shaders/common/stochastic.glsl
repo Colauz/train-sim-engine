@@ -30,6 +30,21 @@
 // Aiguisage des poids. 1 = mélange linéaire (contraste détruit) ; +inf = un seul
 // échantillon (coutures franches). 5 laisse une transition étroite mais continue.
 const float kStochasticSharpen = 5.0;
+
+// PIÈGE 4 — L'ALIASING DES POIDS, et c'est le plus vicieux : il ne se voit PAS sur une
+// image fixe, seulement en mouvement.
+//
+// Les poids barycentriques sont une fonction HAUTE FRÉQUENCE de l'UV (nos cellules font
+// ~0.58 m) et, contrairement aux textures, ils ne sont filtrés par AUCUN mip. Dès qu'un
+// pixel couvre une fraction de cellule, ils crénellent, et le sol grésille dès que la
+// caméra bouge d'un cheveu. Mesuré sur une scène FIGÉE, deux frames consécutives : 22 %
+// de pixels instables à mi-distance contre 0,4 % en carrelage ordinaire — 56x pire.
+//
+// Le remède est de renoncer : au-delà d'une certaine empreinte, on revient au carrelage
+// ordinaire. On ne perd rien, car à cette distance la répétition est déjà invisible — les
+// mips ont réduit la texture à sa moyenne. Bornes en unités UV par pixel.
+const float kStochasticFadeNear = 0.02;  // empreinte < 0.02 : ~14 pixels par cellule
+const float kStochasticFadeFar = 0.10;   // au-delà : carrelage ordinaire, stable
 // Amplitude du décalage aléatoire, en tours de texture. Grand et non entier : il doit
 // décorréler complètement les 3 taps.
 const float kStochasticOffset = 43.0;
@@ -80,22 +95,43 @@ mat2 rot2(float a) {
 // décriraient trois cailloux différents au même endroit.
 void stochasticSurface(sampler2D baseMap, sampler2D armMap, sampler2D normalMap, vec2 uv,
                        out vec3 outBase, out vec3 outArm, out vec3 outNormal) {
+    // Dérivées de l'UV CONTINU : la seule référence correcte pour le choix du mip, ET la
+    // mesure de l'empreinte du pixel.
+    vec2 dx = dFdx(uv);
+    vec2 dy = dFdy(uv);
+    float footprint = max(length(dx), length(dy));
+    float amount = 1.0 - smoothstep(kStochasticFadeNear, kStochasticFadeFar, footprint);
+
+    // Le carrelage ordinaire : toujours lu, c'est la référence stable vers laquelle on
+    // fond au loin. Un seul tap, donc quasi gratuit.
+    vec3 plainBase = textureGrad(baseMap, uv, dx, dy).rgb;
+    vec3 plainArm = textureGrad(armMap, uv, dx, dy).rgb;
+    vec3 plainNor = textureGrad(normalMap, uv, dx, dy).rgb * 2.0 - 1.0;
+
+    if (amount < 0.002) {
+        outBase = plainBase;
+        outArm = plainArm;
+        outNormal = normalize(plainNor) * 0.5 + 0.5;
+        return;  // au loin : on ne paie même pas les 3 taps
+    }
+
     vec3 w;
     ivec2 c1, c2, c3;
     triangleGrid(uv, w, c1, c2, c3);
 
-    w = pow(w, vec3(kStochasticSharpen));
-    w /= (w.x + w.y + w.z);
-
-    // Dérivées de l'UV CONTINU : c'est la seule référence correcte pour le choix du mip.
-    vec2 dx = dFdx(uv);
-    vec2 dy = dFdy(uv);
+    // max(w, 0) AVANT pow : les barycentriques sont positifs en théorie, mais l'erreur
+    // flottante peut en rendre un très légèrement négatif au ras d'une arête — et
+    // pow(négatif, 5) est INDÉFINI en GLSL. Un seul NaN contamine tout le fragment.
+    w = pow(max(w, vec3(0.0)), vec3(kStochasticSharpen));
+    // La somme ne peut pas être nulle (les barycentriques somment à 1, donc l'un vaut au
+    // moins 1/3, soit (1/3)^5 après aiguisage), mais on se garde du zéro par principe.
+    w /= max(w.x + w.y + w.z, 1e-8);
 
     ivec2 cells[3] = ivec2[3](c1, c2, c3);
     float weights[3] = float[3](w.x, w.y, w.z);
 
-    outBase = vec3(0.0);
-    outArm = vec3(0.0);
+    vec3 stochBase = vec3(0.0);
+    vec3 stochArm = vec3(0.0);
     vec3 nAcc = vec3(0.0);
 
     for (int i = 0; i < 3; ++i) {
@@ -106,8 +142,8 @@ void stochasticSurface(sampler2D baseMap, sampler2D armMap, sampler2D normalMap,
         vec2 sdx = R * dx;
         vec2 sdy = R * dy;
 
-        outBase += weights[i] * textureGrad(baseMap, suv, sdx, sdy).rgb;
-        outArm += weights[i] * textureGrad(armMap, suv, sdx, sdy).rgb;
+        stochBase += weights[i] * textureGrad(baseMap, suv, sdx, sdy).rgb;
+        stochArm += weights[i] * textureGrad(armMap, suv, sdx, sdy).rgb;
 
         // La normale est décompressée AVANT le mélange : moyenner des octets encodés
         // n'a pas de sens géométrique. Puis rotation INVERSE — le tap a lu la texture à
@@ -118,8 +154,12 @@ void stochasticSurface(sampler2D baseMap, sampler2D armMap, sampler2D normalMap,
         nAcc += weights[i] * n;
     }
 
+    // Fondu vers le carrelage ordinaire selon l'empreinte : c'est ce qui tue le
+    // grésillement sans rien coûter en qualité de près.
+    outBase = mix(plainBase, stochBase, amount);
+    outArm = mix(plainArm, stochArm, amount);
     // Re-normalisée puis RÉ-ENCODÉE : shadingNormal() attend un texel brut (0..1).
-    outNormal = normalize(nAcc) * 0.5 + 0.5;
+    outNormal = normalize(mix(plainNor, nAcc, amount)) * 0.5 + 0.5;
 }
 
 #endif  // NOIRE_STOCHASTIC_GLSL
