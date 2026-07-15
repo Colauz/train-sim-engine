@@ -508,7 +508,8 @@ VkPipeline Renderer::build_pipeline(Topology topology) {
     depth_stencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
     depth_stencil.depthTestEnable = VK_TRUE;
     depth_stencil.depthWriteEnable = VK_TRUE;
-    depth_stencil.depthCompareOp = VK_COMPARE_OP_LESS;
+    // REVERSE-Z (M9) : le proche projette sur 1.0, le lointain sur 0.0 (cf. camera.cpp).
+    depth_stencil.depthCompareOp = VK_COMPARE_OP_GREATER;
 
     VkPipelineColorBlendAttachmentState blend_attachment{};
     blend_attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
@@ -1384,7 +1385,8 @@ VkPipeline Renderer::build_textured_pipeline() {
     depth_stencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
     depth_stencil.depthTestEnable = VK_TRUE;
     depth_stencil.depthWriteEnable = VK_TRUE;
-    depth_stencil.depthCompareOp = VK_COMPARE_OP_LESS;
+    // REVERSE-Z (M9) : le proche projette sur 1.0, le lointain sur 0.0 (cf. camera.cpp).
+    depth_stencil.depthCompareOp = VK_COMPARE_OP_GREATER;
 
     VkPipelineColorBlendAttachmentState blend_attachment{};
     blend_attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
@@ -1882,7 +1884,9 @@ bool Renderer::create_skybox_pipeline() {
     // testé contre lui. Le test, lui, reste actif en LESS_OR_EQUAL — le ciel sort à
     // exactement 1.0, donc il ne survit que là où la profondeur est encore au clear.
     depth_stencil.depthWriteEnable = VK_FALSE;
-    depth_stencil.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+    // REVERSE-Z : le ciel sort à z = 0 (le plan lointain), il ne survit donc que là où
+    // la profondeur vaut encore 0 — c'est-à-dire là où rien n'a été dessiné.
+    depth_stencil.depthCompareOp = VK_COMPARE_OP_GREATER_OR_EQUAL;
 
     VkPipelineColorBlendAttachmentState blend_attachment{};
     blend_attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
@@ -2473,7 +2477,7 @@ void Renderer::record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
 
     std::array<VkClearValue, 2> clears{};
     clears[0].color = {{background_color_.r, background_color_.g, background_color_.b, 1.0f}};
-    clears[1].depthStencil = {1.0f, 0};
+    clears[1].depthStencil = {0.0f, 0};  // REVERSE-Z : 0 = plan lointain
 
     VkRenderPassBeginInfo rp{};
     rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;

@@ -52,8 +52,20 @@ struct RailProfile {
     // le ballast s'y raccorde au lieu de flotter.
     float ballast_crown_y = -0.30f;      // hauteur du plateau, sous le plan de roulement
     float ballast_crown_half = 1.90f;    // demi-largeur du plateau
-    float ballast_base_y = -0.80f;       // pied du talus (= niveau du sol)
+    float ballast_base_y = -0.80f;       // pied du talus
     float ballast_base_half = 2.65f;     // demi-largeur au pied (pente ~1:1.5)
+
+    // --- Accotement / remblai (M9 correction) ---------------------------------
+    // La voie suit une spline qui ondule (±6 m), le sol est un plan PLAT : sans raccord,
+    // le ballast flotte ou s'enterre au gré des collines. L'accotement est le remblai qui
+    // descend du pied du ballast jusqu'au sol — exactement ce que fait une vraie ligne.
+    //
+    // `ground_level` est une altitude ABSOLUE (monde), calée sous le POINT LE PLUS BAS de
+    // la spline : la voie est donc toujours EN REMBLAI, jamais en tranchée. C'est
+    // volontaire — une tranchée exigerait de percer un trou dans le plan de sol, ce qu'un
+    // simple quad ne sait pas faire.
+    double ground_level = -6.8;    // = -(amplitude verticale de la voie) - 0.8
+    float shoulder_half = 22.0f;   // 12 m de dénivelé max sur ~19 m => pente ~1:1.6, réaliste
 };
 
 // Un sous-maillage : sommets PBR + indices, prêts pour create_mesh_indexed.
@@ -69,6 +81,7 @@ struct TrackMeshData {
     RailMeshData rails;     // acier : metallic 1, poli par les roues
     RailMeshData sleepers;  // béton : diélectrique mat
     RailMeshData ballast;   // gravier : diélectrique très rugueux
+    RailMeshData shoulder;  // remblai : même matériau que le sol (herbe/terre)
     [[nodiscard]] bool empty() const { return rails.empty(); }
 };
 

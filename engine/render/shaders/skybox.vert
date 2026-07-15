@@ -25,17 +25,18 @@ void main() {
     // triangle évite la couture diagonale d'un quad et coûte moins qu'un cube.
     vec2 ndc = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2) * 2.0 - 1.0;
 
-    // z = w = 1 => profondeur NDC de 1.0 EXACTEMENT, soit le plan lointain. Combiné au
-    // test LESS_OR_EQUAL et au clear à 1.0, le ciel ne survit que là où rien n'a été
+    // REVERSE-Z (M9) : le plan lointain est à z = 0, plus à 1. Combiné au test
+    // GREATER_OR_EQUAL et au clear à 0.0, le ciel ne survit que là où rien n'a été
     // dessiné : la géométrie déjà rasterisée le rejette en early-z.
-    gl_Position = vec4(ndc, 1.0, 1.0);
+    gl_Position = vec4(ndc, 0.0, 1.0);
 
     // Rayon de vue : on remonte le NDC à travers la projection. Fait ICI (3 invocations
     // par frame) et surtout pas au fragment, où inverse() sur une mat4 se paierait par
-    // pixel. Pas de division par w : elle ne ferait que mettre à l'échelle une direction
-    // qu'on normalise de toute façon — et le facteur est positif (1/far), donc le sens
-    // est préservé.
-    vec4 viewPos = inverse(u.proj) * vec4(ndc, 1.0, 1.0);
+    // pixel. On divise par w : en reverse-Z le facteur d'échelle n'est plus garanti
+    // positif, et un signe inversé retournerait le ciel — la division rend le calcul
+    // indépendant de la convention de profondeur.
+    vec4 viewPos = inverse(u.proj) * vec4(ndc, 0.0, 1.0);
+    viewPos /= viewPos.w;
 
     // La vue est une PURE ROTATION (origine flottante : la caméra EST à l'origine), donc
     // son inverse est sa transposée. Le résultat vit dans l'espace relatif caméra, qui

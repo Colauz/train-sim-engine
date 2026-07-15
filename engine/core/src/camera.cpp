@@ -51,7 +51,21 @@ glm::mat4 Camera::view_matrix() const {
 }
 
 glm::mat4 Camera::projection_matrix(float aspect_ratio) const {
-    glm::mat4 proj = glm::perspective(fov_y_radians, aspect_ratio, near_plane, far_plane);
+    // REVERSE-Z (M9) : near et far sont SWAPPÉS volontairement => le plan proche projette
+    // sur 1.0 et le plan lointain sur 0.0.
+    //
+    // Pourquoi : une projection perspective distribue la profondeur en 1/z, donc écrase
+    // toute la précision près du plan PROCHE — et un float32 a lui aussi sa précision
+    // concentrée près de 0. En convention normale les deux effets se cumulent DANS LE
+    // MÊME SENS et le lointain devient inexploitable : mesuré à 60 m d'imprécision à
+    // 10 km (near=0.1, far=10000). En inversant, l'hyperbole du 1/z et l'exponentiel du
+    // float se compensent presque exactement, et la précision devient quasi uniforme.
+    //
+    // Impose ailleurs : clear de profondeur à 0.0, compareOp GREATER(_OR_EQUAL), et le
+    // ciel sorti à z = 0. La passe d'ombre, elle, garde la convention normale : sa
+    // projection est ORTHOGRAPHIQUE, donc sa profondeur est déjà linéaire — le reverse-Z
+    // ne lui apporterait rigoureusement rien.
+    glm::mat4 proj = glm::perspective(fov_y_radians, aspect_ratio, far_plane, near_plane);
     proj[1][1] *= -1.0f;  // Vulkan : axe Y de l'espace clip inversé par rapport à OpenGL
     return proj;
 }

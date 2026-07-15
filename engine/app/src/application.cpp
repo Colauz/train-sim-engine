@@ -71,6 +71,12 @@ std::vector<render::Vertex> make_box_vertices(const glm::vec3& base_color) {
 // Doit couvrir le plan lointain de la caméra (10 km depuis le M9) dans toutes les
 // directions, sinon le vide apparaît au-delà.
 constexpr float kGroundHalfExtent = 12000.0f;
+// Altitude ABSOLUE du plan de sol. Calée sous le point le plus BAS de la spline
+// (amplitude verticale 6 m) moins la profondeur du ballast : la voie est donc toujours
+// en remblai au-dessus du sol, jamais en tranchée — un simple quad ne saurait pas se
+// percer d'un trou. AVANT le M9, le sol suivait le train (body_y - 3.0) : il divergeait
+// de la voie jusqu'à 12 m au loin, d'où les rails qui flottaient ou s'enterraient.
+constexpr double kGroundLevel = -6.8;
 // Période de répétition de la texture, en mètres. C'est aussi le pas de recentrage du
 // sol, pour que les UV ne glissent pas sous le train. (Sa valeur était grande faute de
 // mipmaps ; le M9 les a activées, elle pourrait donc être réduite.)
@@ -203,14 +209,18 @@ struct Application::Impl {
 
     static scene::StreamerConfig make_streamer_config() {
         scene::StreamerConfig sc;
-        sc.chunk_length = 2000.0;
-        // 5 tuiles devant = 10 km de voie chargée (M9 optimisation). Tenable uniquement
-        // grâce au LOD : seules les 3 tuiles autour du train sont détaillées.
-        sc.chunks_ahead = 5;
-        sc.chunks_behind = 1;
+        // Tuiles COURTES (500 m) : c'est la granularité du LOD. À 2 km, le détail complet
+        // portait jusqu'à 4 km et les traverses grouillaient ; à 500 m avec un rayon de 1,
+        // il s'arrête à 1 km — là où une traverse fait encore plusieurs pixels.
+        sc.chunk_length = 500.0;
+        sc.chunks_ahead = 20;  // 20 x 500 m = 10 km de voie chargée
+        sc.chunks_behind = 2;
         sc.full_lod_radius = 1;
-        sc.max_uploads_per_update = 1;
+        // 22 tuiles à charger au démarrage : sans budget relevé, l'écran de chargement
+        // durerait 22 frames de plus pour rien.
+        sc.max_uploads_per_update = 3;
         sc.rail_profile.sample_step = 2.0;
+        sc.rail_profile.ground_level = kTrackOrigin.y + kGroundLevel;
         return sc;
     }
 
@@ -258,6 +268,28 @@ struct Application::Impl {
 
     bool model_ready_reported = false;
     bool sky_ready_reported = false;
+    bool loading_done_reported = false;
+
+    // --- Écran de chargement (M9 correction) ---------------------------------
+    // Tant que les assets FONDATEURS ne sont pas sur le GPU, on ne dessine RIEN (noir).
+    // Sans ça, la première frame sort avec des SH à zéro et un environnement 1x1 gris :
+    // la scène s'affiche sombre et sans reflets, puis « saute » brutalement ~2,6 s plus
+    // tard quand le HDR arrive. Le ciel est le seul asset réellement lent (décodage +
+    // rééchantillonnage cube sur un worker) ; les autres suivent.
+    //
+    // On ne BLOQUE pas la boucle : elle continue de tourner, de pumper les ressources et
+    // de streamer la voie. On se contente de ne pas montrer un état intermédiaire.
+    // On teste `sky_ready_reported` et NON `sky->ready` : c'est le drapeau posé APRÈS
+    // set_environment(). Nuance décisive — pump() rend le ciel prêt en MILIEU de frame,
+    // alors que la liaison se fait en TÊTE de la suivante. Se fier à sky->ready laissait
+    // donc passer exactement UNE frame dessinée avec l'environnement 1x1 de secours, soit
+    // le pop d'origine en miniature (observé dans les logs).
+    [[nodiscard]] bool assets_ready() const {
+        return sky_ready_reported &&                    // HDRI chargé ET lié (SH + IBL + skybox)
+               train_model && train_model->ready &&     // le gabarit
+               ballast_textured &&                      // les 3 cartes du ballast
+               streamer.active_chunk_count() > 0;       // au moins une tuile de voie
+    }
 
     float orbit_yaw = 3.14159f;
     float orbit_pitch = 0.30f;
@@ -503,6 +535,24 @@ struct Application::Impl {
             renderer.notify_resized();
         }
 
+        // Écran de chargement : noir tant que les assets fondateurs ne sont pas prêts.
+        // Placé APRÈS resources.pump() et streamer.update() — sinon rien ne progresserait
+        // et on n'en sortirait jamais. Le premier pixel affiché est donc déjà l'image
+        // finale : plus de « pop » de lumière.
+        if (!assets_ready()) {
+            render::FrameUniforms black;
+            black.view = camera.view_matrix();
+            black.proj = camera.projection_matrix(static_cast<float>(size.width) /
+                                                  static_cast<float>(size.height));
+            black.fog_color_density = glm::vec4(0.0f, 0.0f, 0.0f, 0.0f);  // fond noir
+            renderer.draw_frame(black, {});
+            return;
+        }
+        if (!loading_done_reported) {
+            log::info("M9 : assets fondateurs prêts — première frame complète");
+            loading_done_reported = true;
+        }
+
         // Delta de temps réel pour la vitesse de la caméra (Doppler du listener).
         const auto now = std::chrono::steady_clock::now();
         double dt_render = 1.0 / 60.0;
@@ -575,7 +625,8 @@ struct Application::Impl {
         // UV, donc la texture reste parfaitement fixe dans le monde (elle ne glisse pas).
         const WorldPosition wp = wagon.body_position();
         const double gs = static_cast<double>(kGroundUvPeriod);
-        const WorldPosition ground_center(std::floor(wp.x / gs) * gs, wp.y - 3.0,
+        const WorldPosition ground_center(std::floor(wp.x / gs) * gs,
+                                          kTrackOrigin.y + kGroundLevel,
                                           std::floor(wp.z / gs) * gs);
         items.push_back(
             render::DrawItem{camera.relative_model(ground_center), ground_mesh, ground_material});
@@ -583,7 +634,8 @@ struct Application::Impl {
         // Voie streamée (une origine par tuile) : 3 sous-maillages, 3 matériaux (M9).
         for (const scene::ChunkRenderInfo& chunk : streamer.renderables()) {
             const glm::mat4 model = camera.relative_model(chunk.origin);
-            const std::pair<render::MeshId, render::MaterialId> parts[3] = {
+            const std::pair<render::MeshId, render::MaterialId> parts[4] = {
+                {chunk.shoulder, ground_material},  // remblai : c'est du terrain, pas de la voie
                 {chunk.ballast, ballast_material},
                 {chunk.sleepers, sleeper_material},
                 {chunk.rails, rail_material},

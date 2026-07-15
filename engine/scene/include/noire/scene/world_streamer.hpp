@@ -40,6 +40,7 @@ struct ChunkRenderInfo {
     render::MeshId rails = 0;
     render::MeshId sleepers = 0;
     render::MeshId ballast = 0;
+    render::MeshId shoulder = 0;  // remblai : porté par le matériau du SOL
     WorldPosition origin{};
 };
 
@@ -77,6 +78,7 @@ private:
         render::MeshId rails = 0;
         render::MeshId sleepers = 0;
         render::MeshId ballast = 0;
+        render::MeshId shoulder = 0;
         bool has_mesh = false;
         TrackLod lod = TrackLod::Distant;      // LOD des maillages ACTUELLEMENT affichés
         TrackLod building_lod = TrackLod::Distant;  // LOD que le worker est en train de bâtir
