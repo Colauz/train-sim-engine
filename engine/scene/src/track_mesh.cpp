@@ -166,6 +166,18 @@ std::vector<P2> make_rail_profile(const RailProfile& p) {
     };
 }
 
+// Profil du rail en LOD lointain : un simple bloc rectangulaire, aux cotes du champignon
+// mais sur toute la hauteur. 4 arêtes au lieu de 12. À 2 km, l'âme et le patin d'un rail
+// se projettent bien en dessous du pixel : les mailler est du calcul pur perdu.
+std::vector<P2> make_rail_profile_distant(const RailProfile& p) {
+    return {
+        {-p.rail_head_half, -p.rail_height},
+        {p.rail_head_half, -p.rail_height},
+        {p.rail_head_half, 0.0f},
+        {-p.rail_head_half, 0.0f},
+    };
+}
+
 // Profil du ballast : polyligne OUVERTE (le dessous est enterré, on ne le maille pas).
 // Parcourue de DROITE à GAUCHE, ce qui correspond au sens trigonométrique pour une
 // surface supérieure — la même formule de normale que le rail s'applique donc.
@@ -181,14 +193,17 @@ std::vector<P2> make_ballast_profile(const RailProfile& p) {
 }  // namespace
 
 TrackMeshData generate_track_mesh(const TrackSource& track, double x_start, double x_end,
-                                  const WorldPosition& origin, const RailProfile& profile) {
+                                  const WorldPosition& origin, const RailProfile& profile,
+                                  TrackLod lod) {
     TrackMeshData out;
     const double span = x_end - x_start;
     if (span <= 0.0) {
         return out;
     }
 
-    const double step = (profile.sample_step > 0.01) ? profile.sample_step : 1.0;
+    const bool full = lod == TrackLod::Full;
+    const double raw_step = full ? profile.sample_step : profile.distant_sample_step;
+    const double step = (raw_step > 0.01) ? raw_step : 1.0;
     const int count = std::max(2, static_cast<int>(std::ceil(span / step)) + 1);
     const glm::vec3 world_up(0.0f, 1.0f, 0.0f);
     const float uv_period = profile.uv_period > 0.01f ? profile.uv_period : 1.0f;
@@ -216,15 +231,24 @@ TrackMeshData generate_track_mesh(const TrackSource& track, double x_start, doub
     // --- Rails : le profil en I, extrudé deux fois -----------------------------
     // L'écartement se mesure entre FACES INTERNES des champignons : l'axe de chaque rail
     // est donc à gauge/2 + demi-champignon de l'axe de voie.
-    const std::vector<P2> rail_profile = make_rail_profile(profile);
+    const std::vector<P2> rail_profile =
+        full ? make_rail_profile(profile) : make_rail_profile_distant(profile);
     const float rail_axis = static_cast<float>(profile.gauge * 0.5) + profile.rail_head_half;
     extrude(out.rails, frames, rail_profile, /*closed=*/true, rail_axis, uv_period);
     extrude(out.rails, frames, rail_profile, /*closed=*/true, -rail_axis, uv_period);
 
     // --- Ballast --------------------------------------------------------------
+    // Gardé aux DEUX niveaux : c'est lui qui dessine le tracé de la ligne dans le
+    // paysage, et il ne coûte que 3 arêtes.
     extrude(out.ballast, frames, make_ballast_profile(profile), /*closed=*/false, 0.0f, uv_period);
 
     // --- Traverses ------------------------------------------------------------
+    // ABANDONNÉES au loin : à elles seules, elles pèsent ~80 k sommets par tuile (3333
+    // traverses), pour un objet de 30 cm de large qui, à 2 km, ne couvre pas un pixel.
+    // C'est l'essentiel de l'économie du LOD.
+    if (!full) {
+        return out;
+    }
     // Échantillonnées à leur PROPRE pas (60 cm), indépendant de celui de la voie : une
     // traverse est un objet discret, pas une extrusion.
     const double spacing = profile.sleeper_spacing > 0.01f ? profile.sleeper_spacing : 0.6;

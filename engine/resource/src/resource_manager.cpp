@@ -19,6 +19,7 @@ namespace noire::resource {
 struct ResourceManager::TextureSlot {
     TextureHandle handle;
     std::string full_path;
+    render::TextureFormat format = render::TextureFormat::SrgbColor;
     std::atomic<ResourceState> state{ResourceState::Queued};
     ImageData cpu;  // rempli par le worker, consommé au pump
 };
@@ -143,7 +144,8 @@ ModelHandle ResourceManager::load_model(const std::string& relative_path) {
     return model;
 }
 
-TextureHandle ResourceManager::load_texture(const std::string& relative_path) {
+TextureHandle ResourceManager::load_texture(const std::string& relative_path,
+                                           render::TextureFormat format) {
     const auto cached = texture_cache_.find(relative_path);
     if (cached != texture_cache_.end()) {
         if (TextureHandle alive = cached->second.lock()) {
@@ -157,6 +159,7 @@ TextureHandle ResourceManager::load_texture(const std::string& relative_path) {
     auto slot = std::make_shared<TextureSlot>();
     slot->handle = texture;
     slot->full_path = paths_.resolve(relative_path);
+    slot->format = format;
     loading_textures_.push_back(slot);
 
     if (!paths_.exists(relative_path)) {
@@ -323,7 +326,7 @@ void ResourceManager::pump_textures(int& budget) {
         if (state == ResourceState::CpuReady && budget > 0) {
             slot.handle->id = renderer_.create_texture(static_cast<std::uint32_t>(slot.cpu.width),
                                                        static_cast<std::uint32_t>(slot.cpu.height),
-                                                       slot.cpu.pixels.data());
+                                                       slot.cpu.pixels.data(), slot.format);
             slot.cpu = ImageData{};  // libère la RAM CPU une fois lancé vers le GPU
             slot.state.store(ResourceState::Uploading, std::memory_order_relaxed);
             --budget;

@@ -41,7 +41,7 @@ public:
     // --- Paramètres publics ---------------------------------------------------
     float fov_y_radians = glm::radians(60.0f);
     float near_plane = 0.1f;
-    float far_plane = 2000.0f;
+    float far_plane = 10000.0f;
     float move_speed = 12.0f;          // m/s
     float mouse_sensitivity = 0.0025f;  // rad/pixel
 

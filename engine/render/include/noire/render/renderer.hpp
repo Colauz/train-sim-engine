@@ -165,6 +165,7 @@ private:
         VkImage image = VK_NULL_HANDLE;
         VmaAllocation allocation = nullptr;
         VkImageView view = VK_NULL_HANDLE;
+        std::uint32_t mips = 1;  // chaîne complète depuis le M9 (anti-grouillement)
         bool ready = false;
     };
 
@@ -246,7 +247,8 @@ private:
     bool create_textured_pipeline_layout();    // set0 (UBO) + set1 (matériau) + push
     bool create_default_textures();            // secours 1x1 : blanc, metal/rough, normale
     bool create_default_material();
-    VkImageView create_image_view_2d(VkImage image, VkFormat format);
+    VkImageView create_image_view_2d(VkImage image, VkFormat format,
+                                    std::uint32_t mips = 1);
     // Identifiant réellement liable pour un rôle : celui demandé s'il existe, sinon la
     // texture de secours du rôle.
     [[nodiscard]] TextureId resolve_texture(TextureId requested, TextureId fallback) const;
@@ -266,10 +268,15 @@ private:
     // Set d'environnement réellement liable : l'actif s'il est prêt, sinon le secours.
     // VK_NULL_HANDLE tant que même le secours n'est pas téléversé (1 ou 2 frames).
     [[nodiscard]] VkDescriptorSet resolve_environment_set() const;
-    // Engendre la chaîne de mips par blits successifs et laisse l'image en
-    // SHADER_READ_ONLY. Enregistré dans le command buffer d'un transfert.
-    void record_environment_mips(VkCommandBuffer cmd, VkImage image, std::uint32_t face_size,
-                                 std::uint32_t mips);
+    // Engendre la chaîne de mips par blits successifs et laisse TOUS les niveaux en
+    // SHADER_READ_ONLY. Enregistré dans le command buffer d'un transfert. Générique :
+    // sert aux textures 2D (layers=1) comme à la cubemap d'environnement (layers=6).
+    // `dst_stage` doit couvrir TOUS les étages qui liront l'image ensuite.
+    void record_mip_chain(VkCommandBuffer cmd, VkImage image, std::uint32_t width,
+                          std::uint32_t height, std::uint32_t mips, std::uint32_t layers,
+                          VkPipelineStageFlags dst_stage);
+    // Nombre de niveaux d'une chaîne complète pour une image w x h.
+    [[nodiscard]] static std::uint32_t mip_count(std::uint32_t width, std::uint32_t height);
 
     // Préfiltrage GGX (M8 étape 7) : première passe COMPUTE du moteur. Elle vit dans le
     // command buffer du TransferManager (famille 0 = GRAPHICS|COMPUTE) : un seul submit,

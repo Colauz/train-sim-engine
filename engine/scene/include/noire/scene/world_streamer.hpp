@@ -25,6 +25,10 @@ struct StreamerConfig {
     long chunks_ahead = 2;             // tuiles chargées devant le train
     long chunks_behind = 1;            // tuiles conservées derrière
     int max_uploads_per_update = 1;    // budget d'upload GPU par frame (anti-pic)
+    // Rayon (en tuiles) de la zone en LOD complet autour du train. 1 => la tuile courante
+    // et ses deux voisines immédiates, soit ~2 à 4 km de voie détaillée : bien au-delà de
+    // ce que l'oeil distingue, et déjà 3 tuiles pleines à porter.
+    long full_lod_radius = 1;
     RailProfile rail_profile{};
 };
 
@@ -74,9 +78,14 @@ private:
         render::MeshId sleepers = 0;
         render::MeshId ballast = 0;
         bool has_mesh = false;
+        TrackLod lod = TrackLod::Distant;      // LOD des maillages ACTUELLEMENT affichés
+        TrackLod building_lod = TrackLod::Distant;  // LOD que le worker est en train de bâtir
     };
 
-    void request_chunk(long index);
+    // `lod` est fixé à la demande : une tuile régénérée à un autre LOD passe par ici.
+    void request_chunk(long index, TrackLod lod);
+    void generate_async(Chunk& chunk, TrackLod lod);
+    [[nodiscard]] TrackLod desired_lod(long index, long current) const;
 
     const TrackSource& track_;
     JobSystem& jobs_;

@@ -93,7 +93,11 @@ public:
     ResourceManager& operator=(const ResourceManager&) = delete;
 
     ModelHandle load_model(const std::string& relative_path);
-    TextureHandle load_texture(const std::string& relative_path);
+    // `format` dit au matériel s'il doit décoder le sRGB. Le défaut (SrgbColor) vaut
+    // pour une base color ; une normal map ou une metallic-roughness DOIVENT être en
+    // LinearData, sinon le matériel les décode et fausse tout le PBR.
+    TextureHandle load_texture(const std::string& relative_path,
+                               render::TextureFormat format = render::TextureFormat::SrgbColor);
     // Charge un fichier audio (.wav/.mp3/...) décodé en PCM sur le JobSystem. NON
     // bloquant, dédup par chemin. Le PCM (handle->pcm) est prêt quand handle->ready.
     AudioHandle load_audio(const std::string& relative_path);

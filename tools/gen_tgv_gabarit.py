@@ -24,13 +24,18 @@ NOSE = 3.60         # longueur du nez profilé (avant = -Z)
 # metallic = 1 => la baseColor est la couleur de RÉFLEXION (F0), pas un pigment.
 # metallic = 0 => F0 = 0.04, la baseColor est le pigment diffus. Facteurs LINÉAIRES.
 MATERIALS = [
-    # Livrée TGV : gris clair, satiné. Pas de texture — le gabarit ne prétend à rien.
-    {"name": "livree", "factor": [0.62, 0.63, 0.66, 1.0], "metallic": 0.0, "roughness": 0.45},
-    # Bandeau vitré : diélectrique (surtout PAS métallique — un baseColor noir + metallic
-    # élevé donnerait F0 ~ 0.008, une surface qui ne réfléchit rien).
-    {"name": "vitrage", "factor": [0.02, 0.025, 0.03, 1.0], "metallic": 0.0, "roughness": 0.05},
-    # Bogies + organes de roulement : acier sombre.
-    {"name": "acier", "factor": [0.42, 0.43, 0.45, 1.0], "metallic": 1.0, "roughness": 0.35},
+    # Livrée : gris clair MÉTALLISÉ. metallic 0.35 = un entre-deux volontairement non
+    # physique (un vrai matériau est 0 ou 1) : c'est la triche classique pour rendre une
+    # peinture métallisée, dont les paillettes d'aluminium se comportent en métal sans que
+    # la surface entière en soit un. Elle attrape ainsi le ciel sur 22 m de long.
+    {"name": "livree", "factor": [0.78, 0.79, 0.82, 1.0], "metallic": 0.35, "roughness": 0.28},
+    # Bandeau vitré : diélectrique, surtout PAS métallique — un baseColor noir + metallic
+    # élevé donnerait F0 ~ 0.008, une surface qui ne réfléchit RIEN (l'inverse du verre).
+    # À metallic 0, F0 = 0.04 et c'est le Fresnel qui fait tout : sombre de face, miroir
+    # aux angles rasants.
+    {"name": "vitrage", "factor": [0.02, 0.025, 0.03, 1.0], "metallic": 0.0, "roughness": 0.04},
+    # Bogies + organes de roulement : acier sombre, mat (poussière de frein).
+    {"name": "acier", "factor": [0.42, 0.43, 0.45, 1.0], "metallic": 1.0, "roughness": 0.42},
 ]
 
 # --- Géométrie : (x0,y0,z0, x1,y1,z1) en mètres, repère caisse -----------------

@@ -68,12 +68,12 @@ std::vector<render::Vertex> make_box_vertices(const glm::vec3& base_color) {
 // Grand plan solide texturé, qui remplace la grille filaire du M2 : c'est lui qui
 // reçoit l'ombre portée du train.
 
-// Doit couvrir le plan lointain de la caméra (2000 m) dans toutes les directions.
-constexpr float kGroundHalfExtent = 2500.0f;
-// Période de répétition de la texture, en mètres. Volontairement grande : le sampler
-// n'a PAS de mipmaps (maxLod = 0 depuis le M7), donc une texture à haute fréquence
-// spatiale grouillerait au loin. C'est aussi le pas de recentrage du sol, pour que
-// les UV ne glissent pas sous le train.
+// Doit couvrir le plan lointain de la caméra (10 km depuis le M9) dans toutes les
+// directions, sinon le vide apparaît au-delà.
+constexpr float kGroundHalfExtent = 12000.0f;
+// Période de répétition de la texture, en mètres. C'est aussi le pas de recentrage du
+// sol, pour que les UV ne glissent pas sous le train. (Sa valeur était grande faute de
+// mipmaps ; le M9 les a activées, elle pourrait donc être réduite.)
 constexpr float kGroundUvPeriod = 20.0f;
 constexpr std::uint32_t kGroundTextureSize = 256;
 
@@ -204,8 +204,11 @@ struct Application::Impl {
     static scene::StreamerConfig make_streamer_config() {
         scene::StreamerConfig sc;
         sc.chunk_length = 2000.0;
-        sc.chunks_ahead = 2;
+        // 5 tuiles devant = 10 km de voie chargée (M9 optimisation). Tenable uniquement
+        // grâce au LOD : seules les 3 tuiles autour du train sont détaillées.
+        sc.chunks_ahead = 5;
         sc.chunks_behind = 1;
+        sc.full_lod_radius = 1;
         sc.max_uploads_per_update = 1;
         sc.rail_profile.sample_step = 2.0;
         return sc;
@@ -231,6 +234,12 @@ struct Application::Impl {
     resource::ModelHandle train_model;
     resource::AudioHandle rumble_clip;
     resource::EnvironmentHandle sky;
+    // Textures PBR du ballast (Poly Haven, CC0). Maintenues vivantes par ces handles :
+    // les relâcher recyclerait les textures GPU sous le matériau.
+    resource::TextureHandle ballast_diff;
+    resource::TextureHandle ballast_arm;
+    resource::TextureHandle ballast_nor;
+    bool ballast_textured = false;
     bool rumble_source_applied = false;
 
     // Sol : plan solide texturé (M8 étape 2), il reçoit l'ombre portée du train.
@@ -316,6 +325,9 @@ struct Application::Impl {
         sleeper_desc.roughness_factor = 0.85f;
         sleeper_material = renderer.create_material(sleeper_desc);
 
+        // Ballast : matériau de secours SANS texture, créé tout de suite pour que la voie
+        // soit dessinable dès la première tuile. Il est remplacé par la version texturée
+        // dès que les 3 cartes Poly Haven sont téléversées (cf. render_frame).
         render::MaterialDesc ballast_desc;
         ballast_desc.base_color_factor = glm::vec4(kBallastColor, 1.0f);
         ballast_desc.metallic_factor = 0.0f;   // gravier : diélectrique
@@ -332,8 +344,22 @@ struct Application::Impl {
         // est absent, synthèse M6 si le .wav est absent — le moteur ne crashe jamais.
         asset_paths = resource::AssetPaths::discover();
         resources.set_upload_budget(2);
-        train_model = resources.load_model("models/train.glb");
+        // Gabarit TGV (M9) : cotes réelles d'une motrice (22,15 m). Il remplace la
+        // locomotive-boîte du M7 — c'est lui qui donne le sens de l'échelle.
+        train_model = resources.load_model("models/tgv_gabarit.glb");
         rumble_clip = resources.load_audio("audio/roulement.wav");
+
+        // Ballast (Poly Haven, CC0). L'ESPACE COLORIMÉTRIQUE est dicté par le RÔLE :
+        // la base color est du sRGB, l'ARM et la normal map sont des DONNÉES — les
+        // décoder fausserait rugosité et relief.
+        ballast_diff = resources.load_texture("textures/ballast/gravel_diff.jpg",
+                                              render::TextureFormat::SrgbColor);
+        // _arm de Poly Haven = AO / Roughness / Metallic en R/G/B : c'est EXACTEMENT la
+        // convention glTF metallic-roughness (G = rough, B = metal). Aucun repack requis.
+        ballast_arm = resources.load_texture("textures/ballast/gravel_arm.jpg",
+                                             render::TextureFormat::LinearData);
+        ballast_nor = resources.load_texture("textures/ballast/gravel_nor_gl.jpg",
+                                             render::TextureFormat::LinearData);
         // Ciel HDR (M8 étape 6a). 1024 par face => ~64 Mio de VRAM avec les mips, le
         // compromis retenu pour un iGPU. Absent => le fond uni est conservé.
         sky = resources.load_environment("textures/sky/kloofendal_puresky_2k.hdr", 1024);
@@ -423,6 +449,27 @@ struct Application::Impl {
             sky_ready_reported = true;
         }
 
+        // Ballast texturé : dès que les 3 cartes sont sur le GPU, on bascule le matériau.
+        // Un matériau ne se réécrit JAMAIS (son set serait en vol) : on en crée un neuf et
+        // on change la référence. L'ancien meurt avec l'app — il est unique et minuscule.
+        if (!ballast_textured && ballast_diff && ballast_diff->id != 0 && ballast_arm &&
+            ballast_arm->id != 0 && ballast_nor && ballast_nor->id != 0) {
+            render::MaterialDesc desc;
+            desc.base_color = ballast_diff->id;
+            desc.metallic_roughness = ballast_arm->id;
+            desc.normal = ballast_nor->id;
+            // Facteurs à 1 : on laisse les textures décider entièrement (convention glTF,
+            // facteur * texture). Le gravier de Poly Haven porte déjà sa propre rugosité.
+            desc.base_color_factor = glm::vec4(1.0f);
+            desc.metallic_factor = 1.0f;
+            desc.roughness_factor = 1.0f;
+            if (const render::MaterialId textured = renderer.create_material(desc)) {
+                ballast_material = textured;
+                log::info("M9 : ballast texturé (gravier Poly Haven CC0, base+ARM+normale)");
+            }
+            ballast_textured = true;  // une seule tentative, réussie ou non
+        }
+
         if (!model_ready_reported && train_model && train_model->ready) {
             log::info("M7 : locomotive 'models/train.glb' chargée — {} primitive(s), cubes masqués",
                       train_model->primitives.size());
@@ -495,7 +542,10 @@ struct Application::Impl {
         const glm::vec3 fog_dry(0.28f, 0.45f, 0.78f);
         const glm::vec3 fog_wet(0.55f, 0.57f, 0.60f);
         const glm::vec3 fog_color = glm::mix(fog_dry, fog_wet, wetness);
-        const float fog_density = glm::mix(0.0006f, 0.010f, wetness);
+        // Densité BAISSÉE au M9 (0.0006 -> 0.00008) : à 0.0006, le brouillard atteignait
+        // 95 % dès 5 km — les 10 km de voie chargée étaient purement invisibles. À
+        // 0.00008 l'horizon reste à ~55 % de voile à 10 km : brumeux mais lisible.
+        const float fog_density = glm::mix(0.00008f, 0.010f, wetness);
         uniforms.fog_color_density = glm::vec4(fog_color, fog_density);
         uniforms.params = glm::vec4(wetness, 0.0f, 0.0f, 0.0f);
 

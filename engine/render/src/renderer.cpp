@@ -1218,7 +1218,11 @@ bool Renderer::create_sampler() {
     info.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     info.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     info.minLod = 0.0f;
-    info.maxLod = 0.0f;  // pas de mipmaps pour l'instant (M8+)
+    // Mips ACTIVÉS depuis le M9 : sans eux, une texture à haute fréquence (le gravier du
+    // ballast, période 2 m) grouille dès quelques dizaines de mètres — chaque pixel
+    // couvrant alors des dizaines de texels. VK_LOD_CLAMP_NONE = toute la chaîne, quelle
+    // que soit sa longueur.
+    info.maxLod = VK_LOD_CLAMP_NONE;
     info.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
     if (context_.sampler_anisotropy()) {
         info.anisotropyEnable = VK_TRUE;
@@ -1429,14 +1433,14 @@ VkPipeline Renderer::build_textured_pipeline() {
     return pipeline;
 }
 
-VkImageView Renderer::create_image_view_2d(VkImage image, VkFormat format) {
+VkImageView Renderer::create_image_view_2d(VkImage image, VkFormat format, std::uint32_t mips) {
     VkImageViewCreateInfo view_info{};
     view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
     view_info.image = image;
     view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
     view_info.format = format;
     view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    view_info.subresourceRange.levelCount = 1;
+    view_info.subresourceRange.levelCount = mips;
     view_info.subresourceRange.layerCount = 1;
     VkImageView view = VK_NULL_HANDLE;
     if (vkCreateImageView(context_.device(), &view_info, nullptr, &view) != VK_SUCCESS) {
@@ -1491,12 +1495,16 @@ TextureId Renderer::create_texture(std::uint32_t width, std::uint32_t height,
     // complètement le PBR.
     const VkFormat vk_format = format == TextureFormat::SrgbColor ? VK_FORMAT_R8G8B8A8_SRGB
                                                                   : VK_FORMAT_R8G8B8A8_UNORM;
+    // Mips (M9) : TRANSFER_SRC en plus de DST, car chaque niveau est la SOURCE du blit
+    // qui engendre le suivant. Une 1x1 (secours par rôle) donne mips = 1, sans blit.
+    tex.mips = mip_count(width, height);
     if (!context_.create_image(width, height, vk_format,
-                               VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                               tex.image, tex.allocation)) {
+                               VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                   VK_IMAGE_USAGE_SAMPLED_BIT,
+                               tex.image, tex.allocation, tex.mips)) {
         return 0;
     }
-    tex.view = create_image_view_2d(tex.image, vk_format);
+    tex.view = create_image_view_2d(tex.image, vk_format, tex.mips);
     if (tex.view == VK_NULL_HANDLE) {
         context_.destroy_image(tex.image, tex.allocation);
         return 0;
@@ -1526,7 +1534,7 @@ TextureId Renderer::create_texture(std::uint32_t width, std::uint32_t height,
     to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     to_dst.image = tex.image;
     to_dst.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    to_dst.subresourceRange.levelCount = 1;
+    to_dst.subresourceRange.levelCount = tex.mips;  // TOUS les niveaux, pas seulement le 0
     to_dst.subresourceRange.layerCount = 1;
     to_dst.srcAccessMask = 0;
     to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -1541,15 +1549,11 @@ TextureId Renderer::create_texture(std::uint32_t width, std::uint32_t height,
     vkCmdCopyBufferToImage(t.cmd, staging.buffer, tex.image,
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
-    // 3) TRANSFER_DST_OPTIMAL -> SHADER_READ_ONLY_OPTIMAL (échantillonnage frag)
-    VkImageMemoryBarrier to_read = to_dst;
-    to_read.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    to_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    to_read.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    vkCmdPipelineBarrier(t.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
-                         &to_read);
+    // 3) Chaîne de mips par blits + transition finale de TOUS les niveaux vers
+    //    SHADER_READ_ONLY. Une texture 1x1 (les secours par rôle) a mips = 1 : la boucle
+    //    de blit ne tourne pas, seule la transition finale s'applique.
+    record_mip_chain(t.cmd, tex.image, width, height, tex.mips, 1u,
+                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
 
     transfer_.stage(t, staging);
     const TextureId id = next_texture_id_++;
@@ -1924,12 +1928,19 @@ bool Renderer::create_skybox_pipeline() {
     return true;
 }
 
-void Renderer::record_environment_mips(VkCommandBuffer cmd, VkImage image,
-                                       std::uint32_t face_size, std::uint32_t mips) {
+std::uint32_t Renderer::mip_count(std::uint32_t width, std::uint32_t height) {
+    const std::uint32_t largest = std::max(width, height);
+    return static_cast<std::uint32_t>(std::floor(std::log2(static_cast<float>(largest)))) + 1u;
+}
+
+void Renderer::record_mip_chain(VkCommandBuffer cmd, VkImage image, std::uint32_t width,
+                                std::uint32_t height, std::uint32_t mips, std::uint32_t layers,
+                                VkPipelineStageFlags dst_stage) {
     // À l'entrée : TOUS les niveaux sont en TRANSFER_DST et seul le mip 0 est rempli.
     // Chaque itération réduit le niveau précédent de moitié par un blit filtré
-    // linéairement. Les 6 layers sont traités d'un seul blit (layerCount = 6).
-    auto extent = static_cast<std::int32_t>(face_size);
+    // linéairement. Tous les layers sont traités d'un seul blit (cubemap : layers = 6).
+    auto w = static_cast<std::int32_t>(width);
+    auto h = static_cast<std::int32_t>(height);
     for (std::uint32_t level = 1; level < mips; ++level) {
         // Le niveau source vient d'être écrit : on l'amène en TRANSFER_SRC et on rend
         // cette écriture visible à la lecture du blit.
@@ -1940,23 +1951,27 @@ void Renderer::record_environment_mips(VkCommandBuffer cmd, VkImage image,
         to_src.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         to_src.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         to_src.image = image;
-        to_src.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, level - 1u, 1u, 0u, 6u};
+        to_src.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, level - 1u, 1u, 0u, layers};
         to_src.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         to_src.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
                              0, nullptr, 0, nullptr, 1, &to_src);
 
-        const std::int32_t next = extent > 1 ? extent / 2 : 1;
+        // Chaque dimension se divise INDÉPENDAMMENT et plancher à 1 : une texture non
+        // carrée devient 1xN puis 1x1, elle ne « saute » pas de niveau.
+        const std::int32_t nw = w > 1 ? w / 2 : 1;
+        const std::int32_t nh = h > 1 ? h / 2 : 1;
         VkImageBlit blit{};
-        blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level - 1u, 0u, 6u};
+        blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level - 1u, 0u, layers};
         blit.srcOffsets[0] = {0, 0, 0};
-        blit.srcOffsets[1] = {extent, extent, 1};
-        blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0u, 6u};
+        blit.srcOffsets[1] = {w, h, 1};
+        blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0u, layers};
         blit.dstOffsets[0] = {0, 0, 0};
-        blit.dstOffsets[1] = {next, next, 1};
+        blit.dstOffsets[1] = {nw, nh, 1};
         vkCmdBlitImage(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image,
                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
-        extent = next;
+        w = nw;
+        h = nh;
     }
 
     // Transition finale vers l'échantillonnage. Deux plages distinctes car elles ne sont
@@ -1972,7 +1987,7 @@ void Renderer::record_environment_mips(VkCommandBuffer cmd, VkImage image,
         src.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         src.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         src.image = image;
-        src.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, mips - 1u, 0u, 6u};
+        src.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, mips - 1u, 0u, layers};
         src.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
         src.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
     }
@@ -1983,18 +1998,16 @@ void Renderer::record_environment_mips(VkCommandBuffer cmd, VkImage image,
     last.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     last.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     last.image = image;
-    last.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, mips - 1u, 1u, 0u, 6u};
+    last.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, mips - 1u, 1u, 0u, layers};
     last.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     last.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 
-    // dstStage couvre le FRAGMENT (la skybox échantillonne le mip 0) ET le COMPUTE : le
-    // préfiltrage GGX (étape 7) lit cette même chaîne juste après, dans le MÊME command
-    // buffer. Omettre COMPUTE_SHADER ici laisserait le préfiltrage lire des mips pas
+    // `dst_stage` est fourni par l'appelant : une texture n'est lue qu'au FRAGMENT, mais
+    // la cubemap d'environnement est aussi lue par le COMPUTE de préfiltrage, dans le
+    // MÊME command buffer. Omettre cet étage laisserait le préfiltrage lire des mips pas
     // encore blités — un bug qui ne se verrait pas forcément sur cette machine.
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
-                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                         0, 0, nullptr, 0, nullptr, count, finals.data());
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, dst_stage, 0, 0, nullptr, 0, nullptr,
+                         count, finals.data());
 }
 
 bool Renderer::create_environment_specular(Environment& env, std::uint32_t face_size) {
@@ -2286,7 +2299,10 @@ EnvironmentId Renderer::create_environment(std::uint32_t face_size, const void* 
                            &region);
 
     // 3) Chaîne de mips + transition finale vers SHADER_READ_ONLY (visible au compute).
-    record_environment_mips(t.cmd, env.image, face_size, env.mips);
+    // dst_stage inclut COMPUTE : le préfiltrage GGX lit cette chaîne juste après, dans
+    // le même command buffer (cf. record_environment_prefilter).
+    record_mip_chain(t.cmd, env.image, face_size, face_size, env.mips, 6u,
+                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
     // 4) Préfiltrage GGX, dans le MÊME command buffer : la famille de files du
     //    TransferManager est GRAPHICS|COMPUTE, donc les dispatches y sont légaux. Un seul

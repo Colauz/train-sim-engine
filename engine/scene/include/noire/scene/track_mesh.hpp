@@ -16,9 +16,19 @@ namespace noire::scene {
 // C'est la convention ferroviaire naturelle, et elle donne un sens physique à
 // `body_height` (hauteur de caisse au-dessus du rail). Avant le M9 la courbe était le
 // PIED du rail, ce qui enfonçait les roues de 7 cm dans le champignon.
+// Niveau de détail d'une tuile de voie (M9 optimisation). C'est le SEUL levier qui rende
+// tenable une ligne de 150 km : une tuile Full coûte ~40x une tuile Distant.
+enum class TrackLod {
+    Full,     // sous et autour du train : rails en I, traverses, ballast, pas fin
+    Distant,  // au loin : rails réduits à un bloc, AUCUNE traverse, pas grossier
+};
+
 struct RailProfile {
     double gauge = 1.435;      // écartement standard, mesuré entre faces internes
-    double sample_step = 1.0;  // pas d'échantillonnage le long de la voie (m)
+    double sample_step = 1.0;  // pas d'échantillonnage le long de la voie (m), LOD Full
+    // Pas du LOD Distant. À 2 km, 10 m de corde représentent un sous-pixel de flèche :
+    // la facettisation est invisible, et on divise le nombre de sections par 10.
+    double distant_sample_step = 10.0;
     // Période de répétition des UV (m) : 1 unité UV = uv_period mètres, dans les deux
     // sens. Les textures gardent donc une taille PHYSIQUE constante d'un élément à
     // l'autre — un ballast et une traverse ne peuvent pas avoir deux échelles de grain.
@@ -68,6 +78,7 @@ struct TrackMeshData {
 // aucune API GPU) => appelable depuis un worker du JobSystem.
 [[nodiscard]] TrackMeshData generate_track_mesh(const TrackSource& track, double x_start,
                                                 double x_end, const WorldPosition& origin,
-                                                const RailProfile& profile = {});
+                                                const RailProfile& profile = {},
+                                                TrackLod lod = TrackLod::Full);
 
 }  // namespace noire::scene
