@@ -10,6 +10,10 @@ layout(set = 0, binding = 0) uniform GlobalUBO {
     vec4 sunColor;          // rgb = couleur/intensité du soleil, a = intensité ambiante
     mat4 lightViewProj[2];  // une matrice par cascade d'ombre (kShadowCascades)
     vec4 cascadeSplits;     // x,y = fin de chaque cascade (distance en espace vue)
+    // Irradiance du ciel en harmoniques sphériques d'ordre 2 (M8 étape 6b). vec4 et
+    // NON vec3 : en std140 un tableau a un stride de 16 octets quoi qu'il arrive —
+    // déclarer vec3[9] désaligne tout silencieusement. Seul .rgb porte l'information.
+    vec4 sh[9];
 } u;
 
 // set = 0, binding 1 : les cascades d'ombre. sampler2DShadow => la comparaison de
@@ -21,6 +25,12 @@ layout(set = 0, binding = 1) uniform sampler2DShadow shadowMaps[2];
 layout(set = 1, binding = 0) uniform sampler2D baseColorMap;
 layout(set = 1, binding = 1) uniform sampler2D metallicRoughnessMap;
 layout(set = 1, binding = 2) uniform sampler2D normalMap;
+
+// set = 2 : la cubemap HDR d'environnement (M8 étape 6b). Sa CHAÎNE DE MIPS tient lieu
+// d'environnement préfiltré : plus la surface est rugueuse, plus on tape haut (flou).
+// Le soleil en a été retiré au chargement — il est porté par u.sunDirection/sunColor,
+// l'y laisser le compterait deux fois (une fois en spéculaire d'env, une fois en direct).
+layout(set = 2, binding = 0) uniform samplerCube envMap;
 
 // Miroir exact de TexturedPushConstants (renderer.cpp) : cf. mesh_textured.vert.
 layout(push_constant) uniform PushConstants {
@@ -46,9 +56,6 @@ const float kMinRoughness = 0.045;
 // et piège la lumière par réflexion interne, ce qui assombrit l'albédo.
 const float kWetRoughnessScale = 0.15;  // x0.15 : béton mat (0.9) -> quasi miroir (0.14)
 const float kWetAlbedoScale = 0.35;
-
-// Rebond du sol dans l'ambiante hémisphérique, relatif à la lumière du ciel.
-const float kGroundBounce = 0.30;
 
 // PCF 3x3 : 9 comparaisons espacées d'un texel, chacune déjà filtrée 2x2 par le
 // matériel => 6x6 effectif. `map` est un PARAMÈTRE : glslang inline la fonction,
@@ -124,11 +131,39 @@ vec3 fresnelSchlickRoughness(float cosTheta, vec3 F0, float roughness) {
     return F0 + (max(vec3(1.0 - roughness), F0) - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
 }
 
-// Ciel au-dessus, rebond du sol en dessous. Y est l'axe vertical du monde : `dir` vit
-// dans l'espace relatif caméra, qui n'est qu'une TRANSLATION du monde (pas de rotation)
-// — sa composante y est donc bien la verticale monde.
-vec3 hemisphere(vec3 dir, vec3 sky, vec3 ground) {
-    return mix(ground, sky, clamp(dir.y * 0.5 + 0.5, 0.0, 1.0));
+// Irradiance du ciel reconstruite depuis les SH9 (Ramamoorthi & Hanrahan 2001, eq. 13).
+// Rend l'IRRADIANCE E(n), pas une radiance : le diffus lambertien vaut albedo/PI * E.
+// Les coefficients ont été projetés au chargement sur le ciel PRIVÉ DE SON SOLEIL.
+vec3 shIrradiance(vec3 n) {
+    const float c1 = 0.429043;
+    const float c2 = 0.511664;
+    const float c3 = 0.743125;
+    const float c4 = 0.886227;
+    const float c5 = 0.247708;
+    vec3 L00 = u.sh[0].rgb;
+    vec3 L1m1 = u.sh[1].rgb;
+    vec3 L10 = u.sh[2].rgb;
+    vec3 L1p1 = u.sh[3].rgb;
+    vec3 L2m2 = u.sh[4].rgb;
+    vec3 L2m1 = u.sh[5].rgb;
+    vec3 L20 = u.sh[6].rgb;
+    vec3 L2p1 = u.sh[7].rgb;
+    vec3 L22 = u.sh[8].rgb;
+    return c1 * L22 * (n.x * n.x - n.y * n.y) + c3 * L20 * n.z * n.z + c4 * L00 - c5 * L20 +
+           2.0 * c1 * (L2m2 * n.x * n.y + L2p1 * n.x * n.z + L2m1 * n.y * n.z) +
+           2.0 * c2 * (L1p1 * n.x + L1m1 * n.y + L10 * n.z);
+}
+
+// Terme BRDF de l'environnement, approximation analytique de Lazarov (Call of Duty),
+// dans la variante compacte de Karis. Remplace la LUT 2D du split-sum par quelques ALU :
+// une texture et sa passe de génération en moins. Rend (A, B) tels que le spéculaire
+// intégré vaut F0 * A + B.
+vec2 envBRDFApprox(float NdotV, float roughness) {
+    const vec4 c0 = vec4(-1.0, -0.0275, -0.572, 0.022);
+    const vec4 c1 = vec4(1.0, 0.0425, 1.04, -0.04);
+    vec4 r = roughness * c0 + c1;
+    float a004 = min(r.x * r.x, exp2(-9.28 * NdotV)) * r.x + r.y;
+    return vec2(-1.04, 1.04) * a004 + r.zw;
 }
 
 // ACES filmique (approximation de Narkowicz) : ramène le HDR vers 0..1 en préservant
@@ -213,41 +248,51 @@ void main() {
     // L'ombre ne masque QUE le direct — l'ambiante est la lumière du ciel, elle traverse.
     vec3 direct = (kD * albedo / kPi + specular) * radiance * NdotL * shadow;
 
-    // --- Ambiante hémisphérique ---
-    // Le brouillard EST la couleur du ciel ; sunColor.a en porte l'intensité (l'app la
-    // monte sous la pluie : couvert = lumière diffuse). Pour un hémisphère uniforme de
-    // radiance L, l'irradiance vaut PI*L et le 1/PI du diffus l'annule : `skyLight`
-    // s'applique donc tel quel, ce qui préserve le calibrage d'avant l'étape 4.
-    vec3 skyLight = u.fogColorDensity.rgb * u.sunColor.a;
-    vec3 groundLight = skyLight * kGroundBounce;
+    // --- Ambiante : IBL (étape 6b) ---
+    // Le dernier mip utile de la chaîne. textureQueryLevels rend le NOMBRE de niveaux.
+    float envMips = float(textureQueryLevels(envMap) - 1);
+
+    // Diffus : irradiance du ciel en SH9. Les SH peuvent devenir légèrement négatives
+    // (ringing de la troncature à l'ordre 2) — un max() suffit, une irradiance négative
+    // n'a aucun sens physique et donnerait des pixels noirs.
+    vec3 irradiance = max(shIrradiance(N), vec3(0.0));
 
     vec3 Famb = fresnelSchlickRoughness(NdotV, F0, roughness);
     vec3 kDamb = (vec3(1.0) - Famb) * (1.0 - metallic);
+    // E est une IRRADIANCE : le 1/PI du lambert s'applique donc bel et bien ici
+    // (contrairement au direct, où il est annulé par la calibration de sunColor).
+    vec3 ambientDiffuse = kDamb * albedo * irradiance / kPi;
 
-    // Faute d'env map préfiltrée, l'hémisphère joue l'environnement : on l'échantillonne
-    // dans la direction miroir, ramenée vers N à mesure que la surface se dégrade — un
-    // flou de réflexion du pauvre. C'est ce qui empêche nos métaux d'être noirs à l'ombre.
+    // Spéculaire : la chaîne de mips EST l'environnement préfiltré. C'est ce qui rend
+    // enfin aux métaux et au verre un vrai monde à réfléchir, au lieu d'un aplat bleu.
+    // Le mapping rugosité -> lod est LINÉAIRE et heuristique : nos mips sont des filtres
+    // boîte, pas des lobes GGX préfiltrés (cf. l'étape 7 prévue).
     vec3 R = reflect(-V, N);
-    vec3 envSpec = hemisphere(normalize(mix(R, N, roughness)), skyLight, groundLight);
+    vec3 prefiltered = textureLod(envMap, R, roughness * envMips).rgb;
+    vec2 ab = envBRDFApprox(NdotV, roughness);
+    vec3 ambientSpecular = prefiltered * (F0 * ab.x + ab.y);
 
     // Pas de carte d'occlusion dans nos matériaux (notre convention glTF déclare le canal
-    // R de metallicRoughness inutilisé, on ne peut donc pas y lire une AO fiable).
-    // L'occlusion vient de l'hémisphère lui-même : une face tournée vers le sol ne voit
-    // que le rebond sombre, pas le ciel. C'est une AO directionnelle, gratuite et honnête.
-    vec3 ambient = kDamb * albedo * hemisphere(N, skyLight, groundLight) + Famb * envSpec;
+    // R de metallicRoughness inutilisé) : l'occlusion directionnelle vient des SH
+    // elles-mêmes, qui savent qu'une face tournée vers le sol voit moins de ciel.
+    vec3 ambient = ambientDiffuse + ambientSpecular;
 
-    // --- Sortie : HDR -> LDR ---
-    vec3 color = acesFilm(direct + ambient);
+    // --- Sortie ---
+    vec3 color = direct + ambient;
 
-    // Brouillard exponentiel, appliqué APRÈS le tone mapping : le fond est nettoyé avec
-    // fogColor BRUTE (renderer.cpp : background_color_ = fog_color_density), sans ACES.
-    // Mélanger avant ferait converger la géométrie lointaine vers acesFilm(fog) != fog,
-    // soit une couture nette à l'horizon, là où le sol s'arrête.
+    // Brouillard exponentiel, désormais AVANT le tone mapping. Ce que l'étape 4 ne
+    // pouvait pas faire : le fond était alors la couleur de brouillard BRUTE, non
+    // tonemappée, et mélanger en HDR aurait ouvert une couture à l'horizon. Maintenant
+    // que le fond est la skybox passée au MÊME ACES, le mélange linéaire est à la fois
+    // plus physique et sans raccord. Et la couleur du brouillard EST le ciel dans la
+    // direction du regard, lu à un mip flou : la géométrie lointaine se fond dans le ciel
+    // réellement derrière elle, plus clair vers le soleil.
     float dist = length(cameraRelPos);
     float fog = clamp(1.0 - exp(-u.fogColorDensity.a * dist), 0.0, 1.0);
-    color = mix(color, u.fogColorDensity.rgb, fog);
+    vec3 fogColor = textureLod(envMap, normalize(cameraRelPos), envMips * 0.5).rgb;
+    color = mix(color, fogColor, fog);
 
     // AUCUNE correction gamma manuelle : la swapchain est en VK_FORMAT_B8G8R8A8_SRGB
     // (swapchain.cpp), le matériel encode à l'écriture. Un pow(1/2.2) ici délaverait tout.
-    outColor = vec4(color, 1.0);
+    outColor = vec4(acesFilm(color), 1.0);
 }

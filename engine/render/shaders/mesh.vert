@@ -12,6 +12,10 @@ layout(set = 0, binding = 0) uniform GlobalUBO {
     vec4 sunColor;          // rgb = couleur/intensité du soleil, a = intensité ambiante
     mat4 lightViewProj[2];  // une matrice par cascade d'ombre (kShadowCascades)
     vec4 cascadeSplits;     // x,y = fin de chaque cascade (distance en espace vue)
+    // Irradiance du ciel en harmoniques sphériques d'ordre 2 (M8 étape 6b). vec4 et
+    // NON vec3 : en std140 un tableau a un stride de 16 octets quoi qu'il arrive —
+    // déclarer vec3[9] désaligne tout silencieusement. Seul .rgb porte l'information.
+    vec4 sh[9];
 } u;
 
 layout(push_constant) uniform PushConstants {

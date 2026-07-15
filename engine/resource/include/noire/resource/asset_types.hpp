@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <vector>
 
@@ -40,6 +41,16 @@ struct MaterialData {
 struct CubemapData {
     std::uint32_t size = 0;             // côté d'une face, en texels
     std::vector<std::uint16_t> texels;  // 6 * size * size * 4
+
+    // --- Éclairage extrait du ciel (M8 étape 6b) ---
+    // Le soleil est RETIRÉ des `texels` ci-dessus et republié ici : le laisser dans la
+    // cubemap ET l'éclairer en directionnel le compterait deux fois (une fois par la
+    // réflexion spéculaire de l'env, une fois par Cook-Torrance).
+    glm::vec3 sun_direction{0.0f, 1.0f, 0.0f};  // VERS le soleil (normalisée, monde)
+    glm::vec3 sun_color{0.0f};                  // = irradiance / PI (cf. FrameUniforms)
+    // Irradiance du ciel (soleil déjà retiré) en harmoniques sphériques d'ordre 2.
+    std::array<glm::vec3, 9> sh{};
+
     [[nodiscard]] bool valid() const {
         return size > 0 && texels.size() == static_cast<std::size_t>(size) * size * 6u * 4u;
     }

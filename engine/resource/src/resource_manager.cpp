@@ -291,6 +291,11 @@ void ResourceManager::pump_environments(int& budget) {
         }
         if (state == ResourceState::CpuReady && budget > 0) {
             slot.handle->id = renderer_.create_environment(slot.cpu.size, slot.cpu.texels.data());
+            // Le soleil et les SH sont publiés AVANT de libérer le CPU : ils sont
+            // minuscules et l'app en a besoin dès que le ciel est lié.
+            slot.handle->sun_direction = slot.cpu.sun_direction;
+            slot.handle->sun_color = slot.cpu.sun_color;
+            slot.handle->sh = slot.cpu.sh;
             slot.cpu = CubemapData{};  // ~48 Mio rendus au système dès le staging fait
             slot.state.store(ResourceState::Uploading, std::memory_order_relaxed);
             --budget;

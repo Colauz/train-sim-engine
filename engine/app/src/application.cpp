@@ -441,10 +441,10 @@ struct Application::Impl {
         render::FrameUniforms uniforms;
         uniforms.view = camera.view_matrix();
         uniforms.proj = camera.projection_matrix(aspect);
-        // Ciel : « plein jour franc » au sec (bleu lumineux), gris de pluie au mouillé.
-        // Ces valeurs sont LINÉAIRES (la swapchain est SRGB : le matériel encode).
-        // Cette couleur sert au fond, au brouillard ET de teinte à l'ambiante (c'est
-        // la lumière du ciel).
+        // Depuis le M8 étape 6b, la couleur de ciel n'est PLUS une valeur d'auteur : le
+        // brouillard échantillonne la skybox elle-même. .rgb ne sert donc plus qu'au
+        // nettoyage de fond (visible seulement tant que le ciel HDR n'est pas téléversé) ;
+        // seule la densité (.a) pilote encore le brouillard.
         const glm::vec3 fog_dry(0.28f, 0.45f, 0.78f);
         const glm::vec3 fog_wet(0.55f, 0.57f, 0.60f);
         const glm::vec3 fog_color = glm::mix(fog_dry, fog_wet, wetness);
@@ -452,18 +452,25 @@ struct Application::Impl {
         uniforms.fog_color_density = glm::vec4(fog_color, fog_density);
         uniforms.params = glm::vec4(wetness, 0.0f, 0.0f, 0.0f);
 
-        // Soleil : direction VERS l'astre. Une seule source de vérité — elle éclaire
-        // les modèles et cadre les cascades d'ombre. Plein jour franc, ~50° de hauteur :
-        // assez haut pour la lumière, assez bas pour que l'ombre s'étire visiblement.
-        // Volontairement LATÉRAL : dans l'axe de la caméra, l'ombre se cacherait sous
-        // la loco (soleil devant) ou derrière elle (soleil derrière).
+        // Soleil : direction VERS l'astre, source de vérité unique (elle éclaire les
+        // modèles ET cadre les cascades d'ombre). Depuis l'étape 6b elle est EXTRAITE du
+        // ciel HDR : c'est ce qui garantit que l'ombre portée pointe dans le sens du
+        // soleil qu'on voit réellement dans le ciel. Valeur en dur = secours tant que le
+        // HDR n'est pas chargé (~2,6 s au démarrage).
         uniforms.sun_direction = glm::vec4(glm::normalize(glm::vec3(-0.18f, 0.77f, 0.61f)), 0.0f);
-        // Franc et à peine chaud au sec ; la pluie l'écrase et fait monter l'ambiante
-        // (ciel couvert = lumière diffuse, ombres délavées).
-        const glm::vec3 sun_dry(1.05f, 1.00f, 0.92f);
-        const glm::vec3 sun_wet(0.35f, 0.36f, 0.38f);
-        uniforms.sun_color = glm::vec4(glm::mix(sun_dry, sun_wet, wetness),
-                                       glm::mix(0.40f, 0.75f, wetness));
+        glm::vec3 sun_rgb(1.05f, 1.00f, 0.92f);
+        if (sky && sky->ready) {
+            uniforms.sun_direction = glm::vec4(sky->sun_direction, 0.0f);
+            sun_rgb = sky->sun_color;
+            // Irradiance du ciel (soleil déjà retiré côté loader : le laisser dans les SH
+            // le compterait deux fois, une fois ici et une fois en directionnel).
+            for (std::size_t i = 0; i < uniforms.sh.size(); ++i) {
+                uniforms.sh[i] = glm::vec4(sky->sh[i], 0.0f);
+            }
+        }
+        // La pluie écrase le soleil (couvert). Le ciel, lui, reste celui du HDR : un vrai
+        // ciel de pluie demandera un second HDRI en fondu.
+        uniforms.sun_color = glm::vec4(sun_rgb * glm::mix(1.0f, 0.30f, wetness), 0.0f);
 
         std::vector<render::DrawItem> items;
 

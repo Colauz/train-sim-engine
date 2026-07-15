@@ -1,5 +1,7 @@
 #include "noire/render/renderer.hpp"
 
+#include <glm/gtc/packing.hpp>  // packHalf1x16 (cubemap de secours en R16G16B16A16_SFLOAT)
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -39,6 +41,10 @@ struct GpuFrameUniforms {
     glm::vec4 sun_color;
     glm::mat4 light_view_proj[kShadowCascades];
     glm::vec4 cascade_splits;  // x,y = distance de fin de chaque cascade
+    // Irradiance du ciel en SH9. vec4 et non vec3 : en std140 le stride d'un tableau est
+    // de 16 octets de toute façon, et vec3[9] désaligne silencieusement (même piège que
+    // cascade_splits, qui n'est pas un float[]). Seul .rgb porte l'information.
+    glm::vec4 sh[9];
 };
 static_assert(kShadowCascades <= 4, "cascade_splits (vec4) ne porte que 4 distances");
 
@@ -110,6 +116,13 @@ bool Renderer::initialize(const RendererCreateInfo& info) {
         return false;
     }
 
+    // Environnement (étapes 6a/6b) : le layout du set 2 DOIT exister avant le pipeline
+    // layout texturé, qui l'y référence. La cubemap elle-même arrive bien plus tard
+    // (chargement asynchrone) — seule sa forme est figée ici.
+    if (!create_env_sampler() || !create_env_descriptor_layout() || !create_env_descriptor_pool()) {
+        return false;
+    }
+
     // Textures / matériaux : sampler partagé, layout+pool du set 1 (3 textures PBR),
     // pipeline texturé, puis les secours 1x1 et le matériau par défaut.
     if (!create_sampler() || !create_material_descriptor_layout() ||
@@ -120,14 +133,11 @@ bool Renderer::initialize(const RendererCreateInfo& info) {
     if (pipeline_textured_ == VK_NULL_HANDLE) {
         return false;
     }
-    if (!create_default_textures() || !create_default_material()) {
+    if (!create_default_textures() || !create_default_material() || !create_default_environment()) {
         return false;
     }
 
-    // Environnement / skybox (étape 6a) : la cubemap elle-même arrive plus tard (chargement
-    // asynchrone), mais tout ce qui ne dépend pas de son contenu se crée dès maintenant.
-    if (!create_env_sampler() || !create_env_descriptor_layout() || !create_env_descriptor_pool() ||
-        !create_skybox_pipeline_layout() || !create_skybox_pipeline()) {
+    if (!create_skybox_pipeline_layout() || !create_skybox_pipeline()) {
         return false;
     }
 
@@ -1264,8 +1274,11 @@ bool Renderer::create_textured_pipeline_layout() {
     push_range.size = sizeof(TexturedPushConstants);
 
     // set 0 = UBO global + cascades (identique au pipeline debug => layouts compatibles
-    // pour le set 0) ; set 1 = les 3 textures du matériau.
-    std::array<VkDescriptorSetLayout, 2> sets{descriptor_set_layout_, material_set_layout_};
+    // pour le set 0) ; set 1 = les 3 textures du matériau ; set 2 = la cubemap d'env
+    // (M8 étape 6b), globale à la frame mais placée APRÈS le matériau pour ne pas
+    // renuméroter les sets existants.
+    std::array<VkDescriptorSetLayout, 3> sets{descriptor_set_layout_, material_set_layout_,
+                                              env_set_layout_};
 
     VkPipelineLayoutCreateInfo layout_info{};
     layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -2023,6 +2036,44 @@ bool Renderer::is_environment_ready(EnvironmentId id) const {
     return it != environments_.end() && it->second.ready;
 }
 
+bool Renderer::create_default_environment() {
+    // Cubemap 1x1 grise, dans le même esprit que les textures 1x1 par rôle : le set 2 du
+    // pipeline texturé doit être liable même sans ciel chargé. Sans elle, il faudrait
+    // sauter tous les draws texturés en l'absence de HDR.
+    // Valeur en half : 0.05 ~ un gris sombre neutre. Les SH restant à zéro dans ce cas,
+    // le rendu est volontairement terne — c'est un secours, pas un éclairage.
+    const std::uint16_t grey = glm::packHalf1x16(0.05f);
+    const std::uint16_t one = glm::packHalf1x16(1.0f);
+    std::array<std::uint16_t, 6u * 4u> faces{};
+    for (std::size_t i = 0; i < 6u; ++i) {
+        faces[i * 4u + 0] = grey;
+        faces[i * 4u + 1] = grey;
+        faces[i * 4u + 2] = grey;
+        faces[i * 4u + 3] = one;
+    }
+    default_environment_ = create_environment(1u, faces.data());
+    if (default_environment_ == 0) {
+        log::error("Renderer : création de la cubemap d'environnement de secours échouée");
+        return false;
+    }
+    return true;
+}
+
+VkDescriptorSet Renderer::resolve_environment_set() const {
+    // L'actif d'abord, le secours ensuite. `ready` est indispensable : lier une image
+    // encore en TRANSFER_DST déclencherait une erreur de layout au draw.
+    for (const EnvironmentId id : {active_environment_, default_environment_}) {
+        if (id == 0) {
+            continue;
+        }
+        const auto it = environments_.find(id);
+        if (it != environments_.end() && it->second.ready) {
+            return it->second.descriptor;
+        }
+    }
+    return VK_NULL_HANDLE;
+}
+
 void Renderer::destroy_environment_gpu(Environment& env) {
     if (env.descriptor != VK_NULL_HANDLE) {
         vkFreeDescriptorSets(context_.device(), env_pool_, 1, &env.descriptor);
@@ -2148,7 +2199,14 @@ void Renderer::record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
             push.base_color_factor = material.base_color_factor;
             push.pbr_factors = material.pbr_factors;
 
-            const std::array<VkDescriptorSet, 2> sets{frame_ubo, material.descriptor};
+            // set 2 = la cubemap d'environnement (IBL). Résolue à chaque item mais
+            // constante sur la frame ; sans elle (même pas le secours téléversé, ce qui
+            // ne dure qu'une frame ou deux au démarrage) on ne peut pas dessiner.
+            const VkDescriptorSet env_set = resolve_environment_set();
+            if (env_set == VK_NULL_HANDLE) {
+                continue;
+            }
+            const std::array<VkDescriptorSet, 3> sets{frame_ubo, material.descriptor, env_set};
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_textured_);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, textured_pipeline_layout_,
                                     0, static_cast<std::uint32_t>(sets.size()), sets.data(), 0,
@@ -2225,6 +2283,9 @@ void Renderer::draw_frame(const FrameUniforms& uniforms, const std::vector<DrawI
     gpu.params = uniforms.params;
     gpu.sun_direction = uniforms.sun_direction;
     gpu.sun_color = uniforms.sun_color;
+    for (std::size_t i = 0; i < uniforms.sh.size(); ++i) {
+        gpu.sh[i] = uniforms.sh[i];
+    }
     for (std::uint32_t i = 0; i < kShadowCascades; ++i) {
         gpu.light_view_proj[i] = shadow_cascades_[i].light_view_proj;
         gpu.cascade_splits[static_cast<glm::length_t>(i)] = shadow_cascades_[i].split_depth;

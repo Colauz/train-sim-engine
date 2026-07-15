@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -7,6 +8,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "noire/core/math.hpp"      // glm (soleil + SH de l'environnement)
 #include "noire/render/vertex.hpp"  // render::MeshId, render::TextureId
 
 namespace noire {
@@ -54,6 +56,11 @@ struct Model {
 struct Environment {
     render::EnvironmentId id = 0;
     bool ready = false;
+    // Éclairage extrait du ciel (M8 étape 6b), à recopier dans FrameUniforms par l'app :
+    // le soleil a été RETIRÉ de la cubemap et vit ici, les SH portent le ciel sans lui.
+    glm::vec3 sun_direction{0.0f, 1.0f, 0.0f};
+    glm::vec3 sun_color{0.0f};
+    std::array<glm::vec3, 9> sh{};
 };
 
 // Clip audio décodé (CPU) : PCM mono float32 48 kHz (cf. audio::decode_audio_file).

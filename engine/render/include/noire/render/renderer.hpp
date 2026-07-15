@@ -44,10 +44,17 @@ struct FrameUniforms {
     // xyz = direction VERS le soleil (normalisée, espace monde). Cadre les cascades
     // d'ombre ET éclaire les modèles : une seule source de vérité pour le soleil.
     glm::vec4 sun_direction{-0.4f, 0.8f, 0.3f, 0.0f};
-    // rgb = couleur/intensité du soleil (espace LINÉAIRE : la swapchain est SRGB,
-    // la conversion est faite par le matériel). a = intensité de l'ambiante ciel,
-    // dont la teinte est celle du brouillard (= couleur du ciel).
+    // rgb = couleur/intensité du soleil (espace LINÉAIRE : la swapchain est SRGB, la
+    // conversion est faite par le matériel). Calibré pour qu'une surface blanche
+    // lambertienne face au soleil lise ~1.0 => l'irradiance vaut PI * sun_color.
+    // Depuis le M8 étape 6b, l'app le renseigne depuis le soleil EXTRAIT du ciel HDR.
+    // .a n'est plus utilisé : l'ambiante vient désormais des SH.
     glm::vec4 sun_color{1.0f, 0.98f, 0.94f, 0.30f};
+    // Irradiance du ciel en harmoniques sphériques d'ordre 2 (M8 étape 6b), projetée au
+    // chargement depuis le HDR (soleil déjà retiré : il est porté par sun_direction /
+    // sun_color, l'y laisser le compterait deux fois). Seul .rgb porte l'information.
+    // Tout à zéro (défaut) = aucune ambiante image-based, ex. si le ciel est absent.
+    std::array<glm::vec4, 9> sh{};
 };
 
 // Description d'un matériau PBR metallic-roughness (convention glTF), fournie par
@@ -235,6 +242,12 @@ private:
     bool create_env_descriptor_pool();
     bool create_skybox_pipeline_layout();  // set0 (UBO) + set1 (cubemap), pas de push
     bool create_skybox_pipeline();
+    // Cubemap de secours 1x1 (même esprit que les textures 1x1 par rôle) : le set 2 du
+    // pipeline texturé doit TOUJOURS être liable, même si aucun ciel n'est chargé.
+    bool create_default_environment();
+    // Set d'environnement réellement liable : l'actif s'il est prêt, sinon le secours.
+    // VK_NULL_HANDLE tant que même le secours n'est pas téléversé (1 ou 2 frames).
+    [[nodiscard]] VkDescriptorSet resolve_environment_set() const;
     // Engendre la chaîne de mips par blits successifs et laisse l'image en
     // SHADER_READ_ONLY. Enregistré dans le command buffer d'un transfert.
     void record_environment_mips(VkCommandBuffer cmd, VkImage image, std::uint32_t face_size,
@@ -307,6 +320,7 @@ private:
     std::unordered_map<EnvironmentId, Environment> environments_;
     EnvironmentId next_environment_id_ = 1;
     EnvironmentId active_environment_ = 0;
+    EnvironmentId default_environment_ = 0;  // cubemap 1x1 de secours
     static constexpr std::uint32_t kMaxEnvironments = 4;
 
     // --- Ombres du soleil (M8 étape 1) ---------------------------------------
