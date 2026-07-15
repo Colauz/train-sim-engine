@@ -73,10 +73,17 @@ def make_foliage(size):
                     o = (y * size + x) * 4
                     # Teintes de vert : les folioles ne sont pas toutes identiques, sinon
                     # le feuillage se lit comme un aplat.
-                    g = int(96 * shade)
-                    px[o] = int(38 * shade)
-                    px[o + 1] = g
-                    px[o + 2] = int(30 * shade)
+                    #
+                    # ATTENTION AU PIÈGE sRGB : ces octets sont décodés en LINÉAIRE par le
+                    # matériau (base color = R8G8B8A8_SRGB), donc élevés à ~2.2. Le premier
+                    # jeu (38, 96, 30) donnait un albédo linéaire de (0.017, 0.115, 0.010) :
+                    # rouge et bleu quasi NULS, soit une feuille déjà presque noire AVANT
+                    # tout éclairage. Une vraie feuille renvoie ~(0.05, 0.24, 0.03).
+                    # Choisir une couleur « à l'oeil » dans l'espace sRGB trompe : 96/255
+                    # ressemble à un vert moyen, mais ne vaut que 0.115 en linéaire.
+                    px[o] = min(255, int(62 * shade))
+                    px[o + 1] = min(255, int(139 * shade))
+                    px[o + 2] = min(255, int(49 * shade))
                     px[o + 3] = 255  # OPAQUE : c'est ici que la feuille existe
 
     # Rameaux : ils partent du bas-centre (attache au tronc) et s'ouvrent en éventail.

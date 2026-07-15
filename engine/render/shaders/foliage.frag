@@ -41,12 +41,14 @@ void main() {
 
     vec3 N = shadingNormal(fragNormal, fragTangent, texture(normalMap, fragUV).rgb,
                            object.pbrFactors.z);
-    // Une carte de feuillage se voit des DEUX côtés : on retourne la normale vers la
-    // caméra, sinon la moitié des plans est noire — ils tournent le dos au ciel, et notre
-    // ambiante vient entièrement de l'IBL, qui lit N.
-    if (!gl_FrontFacing) {
-        N = -N;
-    }
+    // PAS de retournement selon gl_FrontFacing, contrairement à ce qu'on ferait pour une
+    // surface ordinaire. La normale de gen_tree.py n'est PAS perpendiculaire à la carte :
+    // elle est gonflée à 75 % vers le HAUT (c'est une normale de VOLUME, qui décrit un
+    // bouquet de folioles, pas un plan de carton). Aucune carte ne tourne donc le dos au
+    // ciel, et la retourner la faisait pointer vers le SOL : NdotL négatif et irradiance
+    // IBL prise sous terre => la moitié du feuillage rendait NOIR. C'était la vraie cause
+    // des arbres charbon, bien avant l'albédo.
 
-    outColor = vec4(shadeSurface(base.rgb, metallic, roughness, N, cameraRelPos), 1.0);
+    // foliage = 1 : active le diffus enveloppé et la transmission (cf. common/pbr.glsl).
+    outColor = vec4(shadeSurfaceEx(base.rgb, metallic, roughness, N, cameraRelPos, 1.0), 1.0);
 }

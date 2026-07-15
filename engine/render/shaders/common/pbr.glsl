@@ -164,9 +164,32 @@ vec3 shadingNormal(vec3 geoNormal, vec4 tangent4, vec3 mapSample, float normalSc
     return normalize(mat3(T, B, N) * n);
 }
 
+// --- Feuillage : une feuille n'est PAS un mur ------------------------------------
+// Une feuille fait quelques dixièmes de millimètre : la lumière la TRAVERSE, se diffuse
+// dedans et ressort de l'autre côté. Un Cook-Torrance pur, lui, ne connaît que la
+// réflexion : dès qu'une carte tourne le dos au soleil, NdotL tombe à 0 et elle vire au
+// NOIR. C'est exactement ce qu'on voyait — une forêt de silhouettes charbon à contre-jour.
+//
+// Deux corrections, toutes deux volontairement grossières (un vrai SSS coûterait bien plus
+// cher que ce que la lecture à distance exige) :
+//   * WRAP : le diffus ne s'éteint plus à l'horizon géométrique (NdotL = 0) mais au-delà.
+//     C'est l'aveu que la « surface » est en réalité un volume de folioles, dont certaines
+//     restent éclairées quand la carte moyenne ne l'est plus.
+//   * TRANSMISSION : quand on regarde VERS le soleil à travers la carte, la feuille
+//     s'allume par derrière. C'est ce qui donne le vert lumineux d'un sous-bois à
+//     contre-jour, et sans quoi une forêt éclairée de dos est une masse noire.
+const float kFoliageWrap = 0.55;      // 0 = lambert strict ; 1 = éclairé jusqu'au dos
+const float kFoliageTransScale = 0.9;   // force du rétroéclairage
+const float kFoliageTransPower = 3.0;   // largeur du lobe : petit = diffus, grand = étroit
+const float kFoliageTransDistort = 0.35;  // dévie L le long de N : brise l'aplat
+
 // Éclaire une surface entièrement résolue et rend la couleur FINALE (tonemappée).
 // `cameraRelPos` : position du fragment relative à la caméra (origine flottante).
-vec3 shadeSurface(vec3 albedo, float metallic, float roughness, vec3 N, vec3 cameraRelPos) {
+// `foliage` : 0 = surface opaque ordinaire, 1 = feuillage (wrap + transmission).
+// Paramétré plutôt que dupliqué : une copie du coeur d'éclairage finirait par diverger,
+// et l'herbe ne s'éclairerait plus comme la voie qui la traverse.
+vec3 shadeSurfaceEx(vec3 albedo, float metallic, float roughness, vec3 N, vec3 cameraRelPos,
+                    float foliage) {
     // --- Météo : le film d'eau agit sur le MATÉRIAU, avant tout éclairage ---
     float wetness = u.params.x;
     roughness = max(mix(roughness, roughness * kWetRoughnessScale, wetness), kMinRoughness);
@@ -201,7 +224,27 @@ vec3 shadeSurface(vec3 albedo, float metallic, float roughness, vec3 N, vec3 cam
     // ~1.0 : l'irradiance vaut donc PI * sunColor, et ce PI annule exactement le 1/PI du
     // diffus. L'ombre ne masque QUE le direct — le ciel, lui, traverse.
     vec3 radiance = u.sunColor.rgb * kPi;
-    vec3 direct = (kD * albedo / kPi + specular) * radiance * NdotL * shadow;
+
+    // Diffus ENVELOPPÉ pour le feuillage. Le spéculaire, lui, garde le NdotL géométrique :
+    // un reflet spéculaire vient bien de la surface, pas du volume.
+    // (NdotL + w) / (1 + w) : la face pleinement éclairée reste à 1.0, seule la face
+    // sombre remonte. La variante « énergie conservée » divise par (1+w)² — elle ramènerait
+    // la face éclairée à 0.65 et assombrirait l'arbre, exactement l'inverse du but.
+    float wrap = kFoliageWrap * foliage;
+    float diffuseNdotL = clamp((dot(N, L) + wrap) / (1.0 + wrap), 0.0, 1.0);
+    vec3 direct = (kD * albedo / kPi) * radiance * diffuseNdotL * shadow +
+                  specular * radiance * NdotL * shadow;
+
+    // Transmission : on regarde vers le soleil À TRAVERS la feuille. La distorsion dévie L
+    // le long de la normale pour que le lobe suive la courbure des cartes au lieu de
+    // s'allumer d'un bloc.
+    if (foliage > 0.0) {
+        vec3 transDir = normalize(-L + N * kFoliageTransDistort);
+        float trans = pow(clamp(dot(V, transDir), 0.0, 1.0), kFoliageTransPower);
+        // Teintée par l'albédo : la lumière traverse la feuille et en ressort VERTE, c'est
+        // toute la signature d'un feuillage à contre-jour.
+        direct += albedo * radiance * trans * kFoliageTransScale * foliage * shadow;
+    }
 
     // --- Ambiante : IBL ---
     float envMips = float(textureQueryLevels(envMap) - 1);
@@ -233,6 +276,11 @@ vec3 shadeSurface(vec3 albedo, float metallic, float roughness, vec3 N, vec3 cam
     // Aucune correction gamma manuelle : la swapchain est en VK_FORMAT_B8G8R8A8_SRGB, le
     // matériel encode à l'écriture.
     return acesFilm(color);
+}
+
+// Surface ordinaire : pas de feuillage.
+vec3 shadeSurface(vec3 albedo, float metallic, float roughness, vec3 N, vec3 cameraRelPos) {
+    return shadeSurfaceEx(albedo, metallic, roughness, N, cameraRelPos, 0.0);
 }
 
 #endif  // NOIRE_PBR_GLSL

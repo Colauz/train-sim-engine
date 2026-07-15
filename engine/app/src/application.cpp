@@ -74,7 +74,6 @@ std::vector<render::Vertex> make_box_vertices(const glm::vec3& base_color) {
 
 // Doit couvrir le plan lointain de la caméra (10 km depuis le M9) dans toutes les
 // directions, sinon le vide apparaît au-delà.
-constexpr float kGroundHalfExtent = 12000.0f;
 // Altitude ABSOLUE du plan de sol. Calée sous le point le plus BAS de la spline
 // (amplitude verticale 6 m) moins la profondeur du ballast : la voie est donc toujours
 // en remblai au-dessus du sol, jamais en tranchée — un simple quad ne saurait pas se
@@ -84,7 +83,6 @@ constexpr double kGroundLevel = -6.8;
 // Période de répétition de la texture, en mètres. C'est aussi le pas de recentrage du
 // sol, pour que les UV ne glissent pas sous le train. (Sa valeur était grande faute de
 // mipmaps ; le M9 les a activées, elle pourrait donc être réduite.)
-constexpr float kGroundUvPeriod = 20.0f;
 constexpr std::uint32_t kGroundTextureSize = 256;
 
 // Couleurs de la voie, portées par le base_color_factor de leur matériau (M8 étape 3).
@@ -133,23 +131,6 @@ struct ModelTransform {
 // c'est-à-dire sur le plan de roulement (vérifié : bbox acier y[-2.20, -1.15]). Un modèle
 // importé, lui, aura presque toujours besoin des trois champs.
 constexpr ModelTransform kLocoTransform{1.0f, 0.0f, 0.0f};
-
-void make_ground_plane(std::vector<render::MeshVertex>& vertices,
-                       std::vector<std::uint32_t>& indices) {
-    const float e = kGroundHalfExtent;
-    const float t = e / kGroundUvPeriod;
-    const glm::vec3 up{0.0f, 1.0f, 0.0f};
-    // u croît selon +x, v selon +z. La bitangente reconstruite par cross(N,T)*w doit
-    // donc pointer vers +z : cross(up, +x) = -z, d'où w = -1.
-    const glm::vec4 tangent{1.0f, 0.0f, 0.0f, -1.0f};
-    vertices = {
-        render::MeshVertex{{-e, 0.0f, -e}, up, {-t, -t}, tangent},
-        render::MeshVertex{{e, 0.0f, -e}, up, {t, -t}, tangent},
-        render::MeshVertex{{e, 0.0f, e}, up, {t, t}, tangent},
-        render::MeshVertex{{-e, 0.0f, e}, up, {-t, t}, tangent},
-    };
-    indices = {0, 1, 2, 2, 3, 0};
-}
 
 std::uint32_t hash_u32(std::uint32_t x) {
     x ^= x >> 16;
@@ -289,6 +270,7 @@ struct Application::Impl {
     long tree_snap_x = 0, tree_snap_z = 0;
     bool tree_snap_valid = false;
     double sim_time = 0.0;  // horloge du vent (s)
+    long present_index = 0;  // compte les présentations (banc de mesure, cf. NOIRE_CREEP)
     std::chrono::steady_clock::time_point perf_t0 = std::chrono::steady_clock::now();
     int perf_frames = 0;
     double perf_gpu_sum = 0.0;
@@ -297,7 +279,9 @@ struct Application::Impl {
     bool rumble_source_applied = false;
 
     // Sol : plan solide texturé (M8 étape 2), il reçoit l'ombre portée du train.
-    render::MeshId ground_mesh = 0;
+    // Secours du terrain tant que ses textures Poly Haven ne sont pas arrivées. Le
+    // MAILLAGE plat, lui, est mort avec le clipmap (M11 phase 1) : il était encore
+    // créé sur le GPU sans jamais être dessiné.
     render::TextureId ground_texture = 0;
     render::MaterialId ground_material = 0;
     // Voie : trois matériaux partagés par toutes les tuiles (M9). Sans texture pour
@@ -378,10 +362,6 @@ struct Application::Impl {
 
         // Sol : maillage indexé MeshVertex (pipeline texturé => il reçoit les ombres)
         // + sa texture générée à la volée. Les deux montent en GPU de façon asynchrone.
-        std::vector<render::MeshVertex> ground_vertices;
-        std::vector<std::uint32_t> ground_indices;
-        make_ground_plane(ground_vertices, ground_indices);
-        ground_mesh = renderer.create_mesh_indexed(ground_vertices, ground_indices);
         const std::vector<unsigned char> ground_pixels = make_ground_pixels(kGroundTextureSize);
         ground_texture =
             renderer.create_texture(kGroundTextureSize, kGroundTextureSize, ground_pixels.data());
@@ -501,7 +481,8 @@ struct Application::Impl {
         static const bool pinned = std::getenv("NOIRE_PIN_CAM") != nullptr;
         if (pinned) {
             orbit_yaw = 2.30f;
-            orbit_pitch = 0.32f;
+            const char* p = std::getenv("NOIRE_PITCH");
+            orbit_pitch = p != nullptr ? static_cast<float>(std::atof(p)) : 0.32f;
             orbit_distance = 38.0f;
             window.consume_cursor_delta();  // vidange, sinon elle s'accumule
             return;
@@ -515,6 +496,13 @@ struct Application::Impl {
     }
 
     void update_physics(double dt) {
+        // NOIRE_STILL : gèle la physique mais laisse courir l'horloge du vent. Avec
+        // NOIRE_CREEP et NOIRE_PIN_CAM, c'est le banc qui rend une mesure REPRODUCTIBLE.
+        static const bool still = std::getenv("NOIRE_STILL") != nullptr;
+        if (still) {
+            sim_time += dt;
+            return;
+        }
         wagon.update(dt);
 
         // --- Audio ferroviaire procédural (piloté par l'état physique) ---
@@ -606,6 +594,12 @@ struct Application::Impl {
     }
 
     void render_frame() {
+        // Compté ICI, tout en haut : render_frame présente AUSSI pendant l'écran de
+        // chargement, dont la durée varie d'un lancement à l'autre. Compter plus bas
+        // décalait le glissement d'un nombre variable de frames, et deux runs identiques
+        // cadraient des scènes différentes (mesuré : 7,3/255 d'écart sur le sol).
+        ++present_index;
+
         // M7 finalisé : signale une fois la locomotive entièrement chargée et téléversée
         // (cgltf async -> ResourceManager -> GPU), remplaçant les cubes de debug.
         // Le ciel n'est lié qu'une fois sa cubemap réellement sur le GPU : d'ici là le
@@ -759,7 +753,15 @@ struct Application::Impl {
         const WorldPosition target = wagon.body_position();
         const glm::vec3 dir(std::cos(orbit_yaw) * std::cos(orbit_pitch), std::sin(orbit_pitch),
                             std::sin(orbit_yaw) * std::cos(orbit_pitch));
-        const WorldPosition cam_world = target + WorldPosition(dir) * static_cast<double>(orbit_distance);
+        WorldPosition cam_world = target + WorldPosition(dir) * static_cast<double>(orbit_distance);
+        // NOIRE_CREEP : la caméra avance d'un pas fixe PAR PRÉSENTATION. Couplé à
+        // NOIRE_STILL, la scène à la frame N est rigoureusement la même d'un lancement à
+        // l'autre (vérifié : 0.0000/255 d'écart sur le sol). Sans ça, deux runs aux réglages
+        // IDENTIQUES donnaient 10,10 % et 19,43 % — le bruit dépassait le signal.
+        static const char* creep = std::getenv("NOIRE_CREEP");
+        if (creep != nullptr) {
+            cam_world.x += std::atof(creep) * static_cast<double>(present_index);
+        }
         camera.set_position(cam_world);
         camera.look_at(target);
 
