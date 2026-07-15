@@ -2,6 +2,7 @@
 
 #extension GL_GOOGLE_include_directive : require
 #include "common/pbr.glsl"
+#include "common/stochastic.glsl"
 
 // set = 1 : DEUX jeux PBR complets. C'est la seule raison d'être d'un pipeline terrain
 // distinct : le set 1 des matériaux ordinaires n'a que 3 bindings.
@@ -45,13 +46,10 @@ const float kEdgeScale = 0.30;    // ~ 3 m : dentelle des bords
 // n'est pas teintée : son sol EST blanc, c'est ce qui a donné son nom à la région.
 const vec3 kGrassTint = vec3(0.62, 1.12, 0.45);
 
-// Bruit de gradient 2D. Le hash est ENTIER (pas de sin()) : nos UV montent à ±2000, et
-// un hash à base de sin() y perd toute précision et se met à répéter.
+// Gradient d'une cellule, pour le bruit de transition. Réutilise le hash entier de
+// stochastic.glsl, recentré sur [-1, 1].
 vec2 hash2(vec2 p) {
-    uvec2 q = uvec2(ivec2(floor(p))) * uvec2(1597334673u, 3812015801u);
-    uint n = (q.x ^ q.y) * 1597334673u;
-    uvec2 r = uvec2(n, n * 1597334673u);
-    return vec2(r & uvec2(0x7fffffffu)) / float(0x7fffffff) * 2.0 - 1.0;
+    return hashCell(ivec2(floor(p))) * 2.0 - 1.0;
 }
 
 float gradientNoise(vec2 p) {
@@ -84,13 +82,19 @@ void main() {
     // smoothstep large : une transition franche trahirait immédiatement le procédé.
     float chalk = smoothstep(0.25, 0.75, mask);
 
-    // --- Les deux jeux PBR, mélangés ---------------------------------------------
-    vec3 gBase = texture(grassBase, uv).rgb;
-    vec3 gArm = texture(grassArm, uv).rgb;
-    vec3 gNor = texture(grassNormal, uv).rgb;
-    vec3 cBase = texture(chalkBase, uv).rgb;
-    vec3 cArm = texture(chalkArm, uv).rgb;
-    vec3 cNor = texture(chalkNormal, uv).rgb;
+    // --- Les deux jeux PBR, en TUILAGE STOCHASTIQUE, puis mélangés -----------------
+    // 3 taps x 3 cartes x 2 couches = 18 lectures au pire. On saute donc la couche dont
+    // le poids est nul — branche spatialement COHÉRENTE (le masque varie lentement), et
+    // légale parce que stochasticSurface() utilise textureGrad : ses dérivées sont
+    // explicites, là où un texture() en flot non uniforme serait indéfini.
+    vec3 gBase = vec3(0.0), gArm = vec3(0.5), gNor = vec3(0.5, 0.5, 1.0);
+    vec3 cBase = vec3(0.0), cArm = vec3(0.5), cNor = vec3(0.5, 0.5, 1.0);
+    if (chalk < 0.999) {
+        stochasticSurface(grassBase, grassArm, grassNormal, uv, gBase, gArm, gNor);
+    }
+    if (chalk > 0.001) {
+        stochasticSurface(chalkBase, chalkArm, chalkNormal, uv, cBase, cArm, cNor);
+    }
 
     vec3 albedo = mix(gBase * kGrassTint, cBase, chalk);
     // La RUGOSITÉ est interpolée elle aussi : c'est ce qui fait que le soleil accroche
