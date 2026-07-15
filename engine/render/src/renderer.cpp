@@ -16,6 +16,7 @@
 #include "shaders/mesh.vert.spv.h"
 #include "shaders/mesh_textured.frag.spv.h"
 #include "shaders/mesh_textured.vert.spv.h"
+#include "shaders/prefilter_env.comp.spv.h"
 #include "shaders/shadow.vert.spv.h"
 #include "shaders/skybox.frag.spv.h"
 #include "shaders/skybox.vert.spv.h"
@@ -32,6 +33,14 @@ VkPrimitiveTopology to_vk_topology(Topology topology) {
 // de FrameUniforms — le Renderer y ajoute ce qu'il calcule lui-même (le cadrage des
 // cascades d'ombre). Uniquement des vec4/mat4 => alignements std140 naturels, aucun
 // padding manuel. Toute évolution doit être répercutée dans les 4 shaders.
+// Miroir exact du bloc push du prefilter_env.comp.
+struct PrefilterPush {
+    float roughness;
+    float src_resolution;
+    std::uint32_t sample_count;
+    std::uint32_t dst_size;
+};
+
 struct GpuFrameUniforms {
     glm::mat4 view;
     glm::mat4 proj;
@@ -119,7 +128,8 @@ bool Renderer::initialize(const RendererCreateInfo& info) {
     // Environnement (étapes 6a/6b) : le layout du set 2 DOIT exister avant le pipeline
     // layout texturé, qui l'y référence. La cubemap elle-même arrive bien plus tard
     // (chargement asynchrone) — seule sa forme est figée ici.
-    if (!create_env_sampler() || !create_env_descriptor_layout() || !create_env_descriptor_pool()) {
+    if (!create_env_sampler() || !create_env_descriptor_layout() || !create_env_descriptor_pool() ||
+        !create_prefilter_descriptor_layout() || !create_prefilter_pipeline()) {
         return false;
     }
 
@@ -1714,18 +1724,88 @@ bool Renderer::create_env_descriptor_layout() {
 }
 
 bool Renderer::create_env_descriptor_pool() {
-    VkDescriptorPoolSize size{};
-    size.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    size.descriptorCount = kMaxEnvironments;
+    // Par environnement : 1 set skybox (cube source) + 1 set spéculaire (cube préfiltré)
+    // + kSpecularMips sets de compute (source + 1 mip destination chacun).
+    const std::uint32_t sets_per_env = 2u + kSpecularMips;
+    std::array<VkDescriptorPoolSize, 2> sizes{};
+    sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    // 2 cubes échantillonnés + 1 source par set de compute.
+    sizes[0].descriptorCount = kMaxEnvironments * (2u + kSpecularMips);
+    sizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;  // 1 mip destination par set compute
+    sizes[1].descriptorCount = kMaxEnvironments * kSpecularMips;
 
     VkDescriptorPoolCreateInfo info{};
     info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    info.maxSets = kMaxEnvironments;
-    info.poolSizeCount = 1;
-    info.pPoolSizes = &size;
+    info.maxSets = kMaxEnvironments * sets_per_env;
+    info.poolSizeCount = static_cast<std::uint32_t>(sizes.size());
+    info.pPoolSizes = sizes.data();
     if (vkCreateDescriptorPool(context_.device(), &info, nullptr, &env_pool_) != VK_SUCCESS) {
         log::error("Renderer : création du pool de descripteurs d'environnement échouée");
+        return false;
+    }
+    return true;
+}
+
+bool Renderer::create_prefilter_descriptor_layout() {
+    std::array<VkDescriptorSetLayoutBinding, 2> bindings{};
+    bindings[0].binding = 0;  // cubemap source (le ciel net + sa chaîne de mips)
+    bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[0].descriptorCount = 1;
+    bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    bindings[1].binding = 1;  // LE mip destination, vu en 2D_ARRAY
+    bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    bindings[1].descriptorCount = 1;
+    bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    VkDescriptorSetLayoutCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    info.bindingCount = static_cast<std::uint32_t>(bindings.size());
+    info.pBindings = bindings.data();
+    if (vkCreateDescriptorSetLayout(context_.device(), &info, nullptr, &prefilter_set_layout_) !=
+        VK_SUCCESS) {
+        log::error("Renderer : création du layout de set du préfiltrage échouée");
+        return false;
+    }
+    return true;
+}
+
+bool Renderer::create_prefilter_pipeline() {
+    VkPushConstantRange push{};
+    push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    push.offset = 0;
+    push.size = sizeof(PrefilterPush);
+
+    VkPipelineLayoutCreateInfo layout_info{};
+    layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    layout_info.setLayoutCount = 1;
+    layout_info.pSetLayouts = &prefilter_set_layout_;
+    layout_info.pushConstantRangeCount = 1;
+    layout_info.pPushConstantRanges = &push;
+    if (vkCreatePipelineLayout(context_.device(), &layout_info, nullptr,
+                               &prefilter_pipeline_layout_) != VK_SUCCESS) {
+        log::error("Renderer : création du pipeline layout du préfiltrage échouée");
+        return false;
+    }
+
+    VkShaderModule module = create_shader_module(prefilter_env_comp_spv, prefilter_env_comp_spv_size);
+    if (module == VK_NULL_HANDLE) {
+        return false;
+    }
+
+    VkComputePipelineCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    info.stage.module = module;
+    info.stage.pName = "main";
+    info.layout = prefilter_pipeline_layout_;
+
+    const VkResult res = vkCreateComputePipelines(context_.device(), VK_NULL_HANDLE, 1, &info,
+                                                  nullptr, &prefilter_pipeline_);
+    vkDestroyShaderModule(context_.device(), module, nullptr);
+    if (res != VK_SUCCESS) {
+        log::error("Renderer : création du pipeline compute de préfiltrage échouée");
         return false;
     }
     return true;
@@ -1907,8 +1987,194 @@ void Renderer::record_environment_mips(VkCommandBuffer cmd, VkImage image,
     last.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     last.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+    // dstStage couvre le FRAGMENT (la skybox échantillonne le mip 0) ET le COMPUTE : le
+    // préfiltrage GGX (étape 7) lit cette même chaîne juste après, dans le MÊME command
+    // buffer. Omettre COMPUTE_SHADER ici laisserait le préfiltrage lire des mips pas
+    // encore blités — un bug qui ne se verrait pas forcément sur cette machine.
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          0, 0, nullptr, 0, nullptr, count, finals.data());
+}
+
+bool Renderer::create_environment_specular(Environment& env, std::uint32_t face_size) {
+    // Jamais plus grand que la source : pour la cubemap 1x1 de secours, spec_ fait 1x1.
+    const std::uint32_t size = std::min(kSpecularFaceSize, face_size);
+    const auto max_mips =
+        static_cast<std::uint32_t>(std::floor(std::log2(static_cast<float>(size)))) + 1u;
+    env.spec_mips = std::min(kSpecularMips, max_mips);
+
+    const VkFormat format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    // STORAGE pour l'écriture par le compute, SAMPLED pour la lecture par le PBR.
+    // Pas de TRANSFER : rien ne se copie ici, tout est écrit par les dispatches.
+    if (!context_.create_image(size, size, format,
+                               VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                               env.spec_image, env.spec_allocation, env.spec_mips, 6u,
+                               VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT)) {
+        log::error("Renderer : création de l'image spéculaire préfiltrée échouée");
+        return false;
+    }
+
+    // Vue d'ÉCHANTILLONNAGE : cube, toute la chaîne (c'est elle que lit mesh_textured.frag).
+    VkImageViewCreateInfo cube{};
+    cube.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    cube.image = env.spec_image;
+    cube.viewType = VK_IMAGE_VIEW_TYPE_CUBE;
+    cube.format = format;
+    cube.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, env.spec_mips, 0u, 6u};
+    if (vkCreateImageView(context_.device(), &cube, nullptr, &env.spec_view) != VK_SUCCESS) {
+        log::error("Renderer : création de la vue cube spéculaire échouée");
+        return false;
+    }
+
+    // Vues d'ÉCRITURE : une par mip, en 2D_ARRAY (6 layers).
+    env.spec_mip_views.resize(env.spec_mips, VK_NULL_HANDLE);
+    for (std::uint32_t i = 0; i < env.spec_mips; ++i) {
+        VkImageViewCreateInfo mip{};
+        mip.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        mip.image = env.spec_image;
+        mip.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+        mip.format = format;
+        mip.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, i, 1u, 0u, 6u};
+        if (vkCreateImageView(context_.device(), &mip, nullptr, &env.spec_mip_views[i]) !=
+            VK_SUCCESS) {
+            log::error("Renderer : création de la vue de mip spéculaire {} échouée", i);
+            return false;
+        }
+    }
+
+    // Set d'échantillonnage (set 2 du pipeline texturé) : même forme que celui de la
+    // skybox, donc même layout réutilisé.
+    VkDescriptorSetAllocateInfo alloc{};
+    alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    alloc.descriptorPool = env_pool_;
+    alloc.descriptorSetCount = 1;
+    alloc.pSetLayouts = &env_set_layout_;
+    if (vkAllocateDescriptorSets(context_.device(), &alloc, &env.spec_descriptor) != VK_SUCCESS) {
+        log::error("Renderer : allocation du set spéculaire échouée");
+        return false;
+    }
+    VkDescriptorImageInfo spec_info{};
+    spec_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    spec_info.imageView = env.spec_view;
+    spec_info.sampler = env_sampler_;
+    VkWriteDescriptorSet spec_write{};
+    spec_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    spec_write.dstSet = env.spec_descriptor;
+    spec_write.dstBinding = 0;
+    spec_write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    spec_write.descriptorCount = 1;
+    spec_write.pImageInfo = &spec_info;
+    vkUpdateDescriptorSets(context_.device(), 1, &spec_write, 0, nullptr);
+
+    // Un set de compute par mip : source (cube du ciel) + destination (ce mip).
+    env.prefilter_sets.resize(env.spec_mips, VK_NULL_HANDLE);
+    const std::vector<VkDescriptorSetLayout> layouts(env.spec_mips, prefilter_set_layout_);
+    VkDescriptorSetAllocateInfo comp_alloc{};
+    comp_alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    comp_alloc.descriptorPool = env_pool_;
+    comp_alloc.descriptorSetCount = env.spec_mips;
+    comp_alloc.pSetLayouts = layouts.data();
+    if (vkAllocateDescriptorSets(context_.device(), &comp_alloc, env.prefilter_sets.data()) !=
+        VK_SUCCESS) {
+        log::error("Renderer : allocation des sets de préfiltrage échouée");
+        return false;
+    }
+    for (std::uint32_t i = 0; i < env.spec_mips; ++i) {
+        VkDescriptorImageInfo src{};
+        // La source sera en SHADER_READ_ONLY au moment du dispatch (la barrière finale
+        // des blits l'y amène) — c'est à l'ACCÈS que le layout doit être exact.
+        src.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        src.imageView = env.view;
+        src.sampler = env_sampler_;
+        VkDescriptorImageInfo dst{};
+        dst.imageLayout = VK_IMAGE_LAYOUT_GENERAL;  // obligatoire pour une storage image
+        dst.imageView = env.spec_mip_views[i];
+
+        std::array<VkWriteDescriptorSet, 2> writes{};
+        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[0].dstSet = env.prefilter_sets[i];
+        writes[0].dstBinding = 0;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[0].descriptorCount = 1;
+        writes[0].pImageInfo = &src;
+        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[1].dstSet = env.prefilter_sets[i];
+        writes[1].dstBinding = 1;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes[1].descriptorCount = 1;
+        writes[1].pImageInfo = &dst;
+        vkUpdateDescriptorSets(context_.device(), static_cast<std::uint32_t>(writes.size()),
+                               writes.data(), 0, nullptr);
+    }
+    return true;
+}
+
+void Renderer::record_environment_prefilter(VkCommandBuffer cmd, const Environment& env,
+                                            std::uint32_t face_size) {
+    const std::uint32_t size = std::min(kSpecularFaceSize, face_size);
+
+    // 1) spec_ : UNDEFINED -> GENERAL (tous mips, 6 layers). GENERAL est le seul layout
+    //    admis pour une storage image écrite en compute.
+    VkImageMemoryBarrier to_general{};
+    to_general.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    to_general.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    to_general.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    to_general.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_general.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_general.image = env.spec_image;
+    to_general.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, env.spec_mips, 0u, 6u};
+    to_general.srcAccessMask = 0;
+    to_general.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                         &to_general);
+
+    // 2) Un dispatch par mip. AUCUNE barrière entre eux : chacun écrit une sous-ressource
+    //    différente et ne lit que la source. Ils sont indépendants, le GPU peut les
+    //    recouvrir librement.
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, prefilter_pipeline_);
+    for (std::uint32_t i = 0; i < env.spec_mips; ++i) {
+        const std::uint32_t mip_size = std::max(size >> i, 1u);
+
+        PrefilterPush push{};
+        // Chaque mip EST un niveau de rugosité : 0, 1/6, ... 1. C'est ce qui rend le
+        // mapping rugosité -> lod exact côté PBR.
+        push.roughness = env.spec_mips > 1 ? static_cast<float>(i) /
+                                                 static_cast<float>(env.spec_mips - 1u)
+                                           : 0.0f;
+        push.src_resolution = static_cast<float>(face_size);
+        // Le mip 0 (rugosité 0) sort au premier textureLod : son sampleCount est ignoré.
+        // Les mips fins portent la plupart des texels, les grossiers ont besoin de plus
+        // de samples pour couvrir un lobe large.
+        push.sample_count = i <= 1u ? 64u : 128u;
+        push.dst_size = mip_size;
+
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, prefilter_pipeline_layout_, 0,
+                                1, &env.prefilter_sets[i], 0, nullptr);
+        vkCmdPushConstants(cmd, prefilter_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                           sizeof(push), &push);
+        // Division ARRONDIE AU SUPÉRIEUR : sinon les mips < 8 (taille 4, 2, 1) donneraient
+        // zéro groupe et ne seraient jamais écrits. Le shader borne en retour.
+        const std::uint32_t groups = (mip_size + 7u) / 8u;
+        vkCmdDispatch(cmd, groups, groups, 6u);
+    }
+
+    // 3) spec_ : GENERAL -> SHADER_READ_ONLY. C'est CETTE barrière qui garantit que les
+    //    écritures du compute sont visibles au fragment shader du PBR.
+    VkImageMemoryBarrier to_read{};
+    to_read.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    to_read.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    to_read.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_read.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_read.image = env.spec_image;
+    to_read.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, env.spec_mips, 0u, 6u};
+    to_read.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    to_read.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                         &to_read);
 }
 
 EnvironmentId Renderer::create_environment(std::uint32_t face_size, const void* faces_rgba16f) {
@@ -1972,6 +2238,13 @@ EnvironmentId Renderer::create_environment(std::uint32_t face_size, const void* 
     write.pImageInfo = &image_info;
     vkUpdateDescriptorSets(context_.device(), 1, &write, 0, nullptr);
 
+    // Spéculaire préfiltré (étape 7) : image + vues + sets. Alloué AVANT le transfert,
+    // car ses dispatches vivent dans le même command buffer.
+    if (!create_environment_specular(env, face_size)) {
+        destroy_environment_gpu(env);
+        return 0;
+    }
+
     // 6 faces contiguës, RGBA half => 8 octets par texel.
     const VkDeviceSize size =
         static_cast<VkDeviceSize>(face_size) * face_size * 6u * 4u * sizeof(std::uint16_t);
@@ -2012,8 +2285,14 @@ EnvironmentId Renderer::create_environment(std::uint32_t face_size, const void* 
     vkCmdCopyBufferToImage(t.cmd, staging.buffer, env.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
                            &region);
 
-    // 3) Chaîne de mips + transition finale vers SHADER_READ_ONLY.
+    // 3) Chaîne de mips + transition finale vers SHADER_READ_ONLY (visible au compute).
     record_environment_mips(t.cmd, env.image, face_size, env.mips);
+
+    // 4) Préfiltrage GGX, dans le MÊME command buffer : la famille de files du
+    //    TransferManager est GRAPHICS|COMPUTE, donc les dispatches y sont légaux. Un seul
+    //    submit, une seule fence — l'asynchronisme est celui, déjà éprouvé, des uploads,
+    //    et le `ready` existant interdit tout usage avant la fin du préfiltrage.
+    record_environment_prefilter(t.cmd, env, face_size);
 
     transfer_.stage(t, staging);
     transfer_.on_complete(t, [this, id] {
@@ -2060,27 +2339,59 @@ bool Renderer::create_default_environment() {
 }
 
 VkDescriptorSet Renderer::resolve_environment_set() const {
-    // L'actif d'abord, le secours ensuite. `ready` est indispensable : lier une image
-    // encore en TRANSFER_DST déclencherait une erreur de layout au draw.
+    // Rend le set SPÉCULAIRE (préfiltré GGX) : c'est lui que lit mesh_textured.frag, pas
+    // le ciel brut. L'actif d'abord, le secours ensuite. `ready` est indispensable : lier
+    // une image encore en GENERAL déclencherait une erreur de layout au draw.
     for (const EnvironmentId id : {active_environment_, default_environment_}) {
         if (id == 0) {
             continue;
         }
         const auto it = environments_.find(id);
         if (it != environments_.end() && it->second.ready) {
-            return it->second.descriptor;
+            return it->second.spec_descriptor;
         }
     }
     return VK_NULL_HANDLE;
 }
 
 void Renderer::destroy_environment_gpu(Environment& env) {
-    if (env.descriptor != VK_NULL_HANDLE) {
-        vkFreeDescriptorSets(context_.device(), env_pool_, 1, &env.descriptor);
-        env.descriptor = VK_NULL_HANDLE;
+    VkDevice dev = context_.device();
+    // Sets : seulement si le pool existe encore (au shutdown il part en premier et
+    // emporte tous ses sets, cf. la boucle de shutdown qui les met à VK_NULL_HANDLE).
+    if (env_pool_ != VK_NULL_HANDLE) {
+        if (env.descriptor != VK_NULL_HANDLE) {
+            vkFreeDescriptorSets(dev, env_pool_, 1, &env.descriptor);
+        }
+        if (env.spec_descriptor != VK_NULL_HANDLE) {
+            vkFreeDescriptorSets(dev, env_pool_, 1, &env.spec_descriptor);
+        }
+        if (!env.prefilter_sets.empty()) {
+            vkFreeDescriptorSets(dev, env_pool_,
+                                 static_cast<std::uint32_t>(env.prefilter_sets.size()),
+                                 env.prefilter_sets.data());
+        }
+    }
+    env.descriptor = VK_NULL_HANDLE;
+    env.spec_descriptor = VK_NULL_HANDLE;
+    env.prefilter_sets.clear();
+
+    for (VkImageView view : env.spec_mip_views) {
+        if (view != VK_NULL_HANDLE) {
+            vkDestroyImageView(dev, view, nullptr);
+        }
+    }
+    env.spec_mip_views.clear();
+    if (env.spec_view != VK_NULL_HANDLE) {
+        vkDestroyImageView(dev, env.spec_view, nullptr);
+        env.spec_view = VK_NULL_HANDLE;
+    }
+    if (env.spec_image != VK_NULL_HANDLE) {
+        context_.destroy_image(env.spec_image, env.spec_allocation);
+        env.spec_image = VK_NULL_HANDLE;
+        env.spec_allocation = nullptr;
     }
     if (env.view != VK_NULL_HANDLE) {
-        vkDestroyImageView(context_.device(), env.view, nullptr);
+        vkDestroyImageView(dev, env.view, nullptr);
         env.view = VK_NULL_HANDLE;
     }
     if (env.image != VK_NULL_HANDLE) {
@@ -2422,12 +2733,30 @@ void Renderer::shutdown() {
 
     // Environnement / skybox (étape 6a). Les sets partent avec le pool : on ne libère
     // ici que vues + images (destroy_environment_gpu les remettrait au pool inutilement).
+    // Le pool emporte tous ses sets : on le met à zéro le temps de la boucle pour que
+    // destroy_environment_gpu ne cherche pas à les rendre un par un, mais on garde son
+    // handle pour le détruire réellement plus bas.
+    VkDescriptorPool env_pool_pending = env_pool_;
+    env_pool_ = VK_NULL_HANDLE;
     for (auto& [id, env] : environments_) {
-        env.descriptor = VK_NULL_HANDLE;  // rendu par la destruction du pool ci-dessous
         destroy_environment_gpu(env);
     }
+    env_pool_ = env_pool_pending;
     environments_.clear();
     active_environment_ = 0;
+    default_environment_ = 0;
+    if (prefilter_pipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(dev, prefilter_pipeline_, nullptr);
+        prefilter_pipeline_ = VK_NULL_HANDLE;
+    }
+    if (prefilter_pipeline_layout_ != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(dev, prefilter_pipeline_layout_, nullptr);
+        prefilter_pipeline_layout_ = VK_NULL_HANDLE;
+    }
+    if (prefilter_set_layout_ != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(dev, prefilter_set_layout_, nullptr);
+        prefilter_set_layout_ = VK_NULL_HANDLE;
+    }
     if (skybox_pipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(dev, skybox_pipeline_, nullptr);
         skybox_pipeline_ = VK_NULL_HANDLE;

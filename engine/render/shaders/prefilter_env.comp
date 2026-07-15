@@ -1,0 +1,138 @@
+#version 450
+
+// Préfiltrage GGX de l'environnement (M8 étape 7) — le « split-sum » de Karis.
+// Un dispatch par mip de destination : chaque mip EST un niveau de rugosité, ce qui rend
+// le mapping rugosité -> lod exact côté PBR (au lieu de l'heuristique des mips boîte).
+//
+// z = la face de cubemap (6 dispatches en profondeur). local_size_z = 1 : les faces ne
+// partagent rien, les regrouper n'apporterait aucune localité.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// Source = la cubemap du ciel AVEC sa chaîne de mips (blits de l'étape 6a). Ces mips ne
+// sont pas décoratifs : le biais de mip de Karis (plus bas) en dépend entièrement.
+layout(set = 0, binding = 0) uniform samplerCube srcEnv;
+
+// Destination = UN mip, vu en 2D_ARRAY (6 layers). On écrit en 2D_ARRAY et on lit en
+// CUBE : c'est le pattern portable, les vues cube en storage sont mal supportées.
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2DArray dstMip;
+
+layout(push_constant) uniform Push {
+    float roughness;      // rugosité de CE mip
+    float srcResolution;  // côté d'une face du mip 0 source (biais de mip)
+    uint sampleCount;
+    uint dstSize;         // côté d'une face de CE mip
+} pc;
+
+const float kPi = 3.14159265359;
+
+// Direction d'un texel de face. MÊME table que le loader CPU (hdr_loader.cpp) et que la
+// spec Vulkan : toute divergence ferait tourner l'environnement entre les deux.
+vec3 faceDirection(uint face, float sc, float tc) {
+    switch (face) {
+        case 0u: return vec3(1.0, -tc, -sc);
+        case 1u: return vec3(-1.0, -tc, sc);
+        case 2u: return vec3(sc, 1.0, tc);
+        case 3u: return vec3(sc, -1.0, -tc);
+        case 4u: return vec3(sc, -tc, 1.0);
+        default: return vec3(-sc, -tc, -1.0);
+    }
+}
+
+// Van der Corput : inversion binaire, base 2.
+float radicalInverseVdC(uint bits) {
+    bits = (bits << 16u) | (bits >> 16u);
+    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+    bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+    bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+    return float(bits) * 2.3283064365386963e-10;
+}
+
+// Suite de Hammersley : quasi-aléatoire à faible discrépance. Bien plus régulière qu'un
+// vrai aléatoire à nombre de samples égal — c'est ce qui permet de tenir en 64 samples.
+vec2 hammersley(uint i, uint n) {
+    return vec2(float(i) / float(n), radicalInverseVdC(i));
+}
+
+// Tire un demi-vecteur H selon la distribution GGX plutôt qu'uniformément sur
+// l'hémisphère : on concentre les samples là où le lobe a réellement de l'énergie.
+vec3 importanceSampleGGX(vec2 Xi, vec3 N, float roughness) {
+    float a = roughness * roughness;
+    float phi = 2.0 * kPi * Xi.x;
+    float cosTheta = sqrt((1.0 - Xi.y) / (1.0 + (a * a - 1.0) * Xi.y));
+    float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+    vec3 H = vec3(sinTheta * cos(phi), sinTheta * sin(phi), cosTheta);
+
+    // Repère tangent -> monde. Le choix de `up` évite la dégénérescence quand N est
+    // colinéaire à l'axe de référence.
+    vec3 up = abs(N.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+    vec3 tangent = normalize(cross(up, N));
+    vec3 bitangent = cross(N, tangent);
+    return normalize(tangent * H.x + bitangent * H.y + N * H.z);
+}
+
+float distributionGGX(float NdotH, float roughness) {
+    float a = roughness * roughness;
+    float a2 = a * a;
+    float d = NdotH * NdotH * (a2 - 1.0) + 1.0;
+    return a2 / (kPi * d * d);
+}
+
+void main() {
+    uvec3 id = gl_GlobalInvocationID;
+    // Le dispatch arrondit au groupe supérieur : les invocations en trop sortent ici.
+    if (id.x >= pc.dstSize || id.y >= pc.dstSize) {
+        return;
+    }
+
+    float sc = (float(id.x) + 0.5) / float(pc.dstSize) * 2.0 - 1.0;
+    float tc = (float(id.y) + 0.5) / float(pc.dstSize) * 2.0 - 1.0;
+    vec3 N = normalize(faceDirection(id.z, sc, tc));
+
+    // Rugosité 0 = miroir : l'intégrale se réduit à la valeur dans la direction N. C'est
+    // le mip le plus GROS (donc le plus cher s'il était intégré), et il devient gratuit.
+    // Sans ce raccourci, le préfiltrage coûterait des secondes au lieu de millisecondes.
+    if (pc.roughness <= 0.0) {
+        imageStore(dstMip, ivec3(id), vec4(textureLod(srcEnv, N, 0.0).rgb, 1.0));
+        return;
+    }
+
+    // Approximation de Karis : N = V = R. Le lobe devient isotrope, on perd donc
+    // l'étirement du reflet aux angles rasants. Limite connue et ASSUMÉE du split-sum
+    // (UE4 fait pareil) : la corriger exigerait un préfiltrage dépendant de la vue,
+    // ce qui est incompatible avec un précalcul.
+    vec3 V = N;
+    vec3 color = vec3(0.0);
+    float totalWeight = 0.0;
+
+    // Angle solide d'un texel de la source (6 faces couvrant 4*PI stéradians).
+    float saTexel = 4.0 * kPi / (6.0 * pc.srcResolution * pc.srcResolution);
+
+    for (uint i = 0u; i < pc.sampleCount; ++i) {
+        vec2 Xi = hammersley(i, pc.sampleCount);
+        vec3 H = importanceSampleGGX(Xi, N, pc.roughness);
+        vec3 L = normalize(2.0 * dot(V, H) * H - V);
+
+        float NdotL = dot(N, L);
+        if (NdotL <= 0.0) {
+            continue;  // sample sous l'horizon : il ne contribue pas
+        }
+
+        // Biais de mip (Karis) : lire la source dans un mip dont le texel couvre à peu
+        // près l'angle solide que ce sample représente. Sans ça, un seul texel très
+        // brillant capté par un sample isolé produit un « firefly » que 64 samples ne
+        // moyenneront jamais. C'est ICI que la chaîne de blits de l'étape 6a sert.
+        float NdotH = max(dot(N, H), 0.0);
+        float VdotH = max(dot(V, H), 0.0);
+        float pdf = distributionGGX(NdotH, pc.roughness) * NdotH / (4.0 * VdotH) + 0.0001;
+        float saSample = 1.0 / (float(pc.sampleCount) * pdf + 0.0001);
+        float mip = 0.5 * log2(saSample / saTexel);
+
+        color += textureLod(srcEnv, L, max(mip, 0.0)).rgb * NdotL;
+        totalWeight += NdotL;
+    }
+
+    // Pondération par NdotL : c'est l'approximation de Karis de l'intégrale du split-sum.
+    color = totalWeight > 0.0 ? color / totalWeight : textureLod(srcEnv, N, 0.0).rgb;
+    imageStore(dstMip, ivec3(id), vec4(color, 1.0));
+}

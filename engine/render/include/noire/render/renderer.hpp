@@ -189,12 +189,30 @@ private:
     // jamais un set en vol non plus. Un set PAR environnement : changer de ciel = lier
     // un autre set, jamais réécrire celui-ci.
     struct Environment {
+        // --- Source : le ciel net (M8 étape 6a) ---
+        // Sert la skybox (mip 0) ET de SOURCE au préfiltrage GGX. Sa chaîne de mips
+        // (blits) n'est pas décorative : le biais de mip de Karis en dépend.
         VkImage image = VK_NULL_HANDLE;
         VmaAllocation allocation = nullptr;
-        VkImageView view = VK_NULL_HANDLE;
-        VkDescriptorSet descriptor = VK_NULL_HANDLE;
+        VkImageView view = VK_NULL_HANDLE;      // CUBE, toute la chaîne
+        VkDescriptorSet descriptor = VK_NULL_HANDLE;  // lié par le pipeline skybox
         std::uint32_t mips = 1;
-        bool ready = false;  // true quand copie + blits + transition finale sont terminés
+
+        // --- Spéculaire préfiltré GGX (M8 étape 7) ---
+        // Image SÉPARÉE : préfiltrer en place reviendrait à lire les mips qu'on écrit.
+        // Chaque mip est un niveau de rugosité => le mapping rugosité -> lod devient
+        // exact côté PBR. Sert aussi de couleur de brouillard (mip bas = ciel flou).
+        VkImage spec_image = VK_NULL_HANDLE;
+        VmaAllocation spec_allocation = nullptr;
+        VkImageView spec_view = VK_NULL_HANDLE;  // CUBE, toute la chaîne (échantillonnage)
+        VkDescriptorSet spec_descriptor = VK_NULL_HANDLE;  // set 2 du pipeline texturé
+        std::uint32_t spec_mips = 1;
+        // Une vue 2D_ARRAY par mip (écriture en storage image) + son set de compute.
+        // On écrit en 2D_ARRAY et on lit en CUBE : pattern portable.
+        std::vector<VkImageView> spec_mip_views;
+        std::vector<VkDescriptorSet> prefilter_sets;
+
+        bool ready = false;  // true quand copie + blits + préfiltrage + transitions sont finis
     };
 
     // Une cascade d'ombre : sa depth map + la matrice qui l'a cadrée cette frame.
@@ -252,6 +270,17 @@ private:
     // SHADER_READ_ONLY. Enregistré dans le command buffer d'un transfert.
     void record_environment_mips(VkCommandBuffer cmd, VkImage image, std::uint32_t face_size,
                                  std::uint32_t mips);
+
+    // Préfiltrage GGX (M8 étape 7) : première passe COMPUTE du moteur. Elle vit dans le
+    // command buffer du TransferManager (famille 0 = GRAPHICS|COMPUTE) : un seul submit,
+    // une seule fence, et l'asynchronisme est celui, déjà éprouvé, des téléversements.
+    bool create_prefilter_descriptor_layout();  // samplerCube source + image2DArray dest
+    bool create_prefilter_pipeline();           // layout + pipeline compute
+    // Alloue l'image spec_, ses vues (CUBE + une 2D_ARRAY par mip) et ses sets.
+    bool create_environment_specular(Environment& env, std::uint32_t face_size);
+    // Enregistre les dispatches (un par mip) + les barrières qui les encadrent.
+    void record_environment_prefilter(VkCommandBuffer cmd, const Environment& env,
+                                      std::uint32_t face_size);
     void record_skybox(VkCommandBuffer cmd);
     void destroy_environment_gpu(Environment& env);
 
@@ -322,6 +351,17 @@ private:
     EnvironmentId active_environment_ = 0;
     EnvironmentId default_environment_ = 0;  // cubemap 1x1 de secours
     static constexpr std::uint32_t kMaxEnvironments = 4;
+
+    // --- Préfiltrage GGX en compute (M8 étape 7) -----------------------------
+    VkDescriptorSetLayout prefilter_set_layout_ = VK_NULL_HANDLE;
+    VkPipelineLayout prefilter_pipeline_layout_ = VK_NULL_HANDLE;
+    VkPipeline prefilter_pipeline_ = VK_NULL_HANDLE;
+    // 512 par face : compromis VRAM/netteté. 256 rendrait molles nos vitres (rugosité
+    // 0.05, quasi miroir) ; 1024 quadruplerait la facture pour un gain invisible.
+    static constexpr std::uint32_t kSpecularFaceSize = 512;
+    // 7 mips => rugosité 0, 1/6, ... 1. Au-delà, les faces sont trop petites pour porter
+    // une information angulaire utile.
+    static constexpr std::uint32_t kSpecularMips = 7;
 
     // --- Ombres du soleil (M8 étape 1) ---------------------------------------
     // Passe depth-only rendue AVANT la passe principale. Deux pipelines car les deux

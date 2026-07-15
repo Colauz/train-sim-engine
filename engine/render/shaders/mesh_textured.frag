@@ -26,8 +26,10 @@ layout(set = 1, binding = 0) uniform sampler2D baseColorMap;
 layout(set = 1, binding = 1) uniform sampler2D metallicRoughnessMap;
 layout(set = 1, binding = 2) uniform sampler2D normalMap;
 
-// set = 2 : la cubemap HDR d'environnement (M8 étape 6b). Sa CHAÎNE DE MIPS tient lieu
-// d'environnement préfiltré : plus la surface est rugueuse, plus on tape haut (flou).
+// set = 2 : l'environnement PRÉFILTRÉ GGX en compute (M8 étape 7). Ce n'est PAS le ciel
+// brut : chaque mip est un niveau de rugosité intégré par importance sampling, donc le
+// mapping rugosité -> lod ci-dessous est EXACT par construction (mip i = rugosité
+// i/(mips-1)) et non plus une heuristique sur des filtres boîte.
 // Le soleil en a été retiré au chargement — il est porté par u.sunDirection/sunColor,
 // l'y laisser le compterait deux fois (une fois en spéculaire d'env, une fois en direct).
 layout(set = 2, binding = 0) uniform samplerCube envMap;
@@ -263,10 +265,8 @@ void main() {
     // (contrairement au direct, où il est annulé par la calibration de sunColor).
     vec3 ambientDiffuse = kDamb * albedo * irradiance / kPi;
 
-    // Spéculaire : la chaîne de mips EST l'environnement préfiltré. C'est ce qui rend
-    // enfin aux métaux et au verre un vrai monde à réfléchir, au lieu d'un aplat bleu.
-    // Le mapping rugosité -> lod est LINÉAIRE et heuristique : nos mips sont des filtres
-    // boîte, pas des lobes GGX préfiltrés (cf. l'étape 7 prévue).
+    // Spéculaire : chaque mip EST une rugosité, préfiltrée par importance sampling GGX
+    // (étape 7). Le lod est donc une lecture directe de la table, plus une approximation.
     vec3 R = reflect(-V, N);
     vec3 prefiltered = textureLod(envMap, R, roughness * envMips).rgb;
     vec2 ab = envBRDFApprox(NdotV, roughness);
