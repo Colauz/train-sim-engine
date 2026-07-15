@@ -50,14 +50,29 @@ struct FrameUniforms {
     glm::vec4 sun_color{1.0f, 0.98f, 0.94f, 0.30f};
 };
 
-// Un objet à dessiner : sa matrice Model (déjà relative à la caméra, en float),
-// le maillage à utiliser et, pour les maillages indexés (MeshVertex), la texture
-// de base à appliquer. `texture == 0` => texture de secours (blanche 1x1). Ignoré
-// pour les maillages legacy (Vertex pos+couleur), dessinés par le pipeline debug.
+// Description d'un matériau PBR metallic-roughness (convention glTF), fournie par
+// l'app à create_material(). Chaque texture peut valoir 0 => texture de secours du
+// rôle correspondant, ce qui laisse le facteur seul décider (ex. un rail = pas de
+// texture + base_color_factor gris acier).
+struct MaterialDesc {
+    TextureId base_color = 0;          // sRGB
+    TextureId metallic_roughness = 0;  // linéaire — G = roughness, B = metallic (glTF)
+    TextureId normal = 0;              // linéaire — normal map en espace tangent
+    // Multiplie la texture de base. LINÉAIRE (la conversion sRGB est matérielle).
+    glm::vec4 base_color_factor{1.0f, 1.0f, 1.0f, 1.0f};
+    float metallic_factor = 1.0f;   // défauts glTF
+    float roughness_factor = 1.0f;
+    float normal_scale = 1.0f;
+};
+
+// Un objet à dessiner : sa matrice Model (déjà relative à la caméra, en float), le
+// maillage, et — pour les maillages indexés (MeshVertex) — le matériau à appliquer.
+// `material == 0` => matériau par défaut. Ignoré pour les maillages legacy (Vertex
+// pos+couleur), dessinés par le pipeline debug.
 struct DrawItem {
     glm::mat4 model;
     MeshId mesh;
-    TextureId texture = 0;
+    MaterialId material = 0;
 };
 
 // Renderer générique : il ne connaît PAS la scène. L'app crée des maillages puis
@@ -91,15 +106,21 @@ public:
     // pour ne jamais libérer un tampon encore référencé par une frame en vol.
     void destroy_mesh(MeshId id);
 
-    // Crée une texture GPU (RGBA8 SRGB) à partir de pixels CPU, téléversée de façon
-    // ASYNCHRONE (staging + TransferManager). `rgba_pixels` = width*height*4 octets.
-    // Échantillonnable seulement une fois le transfert terminé (is_texture_ready) ;
-    // en attendant, les DrawItem qui la référencent retombent sur la texture de secours.
-    TextureId create_texture(std::uint32_t width, std::uint32_t height, const void* rgba_pixels);
+    // Crée une texture GPU RGBA8 à partir de pixels CPU, téléversée de façon ASYNCHRONE
+    // (staging + TransferManager). `rgba_pixels` = width*height*4 octets. `format` dit
+    // au matériel s'il doit décoder le sRGB (couleur) ou non (données PBR).
+    TextureId create_texture(std::uint32_t width, std::uint32_t height, const void* rgba_pixels,
+                             TextureFormat format = TextureFormat::SrgbColor);
     [[nodiscard]] bool is_texture_ready(TextureId id) const;
     void destroy_texture(TextureId id);
-    // Texture blanche 1x1 de secours (toujours prête une fois l'init terminée).
-    [[nodiscard]] TextureId white_texture() const { return white_texture_; }
+
+    // Crée un matériau = un descriptor set 1 (3 textures) + ses facteurs. Le set n'est
+    // écrit qu'une fois TOUTES ses textures téléversées : d'ici là is_material_ready()
+    // est false et les DrawItem qui le référencent ne sont pas dessinés (même contrat
+    // que is_mesh_ready). 0 = échec.
+    MaterialId create_material(const MaterialDesc& desc);
+    [[nodiscard]] bool is_material_ready(MaterialId id) const;
+    void destroy_material(MaterialId id);
 
     void draw_frame(const FrameUniforms& uniforms, const std::vector<DrawItem>& items);
     void wait_idle();
@@ -118,15 +139,29 @@ private:
         bool ready = true;
     };
 
-    // Texture GPU (M7 étape 3) : image + vue + descriptor set=1 (combined image
-    // sampler). `ready` bascule à true quand le transfert (copie + transition de
-    // layout vers SHADER_READ_ONLY) est terminé ; le sampler est partagé (sampler_).
+    // Texture GPU (M7 étape 3) : image + vue. `ready` bascule à true quand le transfert
+    // (copie + transition de layout vers SHADER_READ_ONLY) est terminé ; le sampler est
+    // partagé (sampler_). Depuis le M8 étape 3, le descriptor set appartient au
+    // MATÉRIAU (set 1 = 3 textures), plus à la texture.
     struct Texture {
         VkImage image = VK_NULL_HANDLE;
         VmaAllocation allocation = nullptr;
         VkImageView view = VK_NULL_HANDLE;
-        VkDescriptorSet descriptor = VK_NULL_HANDLE;
         bool ready = false;
+    };
+
+    // Matériau GPU (M8 étape 3) : un descriptor set 1 portant les 3 textures PBR, plus
+    // les facteurs (poussés en push constants au moment du draw). `written` bascule à
+    // true quand le set a été écrit — ce qui n'a lieu qu'une fois toutes les textures
+    // téléversées, donc AVANT tout bind : on ne réécrit jamais un set en vol.
+    struct Material {
+        VkDescriptorSet descriptor = VK_NULL_HANDLE;
+        TextureId base_color = 0;
+        TextureId metallic_roughness = 0;
+        TextureId normal = 0;
+        glm::vec4 base_color_factor{1.0f};
+        glm::vec4 pbr_factors{1.0f, 1.0f, 1.0f, 0.0f};  // x=metallic, y=roughness, z=normal_scale
+        bool written = false;
     };
 
     // Une cascade d'ombre : sa depth map + la matrice qui l'a cadrée cette frame.
@@ -153,17 +188,20 @@ private:
     bool create_uniform_buffers();
     bool create_descriptor_sets();
 
-    // Textures / matériaux (M7 étape 3).
+    // Textures / matériaux (M7 étape 3, étendu M8 étape 3).
     bool create_sampler();
-    bool create_texture_descriptor_layout();  // set=1 : combined image sampler (frag)
-    bool create_texture_descriptor_pool();
-    bool create_textured_pipeline_layout();    // set0 (UBO) + set1 (sampler) + push model
-    bool create_default_texture();             // texture blanche 1x1 de secours
+    bool create_material_descriptor_layout();  // set=1 : 3 combined image samplers (frag)
+    bool create_material_descriptor_pool();
+    bool create_textured_pipeline_layout();    // set0 (UBO) + set1 (matériau) + push
+    bool create_default_textures();            // secours 1x1 : blanc, metal/rough, normale
+    bool create_default_material();
     VkImageView create_image_view_2d(VkImage image, VkFormat format);
-    // Texture à lier pour un DrawItem : celle demandée si prête, sinon le fallback ;
-    // nullptr si même le fallback n'est pas encore prêt (toutes premières frames).
-    [[nodiscard]] const Texture* resolve_texture(TextureId id) const;
-    void free_texture(Texture& texture);  // libère descriptor + vue + image (device idle)
+    // Identifiant réellement liable pour un rôle : celui demandé s'il existe, sinon la
+    // texture de secours du rôle.
+    [[nodiscard]] TextureId resolve_texture(TextureId requested, TextureId fallback) const;
+    // Écrit le set 1 des matériaux dont toutes les textures viennent d'être téléversées.
+    void update_pending_materials();
+    void free_texture(Texture& texture);  // libère vue + image (device idle)
 
     // Ombres (M8 étape 1) : passe depth-only du soleil, une par cascade.
     bool create_shadow_render_pass();
@@ -199,16 +237,24 @@ private:
     VkPipeline pipeline_triangles_ = VK_NULL_HANDLE;
     VkPipeline pipeline_lines_ = VK_NULL_HANDLE;
 
-    // --- Textures / matériaux (M7 étape 3) -----------------------------------
+    // --- Textures / matériaux (M7 étape 3, étendu M8 étape 3) ----------------
     VkSampler sampler_ = VK_NULL_HANDLE;                          // partagé (linéaire + aniso)
-    VkDescriptorSetLayout texture_set_layout_ = VK_NULL_HANDLE;   // set=1
-    VkDescriptorPool texture_pool_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout material_set_layout_ = VK_NULL_HANDLE;  // set=1 (3 bindings)
+    VkDescriptorPool material_pool_ = VK_NULL_HANDLE;
     VkPipelineLayout textured_pipeline_layout_ = VK_NULL_HANDLE;  // set0 + set1
-    VkPipeline pipeline_textured_ = VK_NULL_HANDLE;               // MeshVertex + textures
+    VkPipeline pipeline_textured_ = VK_NULL_HANDLE;               // MeshVertex + matériau
     std::unordered_map<TextureId, Texture> textures_;
+    std::unordered_map<MaterialId, Material> materials_;
     TextureId next_texture_id_ = 1;
-    TextureId white_texture_ = 0;
+    MaterialId next_material_id_ = 1;
+    // Textures de secours 1x1, une par rôle PBR (cf. create_default_textures).
+    TextureId white_texture_ = 0;         // albédo : blanc pur
+    TextureId default_mr_texture_ = 0;    // metallic = 0, roughness = 1
+    TextureId flat_normal_texture_ = 0;   // normale plate (128,128,255)
+    MaterialId default_material_ = 0;     // tout en secours (DrawItem::material == 0)
     static constexpr std::uint32_t kMaxTextures = 128;
+    static constexpr std::uint32_t kMaxMaterials = 64;
+    static constexpr std::uint32_t kMaterialTextures = 3;  // bindings du set 1
 
     // --- Ombres du soleil (M8 étape 1) ---------------------------------------
     // Passe depth-only rendue AVANT la passe principale. Deux pipelines car les deux
@@ -253,12 +299,19 @@ private:
     };
     std::vector<PendingDelete> pending_deletes_;
 
-    // Idem pour les textures (image + vue + descriptor set libérés en différé).
+    // Idem pour les textures (image + vue libérées en différé)...
     struct PendingTextureDelete {
         Texture texture;
         std::uint64_t destroy_at_frame = 0;
     };
     std::vector<PendingTextureDelete> pending_texture_deletes_;
+
+    // ...et pour les matériaux (leur descriptor set rendu au pool).
+    struct PendingMaterialDelete {
+        VkDescriptorSet descriptor = VK_NULL_HANDLE;
+        std::uint64_t destroy_at_frame = 0;
+    };
+    std::vector<PendingMaterialDelete> pending_material_deletes_;
     std::uint64_t frame_index_ = 0;
 
     // Couleur de fond = couleur du brouillard (mise à jour depuis les uniforms).

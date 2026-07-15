@@ -34,7 +34,7 @@ void WorldStreamer::request_chunk(long index) {
     const WorldPosition origin = raw->origin;
     const RailProfile profile = config_.rail_profile;
     jobs_.submit([this, raw, x0, x1, origin, profile] {
-        raw->cpu_vertices = generate_rail_mesh(track_, x0, x1, origin, profile);
+        raw->cpu_mesh = generate_rail_mesh(track_, x0, x1, origin, profile);
         // Barrière release : rend visibles les écritures ci-dessus au thread principal.
         raw->state.store(State::CpuReady, std::memory_order_release);
     });
@@ -59,11 +59,14 @@ void WorldStreamer::update(double wagon_chainage, render::Renderer& renderer) {
             break;
         }
         if (!chunk->has_mesh && chunk->state.load(std::memory_order_acquire) == State::CpuReady) {
-            chunk->mesh = renderer.create_mesh(chunk->cpu_vertices, render::Topology::Triangles);
+            // Chemin indexé device-local : la voie est désormais au format PBR
+            // (MeshVertex) => elle passe par le pipeline texturé, donc s'éclaire et
+            // REÇOIT les ombres, en plus d'en projeter.
+            chunk->mesh = renderer.create_mesh_indexed(chunk->cpu_mesh.vertices,
+                                                       chunk->cpu_mesh.indices);
             chunk->has_mesh = true;
             chunk->state.store(State::Active, std::memory_order_relaxed);
-            chunk->cpu_vertices.clear();
-            chunk->cpu_vertices.shrink_to_fit();  // libère la RAM CPU une fois sur le GPU
+            chunk->cpu_mesh = RailMeshData{};  // libère la RAM CPU une fois sur le GPU
             ++uploads;
         }
     }

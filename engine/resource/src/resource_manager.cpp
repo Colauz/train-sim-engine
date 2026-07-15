@@ -27,7 +27,8 @@ struct ResourceManager::ModelSlot {
     std::string full_path;
     std::atomic<ResourceState> state{ResourceState::Queued};
     ModelData cpu;
-    std::vector<TextureHandle> textures;  // textures GPU du modèle (créées au pump)
+    std::vector<TextureHandle> textures;    // textures GPU du modèle (créées au pump)
+    std::vector<MaterialHandle> materials;  // matériaux GPU (créés au pump)
 };
 
 struct ResourceManager::AudioSlot {
@@ -54,6 +55,17 @@ TextureHandle ResourceManager::make_texture_handle() {
             rec->textures.push_back(t->id);
         }
         delete t;
+    });
+}
+
+MaterialHandle ResourceManager::make_material_handle() {
+    std::shared_ptr<Recycler> rec = recycler_;
+    return MaterialHandle(new Material(), [rec](Material* m) {
+        if (m->id != 0) {
+            std::lock_guard<std::mutex> lock(rec->mutex);
+            rec->materials.push_back(m->id);
+        }
+        delete m;  // relâche les TextureHandle => elles se recyclent à leur tour
     });
 }
 
@@ -185,13 +197,19 @@ AudioHandle ResourceManager::load_audio(const std::string& relative_path) {
 void ResourceManager::drain_recycler() {
     std::vector<render::MeshId> meshes;
     std::vector<render::TextureId> textures;
+    std::vector<render::MaterialId> materials;
     {
         std::lock_guard<std::mutex> lock(recycler_->mutex);
         meshes.swap(recycler_->meshes);
         textures.swap(recycler_->textures);
+        materials.swap(recycler_->materials);
     }
     for (render::MeshId id : meshes) {
         renderer_.destroy_mesh(id);
+    }
+    // Les matériaux AVANT leurs textures : un matériau détruit ne référence plus rien.
+    for (render::MaterialId id : materials) {
+        renderer_.destroy_material(id);
     }
     for (render::TextureId id : textures) {
         renderer_.destroy_texture(id);
@@ -235,26 +253,59 @@ void ResourceManager::pump_models(int& budget) {
             continue;
         }
         if (state == ResourceState::CpuReady && budget > 0) {
-            // 1) Une texture GPU par image décodée du modèle.
+            // 1) Une texture GPU par image décodée — l'espace colorimétrique vient du
+            //    RÔLE que le loader lui a attribué (base color = sRGB, PBR = linéaire).
             slot.textures.clear();
             slot.textures.reserve(slot.cpu.images.size());
             for (ImageData& img : slot.cpu.images) {
                 TextureHandle tex = make_texture_handle();
                 tex->id = renderer_.create_texture(static_cast<std::uint32_t>(img.width),
                                                    static_cast<std::uint32_t>(img.height),
-                                                   img.pixels.data());
+                                                   img.pixels.data(), img.color_space);
                 slot.textures.push_back(std::move(tex));
             }
-            // 2) Un mesh device-local par primitive, puis on assemble le Model.
+
+            // 2) Un matériau GPU (= un descriptor set 1) par matériau décodé. Il retient
+            //    les handles de ses textures pour les garder vivantes.
+            const auto image_texture = [&slot](int image_index) -> TextureHandle {
+                if (image_index >= 0 &&
+                    static_cast<std::size_t>(image_index) < slot.textures.size()) {
+                    return slot.textures[static_cast<std::size_t>(image_index)];
+                }
+                return nullptr;
+            };
+            slot.materials.clear();
+            slot.materials.reserve(slot.cpu.materials.size());
+            for (const MaterialData& mat : slot.cpu.materials) {
+                MaterialHandle handle = make_material_handle();
+                render::MaterialDesc desc;
+                desc.base_color_factor = mat.base_color_factor;
+                desc.metallic_factor = mat.metallic_factor;
+                desc.roughness_factor = mat.roughness_factor;
+                desc.normal_scale = mat.normal_scale;
+                for (auto [image_index, out_id] :
+                     {std::pair{mat.base_color_image, &desc.base_color},
+                      std::pair{mat.metallic_roughness_image, &desc.metallic_roughness},
+                      std::pair{mat.normal_image, &desc.normal}}) {
+                    if (TextureHandle tex = image_texture(image_index)) {
+                        *out_id = tex->id;
+                        handle->textures.push_back(std::move(tex));
+                    }
+                }
+                handle->id = renderer_.create_material(desc);
+                slot.materials.push_back(std::move(handle));
+            }
+
+            // 3) Un mesh device-local par primitive, puis on assemble le Model.
             Model& model = *slot.handle;
             model.primitives.clear();
             model.primitives.reserve(slot.cpu.primitives.size());
             for (const PrimitiveData& prim : slot.cpu.primitives) {
                 Model::Primitive out_prim;
                 out_prim.mesh = renderer_.create_mesh_indexed(prim.vertices, prim.indices);
-                if (prim.image_index >= 0 &&
-                    static_cast<std::size_t>(prim.image_index) < slot.textures.size()) {
-                    out_prim.texture = slot.textures[static_cast<std::size_t>(prim.image_index)];
+                if (prim.material_index >= 0 &&
+                    static_cast<std::size_t>(prim.material_index) < slot.materials.size()) {
+                    out_prim.material = slot.materials[static_cast<std::size_t>(prim.material_index)];
                 }
                 model.primitives.push_back(std::move(out_prim));
             }
@@ -269,8 +320,10 @@ void ResourceManager::pump_models(int& budget) {
                     all_ready = false;
                     break;
                 }
-                if (prim.texture && prim.texture->id != 0 &&
-                    !renderer_.is_texture_ready(prim.texture->id)) {
+                // Un matériau n'est « prêt » que quand son set 1 a été écrit, donc quand
+                // ses 3 textures sont téléversées.
+                if (prim.material && prim.material->id != 0 &&
+                    !renderer_.is_material_ready(prim.material->id)) {
                     all_ready = false;
                     break;
                 }

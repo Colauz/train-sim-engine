@@ -64,7 +64,7 @@ private:
         double x_end = 0.0;
         WorldPosition origin{};
         std::atomic<State> state{State::Generating};
-        std::vector<render::Vertex> cpu_vertices;  // rempli par le worker
+        RailMeshData cpu_mesh;  // rempli par le worker (sommets PBR + indices)
         render::MeshId mesh = 0;
         bool has_mesh = false;
     };

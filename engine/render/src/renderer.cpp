@@ -40,6 +40,16 @@ struct GpuFrameUniforms {
 };
 static_assert(kShadowCascades <= 4, "cascade_splits (vec4) ne porte que 4 distances");
 
+// Push constants du pipeline texturé : miroir exact du bloc du même nom dans
+// mesh_textured.vert/.frag. Le modèle est lu au vertex, les facteurs au fragment.
+struct TexturedPushConstants {
+    glm::mat4 model;               // offset 0
+    glm::vec4 base_color_factor;   // offset 64
+    glm::vec4 pbr_factors;         // offset 80 : x=metallic, y=roughness, z=normal_scale
+};
+static_assert(sizeof(TexturedPushConstants) == 96,
+              "les push constants doivent tenir dans les 128 octets garantis par la spec");
+
 // Format des shadow maps : profondeur pure 32 bits (pas de stencil).
 constexpr VkFormat kShadowFormat = VK_FORMAT_D32_SFLOAT;
 
@@ -98,17 +108,17 @@ bool Renderer::initialize(const RendererCreateInfo& info) {
         return false;
     }
 
-    // Textures / matériaux (M7 étape 3) : sampler partagé, layout+pool set=1, pipeline
-    // texturé, puis la texture de secours blanche 1x1.
-    if (!create_sampler() || !create_texture_descriptor_layout() ||
-        !create_texture_descriptor_pool() || !create_textured_pipeline_layout()) {
+    // Textures / matériaux : sampler partagé, layout+pool du set 1 (3 textures PBR),
+    // pipeline texturé, puis les secours 1x1 et le matériau par défaut.
+    if (!create_sampler() || !create_material_descriptor_layout() ||
+        !create_material_descriptor_pool() || !create_textured_pipeline_layout()) {
         return false;
     }
     pipeline_textured_ = build_textured_pipeline();
     if (pipeline_textured_ == VK_NULL_HANDLE) {
         return false;
     }
-    if (!create_default_texture()) {
+    if (!create_default_textures() || !create_default_material()) {
         return false;
     }
 
@@ -259,6 +269,14 @@ void Renderer::process_deferred_deletes() {
         if (frame_index_ >= it->destroy_at_frame) {
             free_texture(it->texture);
             it = pending_texture_deletes_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto it = pending_material_deletes_.begin(); it != pending_material_deletes_.end();) {
+        if (frame_index_ >= it->destroy_at_frame) {
+            vkFreeDescriptorSets(context_.device(), material_pool_, 1, &it->descriptor);
+            it = pending_material_deletes_.erase(it);
         } else {
             ++it;
         }
@@ -1187,52 +1205,58 @@ bool Renderer::create_sampler() {
     return true;
 }
 
-bool Renderer::create_texture_descriptor_layout() {
-    VkDescriptorSetLayoutBinding binding{};
-    binding.binding = 0;
-    binding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    binding.descriptorCount = 1;
-    binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+bool Renderer::create_material_descriptor_layout() {
+    // set 1 = LE MATÉRIAU : les 3 textures PBR (glTF metallic-roughness).
+    //   0 = base color (sRGB), 1 = metallic-roughness, 2 = normal map.
+    std::array<VkDescriptorSetLayoutBinding, kMaterialTextures> bindings{};
+    for (std::uint32_t i = 0; i < kMaterialTextures; ++i) {
+        bindings[i].binding = i;
+        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
 
     VkDescriptorSetLayoutCreateInfo info{};
     info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    info.bindingCount = 1;
-    info.pBindings = &binding;
-    if (vkCreateDescriptorSetLayout(context_.device(), &info, nullptr, &texture_set_layout_) !=
+    info.bindingCount = static_cast<std::uint32_t>(bindings.size());
+    info.pBindings = bindings.data();
+    if (vkCreateDescriptorSetLayout(context_.device(), &info, nullptr, &material_set_layout_) !=
         VK_SUCCESS) {
-        log::error("Vulkan : création du descriptor set layout de texture échouée");
+        log::error("Vulkan : création du descriptor set layout de matériau échouée");
         return false;
     }
     return true;
 }
 
-bool Renderer::create_texture_descriptor_pool() {
+bool Renderer::create_material_descriptor_pool() {
     VkDescriptorPoolSize pool_size{};
     pool_size.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    pool_size.descriptorCount = kMaxTextures;
+    pool_size.descriptorCount = kMaxMaterials * kMaterialTextures;
 
     VkDescriptorPoolCreateInfo info{};
     info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;  // libération individuelle
     info.poolSizeCount = 1;
     info.pPoolSizes = &pool_size;
-    info.maxSets = kMaxTextures;
-    if (vkCreateDescriptorPool(context_.device(), &info, nullptr, &texture_pool_) != VK_SUCCESS) {
-        log::error("Vulkan : création du descriptor pool de textures échouée");
+    info.maxSets = kMaxMaterials;
+    if (vkCreateDescriptorPool(context_.device(), &info, nullptr, &material_pool_) != VK_SUCCESS) {
+        log::error("Vulkan : création du descriptor pool de matériaux échouée");
         return false;
     }
     return true;
 }
 
 bool Renderer::create_textured_pipeline_layout() {
+    // Push constants : la matrice Model (lue au vertex) + les facteurs du matériau
+    // (lus au fragment). 96 octets => sous les 128 garantis par la spec Vulkan.
     VkPushConstantRange push_range{};
-    push_range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    push_range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     push_range.offset = 0;
-    push_range.size = sizeof(glm::mat4);
+    push_range.size = sizeof(TexturedPushConstants);
 
-    // set 0 = UBO global (identique au pipeline debug => layouts compatibles pour
-    // le set 0) ; set 1 = combined image sampler du matériau.
-    std::array<VkDescriptorSetLayout, 2> sets{descriptor_set_layout_, texture_set_layout_};
+    // set 0 = UBO global + cascades (identique au pipeline debug => layouts compatibles
+    // pour le set 0) ; set 1 = les 3 textures du matériau.
+    std::array<VkDescriptorSetLayout, 2> sets{descriptor_set_layout_, material_set_layout_};
 
     VkPipelineLayoutCreateInfo layout_info{};
     layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -1269,13 +1293,13 @@ VkPipeline Renderer::build_textured_pipeline() {
 
     std::array<VkPipelineShaderStageCreateInfo, 2> stages{vs, fs};
 
-    // Format de sommet : position (loc 0) + normale (loc 1) + UV (loc 2).
+    // Format de sommet : position (0) + normale (1) + UV (2) + tangente (3).
     VkVertexInputBindingDescription binding{};
     binding.binding = 0;
     binding.stride = sizeof(MeshVertex);
     binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
 
-    std::array<VkVertexInputAttributeDescription, 3> attributes{};
+    std::array<VkVertexInputAttributeDescription, 4> attributes{};
     attributes[0].location = 0;
     attributes[0].binding = 0;
     attributes[0].format = VK_FORMAT_R32G32B32_SFLOAT;
@@ -1288,6 +1312,10 @@ VkPipeline Renderer::build_textured_pipeline() {
     attributes[2].binding = 0;
     attributes[2].format = VK_FORMAT_R32G32_SFLOAT;
     attributes[2].offset = offsetof(MeshVertex, uv);
+    attributes[3].location = 3;
+    attributes[3].binding = 0;
+    attributes[3].format = VK_FORMAT_R32G32B32A32_SFLOAT;
+    attributes[3].offset = offsetof(MeshVertex, tangent);
 
     VkPipelineVertexInputStateCreateInfo vertex_input{};
     vertex_input.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
@@ -1386,61 +1414,61 @@ VkImageView Renderer::create_image_view_2d(VkImage image, VkFormat format) {
     return view;
 }
 
-bool Renderer::create_default_texture() {
+bool Renderer::create_default_textures() {
+    // Une texture de secours 1x1 par rôle PBR : elles rendent tout matériau valide même
+    // sans aucune texture, et laissent alors les facteurs seuls décider du rendu.
     const unsigned char white[4] = {255, 255, 255, 255};
-    white_texture_ = create_texture(1, 1, white);
-    if (white_texture_ == 0) {
-        log::error("Renderer : création de la texture de secours (blanche 1x1) échouée");
+    white_texture_ = create_texture(1, 1, white, TextureFormat::SrgbColor);
+
+    // Convention glTF : G = roughness, B = metallic (R et A inutilisés). Neutre =
+    // metallic 0 / roughness 1, donc le matériau retombe sur ses seuls facteurs.
+    const unsigned char metal_rough[4] = {255, 255, 0, 255};
+    default_mr_texture_ = create_texture(1, 1, metal_rough, TextureFormat::LinearData);
+
+    // Normale plate : (0,0,1) encodé en 0..255 => la normale géométrique est conservée.
+    const unsigned char flat_normal[4] = {128, 128, 255, 255};
+    flat_normal_texture_ = create_texture(1, 1, flat_normal, TextureFormat::LinearData);
+
+    if (white_texture_ == 0 || default_mr_texture_ == 0 || flat_normal_texture_ == 0) {
+        log::error("Renderer : création des textures de secours 1x1 échouée");
+        return false;
+    }
+    return true;
+}
+
+bool Renderer::create_default_material() {
+    // Matériau par défaut : tout en secours. C'est ce que référence DrawItem::material
+    // == 0 (ex. le sol avant que sa texture ne soit prête, ou un modèle sans matériau).
+    default_material_ = create_material(MaterialDesc{});
+    if (default_material_ == 0) {
+        log::error("Renderer : création du matériau par défaut échouée");
         return false;
     }
     return true;
 }
 
 TextureId Renderer::create_texture(std::uint32_t width, std::uint32_t height,
-                                   const void* rgba_pixels) {
+                                   const void* rgba_pixels, TextureFormat format) {
     if (width == 0 || height == 0 || rgba_pixels == nullptr) {
         return 0;
     }
 
     Texture tex;
-    const VkFormat format = VK_FORMAT_R8G8B8A8_SRGB;  // couleur de base => espace sRGB
-    if (!context_.create_image(width, height, format,
+    // SRGB => décodage matériel vers le linéaire à l'échantillonnage (couleurs).
+    // UNORM => octets bruts (metallic/roughness, normal map) : les décoder fausserait
+    // complètement le PBR.
+    const VkFormat vk_format = format == TextureFormat::SrgbColor ? VK_FORMAT_R8G8B8A8_SRGB
+                                                                  : VK_FORMAT_R8G8B8A8_UNORM;
+    if (!context_.create_image(width, height, vk_format,
                                VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                                tex.image, tex.allocation)) {
         return 0;
     }
-    tex.view = create_image_view_2d(tex.image, format);
+    tex.view = create_image_view_2d(tex.image, vk_format);
     if (tex.view == VK_NULL_HANDLE) {
         context_.destroy_image(tex.image, tex.allocation);
         return 0;
     }
-
-    // Descriptor set=1 (combined image sampler), écrit tout de suite (le layout
-    // SHADER_READ_ONLY sera atteint par le transfert avant tout échantillonnage).
-    VkDescriptorSetAllocateInfo alloc{};
-    alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    alloc.descriptorPool = texture_pool_;
-    alloc.descriptorSetCount = 1;
-    alloc.pSetLayouts = &texture_set_layout_;
-    if (vkAllocateDescriptorSets(context_.device(), &alloc, &tex.descriptor) != VK_SUCCESS) {
-        log::error("Renderer : allocation d'un descriptor set de texture échouée (pool plein ?)");
-        vkDestroyImageView(context_.device(), tex.view, nullptr);
-        context_.destroy_image(tex.image, tex.allocation);
-        return 0;
-    }
-
-    VkDescriptorImageInfo image_info{};
-    image_info.sampler = sampler_;
-    image_info.imageView = tex.view;
-    image_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    VkWriteDescriptorSet write{};
-    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    write.dstSet = tex.descriptor;
-    write.dstBinding = 0;
-    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    write.descriptorCount = 1;
-    write.pImageInfo = &image_info;
-    vkUpdateDescriptorSets(context_.device(), 1, &write, 0, nullptr);
 
     // Staging host-visible + téléversement asynchrone (copie + transitions de layout).
     const VkDeviceSize size =
@@ -1449,7 +1477,6 @@ TextureId Renderer::create_texture(std::uint32_t width, std::uint32_t height,
     if (!context_.create_buffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, /*host_visible=*/true,
                                 staging)) {
         log::error("Renderer : échec d'allocation du staging buffer d'une texture");
-        vkFreeDescriptorSets(context_.device(), texture_pool_, 1, &tex.descriptor);
         vkDestroyImageView(context_.device(), tex.view, nullptr);
         context_.destroy_image(tex.image, tex.allocation);
         return 0;
@@ -1511,25 +1538,99 @@ bool Renderer::is_texture_ready(TextureId id) const {
     return it != textures_.end() && it->second.ready;
 }
 
-const Renderer::Texture* Renderer::resolve_texture(TextureId id) const {
-    if (id != 0) {
-        const auto it = textures_.find(id);
-        if (it != textures_.end() && it->second.ready) {
-            return &it->second;
+TextureId Renderer::resolve_texture(TextureId requested, TextureId fallback) const {
+    // Une texture demandée mais inconnue (échec de chargement côté app) retombe sur le
+    // secours du rôle : un matériau reste toujours dessinable.
+    return (requested != 0 && textures_.count(requested) != 0) ? requested : fallback;
+}
+
+MaterialId Renderer::create_material(const MaterialDesc& desc) {
+    Material material;
+    material.base_color = desc.base_color;
+    material.metallic_roughness = desc.metallic_roughness;
+    material.normal = desc.normal;
+    material.base_color_factor = desc.base_color_factor;
+    material.pbr_factors =
+        glm::vec4(desc.metallic_factor, desc.roughness_factor, desc.normal_scale, 0.0f);
+
+    VkDescriptorSetAllocateInfo alloc{};
+    alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    alloc.descriptorPool = material_pool_;
+    alloc.descriptorSetCount = 1;
+    alloc.pSetLayouts = &material_set_layout_;
+    if (vkAllocateDescriptorSets(context_.device(), &alloc, &material.descriptor) != VK_SUCCESS) {
+        log::error("Renderer : allocation d'un descriptor set de matériau échouée (pool plein ?)");
+        return 0;
+    }
+
+    // Le set n'est PAS écrit ici : ses textures sont peut-être encore en transfert.
+    // update_pending_materials() s'en charge dès qu'elles sont toutes prêtes.
+    const MaterialId id = next_material_id_++;
+    materials_.emplace(id, material);
+    return id;
+}
+
+void Renderer::update_pending_materials() {
+    for (auto& [id, material] : materials_) {
+        if (material.written) {
+            continue;
         }
+        const std::array<TextureId, kMaterialTextures> resolved{
+            resolve_texture(material.base_color, white_texture_),
+            resolve_texture(material.metallic_roughness, default_mr_texture_),
+            resolve_texture(material.normal, flat_normal_texture_)};
+
+        // Tant qu'une seule des 3 n'est pas téléversée, on attend : écrire maintenant
+        // lierait une image encore en TRANSFER_DST (donc pas échantillonnable).
+        bool all_ready = true;
+        for (TextureId tex_id : resolved) {
+            if (!is_texture_ready(tex_id)) {
+                all_ready = false;
+                break;
+            }
+        }
+        if (!all_ready) {
+            continue;
+        }
+
+        std::array<VkDescriptorImageInfo, kMaterialTextures> infos{};
+        std::array<VkWriteDescriptorSet, kMaterialTextures> writes{};
+        for (std::size_t i = 0; i < kMaterialTextures; ++i) {
+            infos[i].sampler = sampler_;
+            infos[i].imageView = textures_.at(resolved[i]).view;
+            infos[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = material.descriptor;
+            writes[i].dstBinding = static_cast<std::uint32_t>(i);
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[i].descriptorCount = 1;
+            writes[i].pImageInfo = &infos[i];
+        }
+        // Sûr : le set n'a jamais pu être lié (les draws sautent les matériaux non
+        // écrits), donc aucune frame en vol ne le référence.
+        vkUpdateDescriptorSets(context_.device(), static_cast<std::uint32_t>(writes.size()),
+                               writes.data(), 0, nullptr);
+        material.written = true;
     }
-    const auto fallback = textures_.find(white_texture_);
-    if (fallback != textures_.end() && fallback->second.ready) {
-        return &fallback->second;
+}
+
+bool Renderer::is_material_ready(MaterialId id) const {
+    const auto it = materials_.find(id);
+    return it != materials_.end() && it->second.written;
+}
+
+void Renderer::destroy_material(MaterialId id) {
+    const auto it = materials_.find(id);
+    if (it == materials_.end()) {
+        return;
     }
-    return nullptr;
+    // Différé : le set peut encore être référencé par une frame en vol.
+    pending_material_deletes_.push_back(
+        PendingMaterialDelete{it->second.descriptor, frame_index_ + kFramesInFlight + 1});
+    materials_.erase(it);
 }
 
 void Renderer::free_texture(Texture& texture) {
-    if (texture.descriptor != VK_NULL_HANDLE) {
-        vkFreeDescriptorSets(context_.device(), texture_pool_, 1, &texture.descriptor);
-        texture.descriptor = VK_NULL_HANDLE;
-    }
     if (texture.view != VK_NULL_HANDLE) {
         vkDestroyImageView(context_.device(), texture.view, nullptr);
         texture.view = VK_NULL_HANDLE;
@@ -1606,17 +1707,26 @@ void Renderer::record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
         VkDeviceSize offset = 0;
         if (mesh.indexed) {
             // Modèle texturé : pipeline dédié + set 0 (UBO) + set 1 (matériau).
-            const Texture* tex = resolve_texture(item.texture);
-            if (tex == nullptr) {
-                continue;  // même la texture de secours n'est pas encore prête.
+            const MaterialId material_id = item.material != 0 ? item.material : default_material_;
+            const auto material_it = materials_.find(material_id);
+            if (material_it == materials_.end() || !material_it->second.written) {
+                continue;  // matériau inconnu, ou ses textures pas encore téléversées.
             }
-            const std::array<VkDescriptorSet, 2> sets{frame_ubo, tex->descriptor};
+            const Material& material = material_it->second;
+
+            TexturedPushConstants push{};
+            push.model = item.model;
+            push.base_color_factor = material.base_color_factor;
+            push.pbr_factors = material.pbr_factors;
+
+            const std::array<VkDescriptorSet, 2> sets{frame_ubo, material.descriptor};
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_textured_);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, textured_pipeline_layout_,
                                     0, static_cast<std::uint32_t>(sets.size()), sets.data(), 0,
                                     nullptr);
-            vkCmdPushConstants(cmd, textured_pipeline_layout_, VK_SHADER_STAGE_VERTEX_BIT, 0,
-                               sizeof(glm::mat4), &item.model);
+            vkCmdPushConstants(cmd, textured_pipeline_layout_,
+                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                               sizeof(push), &push);
             vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertex_buffer.buffer, &offset);
             vkCmdBindIndexBuffer(cmd, mesh.index_buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
             vkCmdDrawIndexed(cmd, mesh.index_count, 1, 0, 0, 0);
@@ -1648,6 +1758,8 @@ void Renderer::draw_frame(const FrameUniforms& uniforms, const std::vector<DrawI
     // Récupère les téléversements asynchrones terminés (fences pollées, non bloquant) :
     // libère les staging buffers et marque les maillages prêts à dessiner.
     transfer_.poll();
+    // Puis écrit le set 1 des matériaux dont les textures viennent d'arriver.
+    update_pending_materials();
 
     vkWaitForFences(dev, 1, &in_flight_[current_frame_], VK_TRUE, UINT64_MAX);
 
@@ -1780,8 +1892,10 @@ void Renderer::shutdown() {
     }
     pending_deletes_.clear();
 
-    // Textures / matériaux (M7 étape 3) : on libère les descriptor sets tant que le
-    // pool est vivant, puis vues + images, puis pool / layout / sampler / pipeline.
+    // Textures / matériaux : les descriptor sets des matériaux partent avec leur pool
+    // (pas besoin de les libérer un par un), puis vues + images des textures.
+    materials_.clear();
+    pending_material_deletes_.clear();
     for (auto& [id, tex] : textures_) {
         free_texture(tex);
     }
@@ -1798,13 +1912,13 @@ void Renderer::shutdown() {
         vkDestroyPipelineLayout(dev, textured_pipeline_layout_, nullptr);
         textured_pipeline_layout_ = VK_NULL_HANDLE;
     }
-    if (texture_pool_ != VK_NULL_HANDLE) {
-        vkDestroyDescriptorPool(dev, texture_pool_, nullptr);
-        texture_pool_ = VK_NULL_HANDLE;
+    if (material_pool_ != VK_NULL_HANDLE) {
+        vkDestroyDescriptorPool(dev, material_pool_, nullptr);  // libère aussi les sets
+        material_pool_ = VK_NULL_HANDLE;
     }
-    if (texture_set_layout_ != VK_NULL_HANDLE) {
-        vkDestroyDescriptorSetLayout(dev, texture_set_layout_, nullptr);
-        texture_set_layout_ = VK_NULL_HANDLE;
+    if (material_set_layout_ != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(dev, material_set_layout_, nullptr);
+        material_set_layout_ = VK_NULL_HANDLE;
     }
     if (sampler_ != VK_NULL_HANDLE) {
         vkDestroySampler(dev, sampler_, nullptr);

@@ -77,16 +77,23 @@ constexpr float kGroundHalfExtent = 2500.0f;
 constexpr float kGroundUvPeriod = 20.0f;
 constexpr std::uint32_t kGroundTextureSize = 256;
 
+// Gris acier des rails : porté par le base_color_factor de leur matériau (M8 étape 3),
+// là où c'était une couleur par sommet avant. Valeur LINÉAIRE.
+constexpr glm::vec3 kRailColor{0.55f, 0.57f, 0.62f};
+
 void make_ground_plane(std::vector<render::MeshVertex>& vertices,
                        std::vector<std::uint32_t>& indices) {
     const float e = kGroundHalfExtent;
     const float t = e / kGroundUvPeriod;
     const glm::vec3 up{0.0f, 1.0f, 0.0f};
+    // u croît selon +x, v selon +z. La bitangente reconstruite par cross(N,T)*w doit
+    // donc pointer vers +z : cross(up, +x) = -z, d'où w = -1.
+    const glm::vec4 tangent{1.0f, 0.0f, 0.0f, -1.0f};
     vertices = {
-        render::MeshVertex{{-e, 0.0f, -e}, up, {-t, -t}},
-        render::MeshVertex{{e, 0.0f, -e}, up, {t, -t}},
-        render::MeshVertex{{e, 0.0f, e}, up, {t, t}},
-        render::MeshVertex{{-e, 0.0f, e}, up, {-t, t}},
+        render::MeshVertex{{-e, 0.0f, -e}, up, {-t, -t}, tangent},
+        render::MeshVertex{{e, 0.0f, -e}, up, {t, -t}, tangent},
+        render::MeshVertex{{e, 0.0f, e}, up, {t, t}, tangent},
+        render::MeshVertex{{-e, 0.0f, e}, up, {-t, t}, tangent},
     };
     indices = {0, 1, 2, 2, 3, 0};
 }
@@ -196,6 +203,9 @@ struct Application::Impl {
     // Sol : plan solide texturé (M8 étape 2), il reçoit l'ombre portée du train.
     render::MeshId ground_mesh = 0;
     render::TextureId ground_texture = 0;
+    render::MaterialId ground_material = 0;
+    // Voie : un seul matériau partagé par toutes les tuiles (acier, sans texture).
+    render::MaterialId rail_material = 0;
 
     // Cubes de debug M4, dessinés uniquement en fallback / pendant le chargement.
     render::MeshId bogie_mesh = 0;
@@ -249,6 +259,19 @@ struct Application::Impl {
         const std::vector<unsigned char> ground_pixels = make_ground_pixels(kGroundTextureSize);
         ground_texture =
             renderer.create_texture(kGroundTextureSize, kGroundTextureSize, ground_pixels.data());
+        render::MaterialDesc ground_desc;
+        ground_desc.base_color = ground_texture;
+        ground_desc.metallic_factor = 0.0f;   // terre/herbe : diélectrique
+        ground_desc.roughness_factor = 0.95f;  // totalement mat
+        ground_material = renderer.create_material(ground_desc);
+
+        // Voie : pas de texture, la couleur vient du seul base_color_factor (le secours
+        // blanc 1x1 le laisse passer tel quel). Acier => metallic 1.
+        render::MaterialDesc rail_desc;
+        rail_desc.base_color_factor = glm::vec4(kRailColor, 1.0f);
+        rail_desc.metallic_factor = 1.0f;
+        rail_desc.roughness_factor = 0.35f;  // poli par le passage des roues
+        rail_material = renderer.create_material(rail_desc);
 
         bogie_mesh = renderer.create_mesh(make_box_vertices(glm::vec3(0.85f, 0.15f, 0.15f)),
                                           render::Topology::Triangles);
@@ -438,11 +461,12 @@ struct Application::Impl {
         const WorldPosition ground_center(std::floor(wp.x / gs) * gs, wp.y - 3.0,
                                           std::floor(wp.z / gs) * gs);
         items.push_back(
-            render::DrawItem{camera.relative_model(ground_center), ground_mesh, ground_texture});
+            render::DrawItem{camera.relative_model(ground_center), ground_mesh, ground_material});
 
-        // Rails streamés (une origine par tuile).
+        // Rails streamés (une origine par tuile), tous sur le même matériau acier.
         for (const scene::ChunkRenderInfo& chunk : streamer.renderables()) {
-            items.push_back(render::DrawItem{camera.relative_model(chunk.origin), chunk.mesh});
+            items.push_back(
+                render::DrawItem{camera.relative_model(chunk.origin), chunk.mesh, rail_material});
         }
 
         // Locomotive (M7 finalisé) : dès que le modèle .glb est chargé, il remplace les
@@ -454,8 +478,8 @@ struct Application::Impl {
             const glm::mat4 loco =
                 camera.relative_model(wagon.body_position()) * wagon.body_orientation();
             for (const resource::Model::Primitive& prim : train_model->primitives) {
-                const render::TextureId tex = prim.texture ? prim.texture->id : 0;
-                items.push_back(render::DrawItem{loco, prim.mesh, tex});
+                const render::MaterialId mat = prim.material ? prim.material->id : 0;
+                items.push_back(render::DrawItem{loco, prim.mesh, mat});
             }
         } else {
             // Fallback / pendant le chargement : cubes de debug M4 (2 bogies + caisse),

@@ -30,12 +30,19 @@ struct Texture {
     render::TextureId id = 0;
 };
 
-// Enregistrement d'un modèle : une ou plusieurs primitives (mesh + texture). `ready`
+// Enregistrement d'un matériau GPU (M8 étape 3) : son identifiant côté renderer + les
+// handles de ses textures, qu'il maintient vivantes tant que le matériau existe.
+struct Material {
+    render::MaterialId id = 0;
+    std::vector<std::shared_ptr<Texture>> textures;
+};
+
+// Enregistrement d'un modèle : une ou plusieurs primitives (mesh + matériau). `ready`
 // passe à true quand TOUTES les ressources GPU du modèle sont téléversées.
 struct Model {
     struct Primitive {
         render::MeshId mesh = 0;
-        std::shared_ptr<Texture> texture;  // nul => texture de secours côté renderer
+        std::shared_ptr<Material> material;  // nul => matériau par défaut côté renderer
     };
     std::vector<Primitive> primitives;
     bool ready = false;
@@ -53,6 +60,7 @@ struct AudioClip {
 
 using ModelHandle = std::shared_ptr<Model>;
 using TextureHandle = std::shared_ptr<Texture>;
+using MaterialHandle = std::shared_ptr<Material>;
 using AudioHandle = std::shared_ptr<AudioClip>;
 
 // Gestionnaire de ressources centralisé (M7 étape 4).
@@ -95,10 +103,12 @@ private:
         std::mutex mutex;
         std::vector<render::MeshId> meshes;
         std::vector<render::TextureId> textures;
+        std::vector<render::MaterialId> materials;
     };
 
     ModelHandle make_model_handle();
     TextureHandle make_texture_handle();
+    MaterialHandle make_material_handle();
     void drain_recycler();
     void pump_textures(int& budget);
     void pump_models(int& budget);

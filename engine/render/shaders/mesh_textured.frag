@@ -17,12 +17,24 @@ layout(set = 0, binding = 0) uniform GlobalUBO {
 // résultats de comparaison (PCF 2x2 gratuit).
 layout(set = 0, binding = 1) uniform sampler2DShadow shadowMaps[2];
 
-// set = 1 : matériau. Combined image sampler, propre à chaque DrawItem.
-layout(set = 1, binding = 0) uniform sampler2D baseColor;
+// set = 1 : LE MATÉRIAU (glTF metallic-roughness), propre à chaque DrawItem.
+// metallicRoughness et normalMap sont branchés et prêts ; ils ne seront consommés
+// qu'à l'étape 4 (BRDF + normal mapping) — ici seul l'albédo est utilisé.
+layout(set = 1, binding = 0) uniform sampler2D baseColorMap;
+layout(set = 1, binding = 1) uniform sampler2D metallicRoughnessMap;
+layout(set = 1, binding = 2) uniform sampler2D normalMap;
+
+// Miroir exact de TexturedPushConstants (renderer.cpp) : cf. mesh_textured.vert.
+layout(push_constant) uniform PushConstants {
+    mat4 model;
+    vec4 baseColorFactor;
+    vec4 pbrFactors;  // x = metallic, y = roughness, z = normalScale
+} object;
 
 layout(location = 0) in vec2 fragUV;
 layout(location = 1) in vec3 cameraRelPos;
 layout(location = 2) in vec3 fragNormal;
+layout(location = 3) in vec4 fragTangent;
 
 layout(location = 0) out vec4 outColor;
 
@@ -67,7 +79,9 @@ float sunShadow(vec3 rel, float viewDepth) {
 }
 
 void main() {
-    vec3 albedo = texture(baseColor, fragUV).rgb;
+    // Albédo = texture de base * facteur (convention glTF). Sans texture, le secours
+    // blanc 1x1 laisse le facteur seul décider (ex. le gris acier des rails).
+    vec3 albedo = texture(baseColorMap, fragUV).rgb * object.baseColorFactor.rgb;
 
     // Éclairage directionnel : le soleil vient de l'UBO — même direction que celle
     // qui cadre les cascades d'ombre.
