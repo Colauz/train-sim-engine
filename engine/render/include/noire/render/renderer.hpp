@@ -44,6 +44,10 @@ struct FrameUniforms {
     // xyz = direction VERS le soleil (normalisée, espace monde). Cadre les cascades
     // d'ombre ET éclaire les modèles : une seule source de vérité pour le soleil.
     glm::vec4 sun_direction{-0.4f, 0.8f, 0.3f, 0.0f};
+    // rgb = couleur/intensité du soleil (espace LINÉAIRE : la swapchain est SRGB,
+    // la conversion est faite par le matériel). a = intensité de l'ambiante ciel,
+    // dont la teinte est celle du brouillard (= couleur du ciel).
+    glm::vec4 sun_color{1.0f, 0.98f, 0.94f, 0.30f};
 };
 
 // Un objet à dessiner : sa matrice Model (déjà relative à la caméra, en float),
@@ -164,6 +168,7 @@ private:
     // Ombres (M8 étape 1) : passe depth-only du soleil, une par cascade.
     bool create_shadow_render_pass();
     bool create_shadow_resources();        // images + vues + framebuffers des cascades
+    bool create_shadow_sampler();          // sampler COMPARATIF (PCF matériel)
     bool create_shadow_pipeline_layout();  // push constant : lightViewProj * model
     bool create_shadow_pipelines();
     VkPipeline build_shadow_pipeline(std::uint32_t vertex_stride);
@@ -209,6 +214,7 @@ private:
     // Passe depth-only rendue AVANT la passe principale. Deux pipelines car les deux
     // formats de sommet ont la position à l'offset 0 mais des strides différents.
     VkRenderPass shadow_render_pass_ = VK_NULL_HANDLE;
+    VkSampler shadow_sampler_ = VK_NULL_HANDLE;  // comparatif : lié au set 0, binding 1
     VkPipelineLayout shadow_pipeline_layout_ = VK_NULL_HANDLE;
     VkPipeline shadow_pipeline_mesh_ = VK_NULL_HANDLE;    // MeshVertex (modèles indexés)
     VkPipeline shadow_pipeline_legacy_ = VK_NULL_HANDLE;  // Vertex (rails, géométrie debug)

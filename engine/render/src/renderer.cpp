@@ -34,6 +34,7 @@ struct GpuFrameUniforms {
     glm::vec4 fog_color_density;
     glm::vec4 params;
     glm::vec4 sun_direction;
+    glm::vec4 sun_color;
     glm::mat4 light_view_proj[kShadowCascades];
     glm::vec4 cascade_splits;  // x,y = distance de fin de chaque cascade
 };
@@ -80,16 +81,20 @@ bool Renderer::initialize(const RendererCreateInfo& info) {
 
     if (!create_render_pass() || !create_descriptor_set_layout() || !create_pipeline_layout() ||
         !create_pipelines() || !create_depth_resources() || !create_framebuffers() ||
-        !create_command_objects() || !create_sync_objects() || !create_uniform_buffers() ||
-        !create_descriptor_sets()) {
+        !create_command_objects() || !create_sync_objects()) {
         return false;
     }
 
-    // Ombres du soleil (M8 étape 1) : passe depth-only + cascades. Leur taille est
-    // fixe (kShadowMapSize) => indépendantes de la swapchain, donc créées une seule
-    // fois et jamais recréées au redimensionnement.
-    if (!create_shadow_render_pass() || !create_shadow_resources() ||
+    // Ombres du soleil (M8) : passe depth-only + cascades. Leur taille est fixe
+    // (kShadowMapSize) => indépendantes de la swapchain, donc créées une seule fois et
+    // jamais recréées au redimensionnement. AVANT les descriptor sets, qui référencent
+    // les vues des cascades et le sampler comparatif (set 0, binding 1).
+    if (!create_shadow_render_pass() || !create_shadow_resources() || !create_shadow_sampler() ||
         !create_shadow_pipeline_layout() || !create_shadow_pipelines()) {
+        return false;
+    }
+
+    if (!create_uniform_buffers() || !create_descriptor_sets()) {
         return false;
     }
 
@@ -324,17 +329,26 @@ bool Renderer::create_render_pass() {
 }
 
 bool Renderer::create_descriptor_set_layout() {
-    VkDescriptorSetLayoutBinding ubo_binding{};
-    ubo_binding.binding = 0;
-    ubo_binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    ubo_binding.descriptorCount = 1;
+    std::array<VkDescriptorSetLayoutBinding, 2> bindings{};
+    bindings[0].binding = 0;
+    bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    bindings[0].descriptorCount = 1;
     // Lu par le vertex ET le fragment (météo : wetness + brouillard côté frag).
-    ubo_binding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    bindings[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+
+    // Cascades d'ombre (M8 étape 2) : un tableau de kShadowCascades samplers
+    // comparatifs. Le pipeline debug (mesh.frag) n'en déclare aucun — un shader n'est
+    // pas tenu d'utiliser tous les bindings de son layout, et les deux pipelines
+    // partagent ce set 0.
+    bindings[1].binding = 1;
+    bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[1].descriptorCount = kShadowCascades;
+    bindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 
     VkDescriptorSetLayoutCreateInfo layout_info{};
     layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layout_info.bindingCount = 1;
-    layout_info.pBindings = &ubo_binding;
+    layout_info.bindingCount = static_cast<std::uint32_t>(bindings.size());
+    layout_info.pBindings = bindings.data();
 
     if (vkCreateDescriptorSetLayout(context_.device(), &layout_info, nullptr,
                                     &descriptor_set_layout_) != VK_SUCCESS) {
@@ -633,14 +647,17 @@ bool Renderer::create_uniform_buffers() {
 }
 
 bool Renderer::create_descriptor_sets() {
-    VkDescriptorPoolSize pool_size{};
-    pool_size.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    pool_size.descriptorCount = kFramesInFlight;
+    std::array<VkDescriptorPoolSize, 2> pool_sizes{};
+    pool_sizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    pool_sizes[0].descriptorCount = kFramesInFlight;
+    // Les cascades d'ombre : kShadowCascades samplers par frame en vol.
+    pool_sizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    pool_sizes[1].descriptorCount = kFramesInFlight * kShadowCascades;
 
     VkDescriptorPoolCreateInfo pool_info{};
     pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    pool_info.poolSizeCount = 1;
-    pool_info.pPoolSizes = &pool_size;
+    pool_info.poolSizeCount = static_cast<std::uint32_t>(pool_sizes.size());
+    pool_info.pPoolSizes = pool_sizes.data();
     pool_info.maxSets = kFramesInFlight;
     if (vkCreateDescriptorPool(context_.device(), &pool_info, nullptr, &descriptor_pool_) !=
         VK_SUCCESS) {
@@ -661,20 +678,41 @@ bool Renderer::create_descriptor_sets() {
         return false;
     }
 
+    // Les shadow maps sont UNIQUES (pas une par frame en vol) : la render pass d'ombre
+    // porte déjà la dépendance qui empêche la frame N d'écraser la carte pendant que la
+    // frame N-1 la lit encore. Les descripteurs sont donc écrits une fois pour toutes.
+    std::array<VkDescriptorImageInfo, kShadowCascades> shadow_infos{};
+    for (std::size_t c = 0; c < kShadowCascades; ++c) {
+        shadow_infos[c].sampler = shadow_sampler_;
+        shadow_infos[c].imageView = shadow_cascades_[c].view;
+        // Layout atteint à la fin de chaque passe d'ombre, donc avant tout
+        // échantillonnage par la passe principale.
+        shadow_infos[c].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }
+
     for (int i = 0; i < kFramesInFlight; ++i) {
         VkDescriptorBufferInfo buffer_info{};
         buffer_info.buffer = uniform_buffers_[static_cast<std::size_t>(i)].buffer;
         buffer_info.offset = 0;
         buffer_info.range = sizeof(GpuFrameUniforms);
 
-        VkWriteDescriptorSet write{};
-        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        write.dstSet = descriptor_sets_[static_cast<std::size_t>(i)];
-        write.dstBinding = 0;
-        write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        write.descriptorCount = 1;
-        write.pBufferInfo = &buffer_info;
-        vkUpdateDescriptorSets(context_.device(), 1, &write, 0, nullptr);
+        std::array<VkWriteDescriptorSet, 2> writes{};
+        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[0].dstSet = descriptor_sets_[static_cast<std::size_t>(i)];
+        writes[0].dstBinding = 0;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        writes[0].descriptorCount = 1;
+        writes[0].pBufferInfo = &buffer_info;
+
+        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[1].dstSet = descriptor_sets_[static_cast<std::size_t>(i)];
+        writes[1].dstBinding = 1;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[1].descriptorCount = static_cast<std::uint32_t>(shadow_infos.size());
+        writes[1].pImageInfo = shadow_infos.data();
+
+        vkUpdateDescriptorSets(context_.device(), static_cast<std::uint32_t>(writes.size()),
+                               writes.data(), 0, nullptr);
     }
     return true;
 }
@@ -778,6 +816,35 @@ bool Renderer::create_shadow_resources() {
             log::error("Vulkan : création du framebuffer d'une shadow map échouée");
             return false;
         }
+    }
+    return true;
+}
+
+bool Renderer::create_shadow_sampler() {
+    VkSamplerCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    // compareEnable + filtrage LINEAR => le matériel compare la profondeur PUIS
+    // interpole les 4 résultats booléens : un PCF 2x2 gratuit. Combiné à la grille
+    // 3x3 du shader, on obtient un adoucissement 6x6 effectif.
+    info.compareEnable = VK_TRUE;
+    info.compareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+    info.magFilter = VK_FILTER_LINEAR;
+    info.minFilter = VK_FILTER_LINEAR;
+    info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;  // pas de mipmaps sur une depth map
+    // Hors de la cascade : bordure blanche (profondeur 1.0) => la comparaison passe
+    // toujours => pas d'ombre. Sans ça, le mode REPEAT ferait réapparaître l'ombre
+    // du train répétée à l'infini sur le sol.
+    info.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    info.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    info.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
+    info.minLod = 0.0f;
+    info.maxLod = 0.0f;
+    info.anisotropyEnable = VK_FALSE;  // sans objet pour une comparaison de profondeur
+    info.maxAnisotropy = 1.0f;
+    if (vkCreateSampler(context_.device(), &info, nullptr, &shadow_sampler_) != VK_SUCCESS) {
+        log::error("Vulkan : création du sampler comparatif d'ombre échouée");
+        return false;
     }
     return true;
 }
@@ -1611,6 +1678,7 @@ void Renderer::draw_frame(const FrameUniforms& uniforms, const std::vector<DrawI
     gpu.fog_color_density = uniforms.fog_color_density;
     gpu.params = uniforms.params;
     gpu.sun_direction = uniforms.sun_direction;
+    gpu.sun_color = uniforms.sun_color;
     for (std::uint32_t i = 0; i < kShadowCascades; ++i) {
         gpu.light_view_proj[i] = shadow_cascades_[i].light_view_proj;
         gpu.cascade_splits[static_cast<glm::length_t>(i)] = shadow_cascades_[i].split_depth;
@@ -1743,8 +1811,12 @@ void Renderer::shutdown() {
         sampler_ = VK_NULL_HANDLE;
     }
 
-    // Ombres (M8 étape 1) : framebuffers/vues/images, puis pipelines, layout, passe.
+    // Ombres (M8) : framebuffers/vues/images, puis sampler, pipelines, layout, passe.
     destroy_shadow_resources();
+    if (shadow_sampler_ != VK_NULL_HANDLE) {
+        vkDestroySampler(dev, shadow_sampler_, nullptr);
+        shadow_sampler_ = VK_NULL_HANDLE;
+    }
     if (shadow_pipeline_mesh_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(dev, shadow_pipeline_mesh_, nullptr);
         shadow_pipeline_mesh_ = VK_NULL_HANDLE;

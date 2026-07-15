@@ -1,7 +1,9 @@
 #include "noire/app/application.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <utility>
 #include <vector>
 
@@ -62,18 +64,90 @@ std::vector<render::Vertex> make_box_vertices(const glm::vec3& base_color) {
     return vertices;
 }
 
-std::vector<render::Vertex> make_grid_vertices(int half_lines, float step) {
-    const glm::vec3 gray{0.18f, 0.18f, 0.21f};
-    const float extent = static_cast<float>(half_lines) * step;
-    std::vector<render::Vertex> vertices;
-    for (int i = -half_lines; i <= half_lines; ++i) {
-        const float t = static_cast<float>(i) * step;
-        vertices.push_back(render::Vertex{{t, 0.0f, -extent}, gray});
-        vertices.push_back(render::Vertex{{t, 0.0f, extent}, gray});
-        vertices.push_back(render::Vertex{{-extent, 0.0f, t}, gray});
-        vertices.push_back(render::Vertex{{extent, 0.0f, t}, gray});
+// --- Sol (M8 étape 2) -------------------------------------------------------
+// Grand plan solide texturé, qui remplace la grille filaire du M2 : c'est lui qui
+// reçoit l'ombre portée du train.
+
+// Doit couvrir le plan lointain de la caméra (2000 m) dans toutes les directions.
+constexpr float kGroundHalfExtent = 2500.0f;
+// Période de répétition de la texture, en mètres. Volontairement grande : le sampler
+// n'a PAS de mipmaps (maxLod = 0 depuis le M7), donc une texture à haute fréquence
+// spatiale grouillerait au loin. C'est aussi le pas de recentrage du sol, pour que
+// les UV ne glissent pas sous le train.
+constexpr float kGroundUvPeriod = 20.0f;
+constexpr std::uint32_t kGroundTextureSize = 256;
+
+void make_ground_plane(std::vector<render::MeshVertex>& vertices,
+                       std::vector<std::uint32_t>& indices) {
+    const float e = kGroundHalfExtent;
+    const float t = e / kGroundUvPeriod;
+    const glm::vec3 up{0.0f, 1.0f, 0.0f};
+    vertices = {
+        render::MeshVertex{{-e, 0.0f, -e}, up, {-t, -t}},
+        render::MeshVertex{{e, 0.0f, -e}, up, {t, -t}},
+        render::MeshVertex{{e, 0.0f, e}, up, {t, t}},
+        render::MeshVertex{{-e, 0.0f, e}, up, {-t, t}},
+    };
+    indices = {0, 1, 2, 2, 3, 0};
+}
+
+std::uint32_t hash_u32(std::uint32_t x) {
+    x ^= x >> 16;
+    x *= 0x7feb352dU;
+    x ^= x >> 15;
+    x *= 0x846ca68bU;
+    x ^= x >> 16;
+    return x;
+}
+
+float hash_unit(std::uint32_t x, std::uint32_t y) {
+    return static_cast<float>(hash_u32(x * 374761393U + y * 668265263U)) /
+           static_cast<float>(0xffffffffU);
+}
+
+// Bruit de valeur lissé et RACCORDABLE (indices modulo `cells`) : la texture étant
+// répétée sur tout le sol, une couture serait visible à chaque période.
+float value_noise(float u, float v, std::uint32_t cells) {
+    const float sx = u * static_cast<float>(cells);
+    const float sy = v * static_cast<float>(cells);
+    const auto ix = static_cast<std::uint32_t>(sx);
+    const auto iy = static_cast<std::uint32_t>(sy);
+    const float tx = sx - static_cast<float>(ix);
+    const float ty = sy - static_cast<float>(iy);
+    const float ux = tx * tx * (3.0f - 2.0f * tx);  // lissage cubique (pas d'arêtes)
+    const float uy = ty * ty * (3.0f - 2.0f * ty);
+    const float a = hash_unit(ix % cells, iy % cells);
+    const float b = hash_unit((ix + 1) % cells, iy % cells);
+    const float c = hash_unit(ix % cells, (iy + 1) % cells);
+    const float d = hash_unit((ix + 1) % cells, (iy + 1) % cells);
+    return glm::mix(glm::mix(a, b, ux), glm::mix(c, d, ux), uy);
+}
+
+unsigned char to_srgb_byte(float v) {
+    return static_cast<unsigned char>(std::clamp(v, 0.0f, 1.0f) * 255.0f + 0.5f);
+}
+
+// Sol herbeux/terreux : 2 octaves de bruit lissé, généré à la volée (aucun asset).
+// La texture est RGBA8 SRGB => les octets écrits ici sont des valeurs sRGB, que le
+// matériel reconvertit en linéaire à l'échantillonnage.
+std::vector<unsigned char> make_ground_pixels(std::uint32_t size) {
+    std::vector<unsigned char> pixels(static_cast<std::size_t>(size) * size * 4u);
+    const glm::vec3 dark{0.42f, 0.46f, 0.30f};
+    const glm::vec3 light{0.60f, 0.64f, 0.44f};
+    for (std::uint32_t y = 0; y < size; ++y) {
+        for (std::uint32_t x = 0; x < size; ++x) {
+            const float u = (static_cast<float>(x) + 0.5f) / static_cast<float>(size);
+            const float v = (static_cast<float>(y) + 0.5f) / static_cast<float>(size);
+            const float n = 0.65f * value_noise(u, v, 4) + 0.35f * value_noise(u, v, 16);
+            const glm::vec3 c = glm::mix(dark, light, n);
+            const std::size_t o = (static_cast<std::size_t>(y) * size + x) * 4u;
+            pixels[o + 0] = to_srgb_byte(c.r);
+            pixels[o + 1] = to_srgb_byte(c.g);
+            pixels[o + 2] = to_srgb_byte(c.b);
+            pixels[o + 3] = 255;
+        }
     }
-    return vertices;
+    return pixels;
 }
 
 }  // namespace
@@ -119,8 +193,11 @@ struct Application::Impl {
     resource::AudioHandle rumble_clip;
     bool rumble_source_applied = false;
 
+    // Sol : plan solide texturé (M8 étape 2), il reçoit l'ombre portée du train.
+    render::MeshId ground_mesh = 0;
+    render::TextureId ground_texture = 0;
+
     // Cubes de debug M4, dessinés uniquement en fallback / pendant le chargement.
-    render::MeshId grid_mesh = 0;
     render::MeshId bogie_mesh = 0;
     render::MeshId body_mesh = 0;
 
@@ -163,7 +240,16 @@ struct Application::Impl {
         jobs.start(2);
         audio.initialize();  // non fatal : no-op si aucun périphérique audio
 
-        grid_mesh = renderer.create_mesh(make_grid_vertices(80, 5.0f), render::Topology::Lines);
+        // Sol : maillage indexé MeshVertex (pipeline texturé => il reçoit les ombres)
+        // + sa texture générée à la volée. Les deux montent en GPU de façon asynchrone.
+        std::vector<render::MeshVertex> ground_vertices;
+        std::vector<std::uint32_t> ground_indices;
+        make_ground_plane(ground_vertices, ground_indices);
+        ground_mesh = renderer.create_mesh_indexed(ground_vertices, ground_indices);
+        const std::vector<unsigned char> ground_pixels = make_ground_pixels(kGroundTextureSize);
+        ground_texture =
+            renderer.create_texture(kGroundTextureSize, kGroundTextureSize, ground_pixels.data());
+
         bogie_mesh = renderer.create_mesh(make_box_vertices(glm::vec3(0.85f, 0.15f, 0.15f)),
                                           render::Topology::Triangles);
         body_mesh = renderer.create_mesh(make_box_vertices(glm::vec3(0.20f, 0.38f, 0.58f)),
@@ -319,24 +405,40 @@ struct Application::Impl {
         render::FrameUniforms uniforms;
         uniforms.view = camera.view_matrix();
         uniforms.proj = camera.projection_matrix(aspect);
-        const glm::vec3 fog_dry(0.02f, 0.03f, 0.06f);
+        // Ciel : « plein jour franc » au sec (bleu lumineux), gris de pluie au mouillé.
+        // Ces valeurs sont LINÉAIRES (la swapchain est SRGB : le matériel encode).
+        // Cette couleur sert au fond, au brouillard ET de teinte à l'ambiante (c'est
+        // la lumière du ciel).
+        const glm::vec3 fog_dry(0.28f, 0.45f, 0.78f);
         const glm::vec3 fog_wet(0.55f, 0.57f, 0.60f);
         const glm::vec3 fog_color = glm::mix(fog_dry, fog_wet, wetness);
         const float fog_density = glm::mix(0.0006f, 0.010f, wetness);
         uniforms.fog_color_density = glm::vec4(fog_color, fog_density);
         uniforms.params = glm::vec4(wetness, 0.0f, 0.0f, 0.0f);
+
         // Soleil : direction VERS l'astre. Une seule source de vérité — elle éclaire
-        // les modèles et cadre les cascades d'ombre.
-        uniforms.sun_direction = glm::vec4(glm::normalize(glm::vec3(-0.4f, 0.8f, 0.3f)), 0.0f);
+        // les modèles et cadre les cascades d'ombre. Plein jour franc, ~50° de hauteur :
+        // assez haut pour la lumière, assez bas pour que l'ombre s'étire visiblement.
+        // Volontairement LATÉRAL : dans l'axe de la caméra, l'ombre se cacherait sous
+        // la loco (soleil devant) ou derrière elle (soleil derrière).
+        uniforms.sun_direction = glm::vec4(glm::normalize(glm::vec3(-0.18f, 0.77f, 0.61f)), 0.0f);
+        // Franc et à peine chaud au sec ; la pluie l'écrase et fait monter l'ambiante
+        // (ciel couvert = lumière diffuse, ombres délavées).
+        const glm::vec3 sun_dry(1.05f, 1.00f, 0.92f);
+        const glm::vec3 sun_wet(0.35f, 0.36f, 0.38f);
+        uniforms.sun_color = glm::vec4(glm::mix(sun_dry, sun_wet, wetness),
+                                       glm::mix(0.40f, 0.75f, wetness));
 
         std::vector<render::DrawItem> items;
 
-        // Sol infini (recentré sous le train).
+        // Sol : plan solide recentré sous le train. Le pas de recentrage est la période
+        // UV, donc la texture reste parfaitement fixe dans le monde (elle ne glisse pas).
         const WorldPosition wp = wagon.body_position();
-        const double gs = 5.0;
-        const WorldPosition grid_center(std::floor(wp.x / gs) * gs, wp.y - 3.0,
-                                        std::floor(wp.z / gs) * gs);
-        items.push_back(render::DrawItem{camera.relative_model(grid_center), grid_mesh});
+        const double gs = static_cast<double>(kGroundUvPeriod);
+        const WorldPosition ground_center(std::floor(wp.x / gs) * gs, wp.y - 3.0,
+                                          std::floor(wp.z / gs) * gs);
+        items.push_back(
+            render::DrawItem{camera.relative_model(ground_center), ground_mesh, ground_texture});
 
         // Rails streamés (une origine par tuile).
         for (const scene::ChunkRenderInfo& chunk : streamer.renderables()) {
