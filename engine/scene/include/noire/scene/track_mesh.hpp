@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "noire/core/math.hpp"
+#include "noire/core/terrain.hpp"
 #include "noire/core/track_source.hpp"
 #include "noire/render/vertex.hpp"
 
@@ -60,12 +61,13 @@ struct RailProfile {
     // le ballast flotte ou s'enterre au gré des collines. L'accotement est le remblai qui
     // descend du pied du ballast jusqu'au sol — exactement ce que fait une vraie ligne.
     //
-    // `ground_level` est une altitude ABSOLUE (monde), calée sous le POINT LE PLUS BAS de
-    // la spline : la voie est donc toujours EN REMBLAI, jamais en tranchée. C'est
-    // volontaire — une tranchée exigerait de percer un trou dans le plan de sol, ce qu'un
-    // simple quad ne sait pas faire.
-    double ground_level = -6.8;    // = -(amplitude verticale de la voie) - 0.8
-    float shoulder_half = 22.0f;   // 12 m de dénivelé max sur ~19 m => pente ~1:1.6, réaliste
+    // Depuis le M11, le point extérieur de l'accotement se cale sur le TERRAIN réel
+    // (Terrain::height), plus sur une altitude figée. Le terrain étant lui-même aplani
+    // dans le corridor ferroviaire, les deux se raccordent PAR CONSTRUCTION : c'est la
+    // même fonction des deux côtés, il n'y a rien à synchroniser. Ça libère aussi la voie
+    // de la contrainte M9 « toujours en remblai » — elle peut enfin entrer en tranchée,
+    // puisque c'est le terrain qui se creuse.
+    float shoulder_half = 22.0f;   // largeur de l'accotement, de l'axe vers l'extérieur
 };
 
 // Un sous-maillage : sommets PBR + indices, prêts pour create_mesh_indexed.
@@ -89,8 +91,9 @@ struct TrackMeshData {
 // traverses et lit de ballast. Sommets exprimés RELATIVEMENT à `origin` (float) =>
 // compatible origine flottante, chaque tuile ayant la sienne. Fonction PURE (aucun état,
 // aucune API GPU) => appelable depuis un worker du JobSystem.
-[[nodiscard]] TrackMeshData generate_track_mesh(const TrackSource& track, double x_start,
-                                                double x_end, const WorldPosition& origin,
+[[nodiscard]] TrackMeshData generate_track_mesh(const TrackSource& track, const Terrain& terrain,
+                                                double x_start, double x_end,
+                                                const WorldPosition& origin,
                                                 const RailProfile& profile = {},
                                                 TrackLod lod = TrackLod::Full);
 

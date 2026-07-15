@@ -6,7 +6,8 @@ add_library(noire_core
     src/camera.cpp
     src/spline.cpp
     src/procedural_track.cpp
-    src/job_system.cpp)
+    src/job_system.cpp
+    src/terrain.cpp)
 add_library(noire::core ALIAS noire_core)
 
 target_compile_features(noire_core PUBLIC cxx_std_20)

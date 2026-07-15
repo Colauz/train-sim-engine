@@ -7,8 +7,9 @@
 
 namespace noire::scene {
 
-WorldStreamer::WorldStreamer(const TrackSource& track, JobSystem& jobs, StreamerConfig config)
-    : track_(track), jobs_(jobs), config_(config) {}
+WorldStreamer::WorldStreamer(const TrackSource& track, const Terrain& terrain, JobSystem& jobs,
+                             StreamerConfig config)
+    : track_(track), terrain_(terrain), jobs_(jobs), config_(config) {}
 
 WorldStreamer::~WorldStreamer() = default;
 
@@ -27,7 +28,7 @@ void WorldStreamer::generate_async(Chunk& chunk, TrackLod lod) {
     const WorldPosition origin = chunk.origin;
     const RailProfile profile = config_.rail_profile;
     jobs_.submit([this, raw, x0, x1, origin, profile, lod] {
-        raw->cpu_mesh = generate_track_mesh(track_, x0, x1, origin, profile, lod);
+        raw->cpu_mesh = generate_track_mesh(track_, terrain_, x0, x1, origin, profile, lod);
         // Barrière release : rend visibles les écritures ci-dessus au thread principal.
         raw->state.store(State::CpuReady, std::memory_order_release);
     });

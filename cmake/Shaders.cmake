@@ -23,10 +23,20 @@ message(STATUS "Compilateur de shaders : ${NOIRE_GLSL_COMPILER}")
 
 # noire_add_shaders(<cible> <shader1> <shader2> ...)
 # Chemins des shaders relatifs au CMakeLists.txt appelant.
+#
+# #include : glslc COMME glslangValidator le gèrent nativement via -I (extension
+# GL_GOOGLE_include_directive). Aucun préprocesseur maison n'est donc nécessaire — les
+# shaders incluent depuis `shaders/`, ce qui permet de ne déclarer le bloc GlobalUBO et
+# le coeur PBR QU'UNE FOIS (ils étaient dupliqués dans 5 shaders, et il fallait patcher
+# les 5 à chaque évolution de l'UBO : la divergence n'était qu'une question de temps).
 function(noire_add_shaders target)
     set(_gen_root ${CMAKE_CURRENT_BINARY_DIR}/generated)
     set(_gen_dir  ${_gen_root}/shaders)
     file(MAKE_DIRECTORY ${_gen_dir})
+
+    # Les .glsl inclus ne se compilent pas seuls, mais TOUT shader en dépend : sans ça,
+    # modifier le coeur PBR ne déclencherait aucune recompilation.
+    file(GLOB _includes CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/shaders/common/*.glsl)
 
     foreach(_src IN LISTS ARGN)
         get_filename_component(_name "${_src}" NAME)   # triangle.vert
@@ -34,11 +44,12 @@ function(noire_add_shaders target)
         set(_abs ${CMAKE_CURRENT_SOURCE_DIR}/${_src})
         set(_spv ${CMAKE_CURRENT_BINARY_DIR}/${_name}.spv)
         set(_hdr ${_gen_dir}/${_name}.spv.h)
+        set(_inc_dir ${CMAKE_CURRENT_SOURCE_DIR}/shaders)
 
         if(_noire_glsl_name STREQUAL "glslc")
-            set(_compile_cmd ${NOIRE_GLSL_COMPILER} "${_abs}" -o "${_spv}")
+            set(_compile_cmd ${NOIRE_GLSL_COMPILER} "${_abs}" -I "${_inc_dir}" -o "${_spv}")
         else()  # glslangValidator / glslang
-            set(_compile_cmd ${NOIRE_GLSL_COMPILER} -V "${_abs}" -o "${_spv}")
+            set(_compile_cmd ${NOIRE_GLSL_COMPILER} -V "${_abs}" -I"${_inc_dir}" -o "${_spv}")
         endif()
 
         add_custom_command(
@@ -47,7 +58,7 @@ function(noire_add_shaders target)
             COMMAND ${CMAKE_COMMAND}
                     -DSPV_FILE=${_spv} -DHEADER_FILE=${_hdr} -DVAR_NAME=${_var}_spv
                     -P ${CMAKE_SOURCE_DIR}/cmake/EmbedSpirv.cmake
-            DEPENDS ${_abs} ${CMAKE_SOURCE_DIR}/cmake/EmbedSpirv.cmake
+            DEPENDS ${_abs} ${_includes} ${CMAKE_SOURCE_DIR}/cmake/EmbedSpirv.cmake
             COMMENT "Shader : ${_name} -> SPIR-V embarqué"
             VERBATIM)
 

@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "noire/core/math.hpp"
+#include "noire/core/terrain.hpp"
 #include "noire/core/track_source.hpp"
 #include "noire/render/vertex.hpp"
 #include "noire/scene/track_mesh.hpp"
@@ -54,7 +55,8 @@ struct ChunkRenderInfo {
 //   * un chunk en cours de génération n'est JAMAIS supprimé (le worker écrit dedans).
 class WorldStreamer {
 public:
-    WorldStreamer(const TrackSource& track, JobSystem& jobs, StreamerConfig config = {});
+    WorldStreamer(const TrackSource& track, const Terrain& terrain, JobSystem& jobs,
+                  StreamerConfig config = {});
     ~WorldStreamer();
     WorldStreamer(const WorldStreamer&) = delete;
     WorldStreamer& operator=(const WorldStreamer&) = delete;
@@ -90,6 +92,7 @@ private:
     [[nodiscard]] TrackLod desired_lod(long index, long current) const;
 
     const TrackSource& track_;
+    const Terrain& terrain_;
     JobSystem& jobs_;
     StreamerConfig config_;
     std::unordered_map<long, std::unique_ptr<Chunk>> chunks_;

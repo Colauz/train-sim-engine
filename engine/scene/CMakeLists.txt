@@ -1,6 +1,7 @@
 add_library(noire_scene
     src/track_mesh.cpp
-    src/world_streamer.cpp)
+    src/world_streamer.cpp
+    src/terrain_clipmap.cpp)
 add_library(noire::scene ALIAS noire_scene)
 
 target_include_directories(noire_scene PUBLIC

@@ -15,6 +15,7 @@
 #include "noire/core/log.hpp"
 #include "noire/core/math.hpp"
 #include "noire/core/procedural_track.hpp"
+#include "noire/core/terrain.hpp"
 #include "noire/physics/wagon.hpp"
 #include "noire/platform/window.hpp"
 #include "noire/render/renderer.hpp"
@@ -22,6 +23,7 @@
 #include "noire/resource/asset_paths.hpp"
 #include "noire/resource/resource_manager.hpp"
 #include "noire/scene/track_mesh.hpp"
+#include "noire/scene/terrain_clipmap.hpp"
 #include "noire/scene/world_streamer.hpp"
 
 namespace noire {
@@ -203,8 +205,10 @@ struct Application::Impl {
           window(platform::WindowConfig{config.width, config.height, config.title}),
           engine(EngineConfig{config.simulation_hz, 0}),
           track(kTrackOrigin),
+          terrain(track),
           wagon(make_loco_config()),
-          streamer(track, jobs, make_streamer_config()),
+          streamer(track, terrain, jobs, make_streamer_config()),
+          clipmap(terrain, jobs),
           resources(renderer, jobs, asset_paths) {}
 
     static scene::StreamerConfig make_streamer_config() {
@@ -220,7 +224,6 @@ struct Application::Impl {
         // durerait 22 frames de plus pour rien.
         sc.max_uploads_per_update = 3;
         sc.rail_profile.sample_step = 2.0;
-        sc.rail_profile.ground_level = kTrackOrigin.y + kGroundLevel;
         return sc;
     }
 
@@ -231,9 +234,11 @@ struct Application::Impl {
     Camera camera;
 
     ProceduralTrack track;
+    Terrain terrain;
     JobSystem jobs;
     physics::Wagon wagon;
     scene::WorldStreamer streamer;
+    scene::TerrainClipmap clipmap;
 
     audio::AudioEngine audio;
     audio::RailAudio rail_audio;
@@ -288,7 +293,8 @@ struct Application::Impl {
         return sky_ready_reported &&                    // HDRI chargé ET lié (SH + IBL + skybox)
                train_model && train_model->ready &&     // le gabarit
                ballast_textured &&                      // les 3 cartes du ballast
-               streamer.active_chunk_count() > 0;       // au moins une tuile de voie
+               streamer.active_chunk_count() > 0 &&     // au moins une tuile de voie
+               clipmap.ready();                         // et le relief sous le train
     }
 
     float orbit_yaw = 3.14159f;
@@ -524,6 +530,7 @@ struct Application::Impl {
 
         // Streaming (thread principal), toujours exécuté (même minimisé).
         streamer.update(wagon.chainage(), renderer);
+        clipmap.update(wagon.body_position(), renderer);
 
         const auto size = window.framebuffer_size();
         if (size.width == 0 || size.height == 0) {
@@ -621,15 +628,13 @@ struct Application::Impl {
 
         std::vector<render::DrawItem> items;
 
-        // Sol : plan solide recentré sous le train. Le pas de recentrage est la période
-        // UV, donc la texture reste parfaitement fixe dans le monde (elle ne glisse pas).
-        const WorldPosition wp = wagon.body_position();
-        const double gs = static_cast<double>(kGroundUvPeriod);
-        const WorldPosition ground_center(std::floor(wp.x / gs) * gs,
-                                          kTrackOrigin.y + kGroundLevel,
-                                          std::floor(wp.z / gs) * gs);
-        items.push_back(
-            render::DrawItem{camera.relative_model(ground_center), ground_mesh, ground_material});
+        // Terrain (M11) : geo-clipmap centré sur le train. Il remplace le plan plat, qui
+        // ne pouvait par construction ni onduler ni suivre la voie. UN seul maillage pour
+        // les 7 niveaux => un seul draw call, un seul upload par régénération.
+        if (clipmap.ready()) {
+            items.push_back(render::DrawItem{camera.relative_model(clipmap.origin()),
+                                             clipmap.mesh(), ground_material});
+        }
 
         // Voie streamée (une origine par tuile) : 3 sous-maillages, 3 matériaux (M9).
         for (const scene::ChunkRenderInfo& chunk : streamer.renderables()) {

@@ -192,9 +192,9 @@ std::vector<P2> make_ballast_profile(const RailProfile& p) {
 
 }  // namespace
 
-TrackMeshData generate_track_mesh(const TrackSource& track, double x_start, double x_end,
-                                  const WorldPosition& origin, const RailProfile& profile,
-                                  TrackLod lod) {
+TrackMeshData generate_track_mesh(const TrackSource& track, const Terrain& terrain,
+                                  double x_start, double x_end, const WorldPosition& origin,
+                                  const RailProfile& profile, TrackLod lod) {
     TrackMeshData out;
     const double span = x_end - x_start;
     if (span <= 0.0) {
@@ -255,9 +255,14 @@ TrackMeshData generate_track_mesh(const TrackSource& track, double x_start, doub
             const Frame& f1 = frames[i + 1];
             // t du point extérieur : profondeur du sol SOUS le repère local. On divise par
             // up.y car `up` est incliné par la pente (l'erreur serait sinon de 1 %).
+            // Le point extérieur se cale sur le TERRAIN à sa position monde exacte. On
+            // divise par up.y car `up` est incliné par la pente (erreur de 1 % sinon).
             auto outer_t = [&](const Frame& f) {
-                const double abs_y = origin.y + static_cast<double>(f.center.y);
-                return static_cast<float>((profile.ground_level - abs_y) /
+                const glm::dvec3 world = origin + glm::dvec3(f.center) +
+                                         glm::dvec3(f.right) * static_cast<double>(
+                                             side * profile.shoulder_half);
+                const double ground = terrain.height(world.x, world.z);
+                return static_cast<float>((ground - world.y) /
                                           std::max(static_cast<double>(f.up.y), 1e-3));
             };
             const P2 inner{side * profile.ballast_base_half, profile.ballast_base_y};
