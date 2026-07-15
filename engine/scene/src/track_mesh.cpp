@@ -192,9 +192,9 @@ std::vector<P2> make_ballast_profile(const RailProfile& p) {
 
 }  // namespace
 
-TrackMeshData generate_track_mesh(const TrackSource& track, const Terrain& terrain,
-                                  double x_start, double x_end, const WorldPosition& origin,
-                                  const RailProfile& profile, TrackLod lod) {
+TrackMeshData generate_track_mesh(const TrackSource& track, double x_start, double x_end,
+                                  const WorldPosition& origin, const RailProfile& profile,
+                                  TrackLod lod) {
     TrackMeshData out;
     const double span = x_end - x_start;
     if (span <= 0.0) {
@@ -241,57 +241,6 @@ TrackMeshData generate_track_mesh(const TrackSource& track, const Terrain& terra
     // Gardé aux DEUX niveaux : c'est lui qui dessine le tracé de la ligne dans le
     // paysage, et il ne coûte que 3 arêtes.
     extrude(out.ballast, frames, make_ballast_profile(profile), /*closed=*/false, 0.0f, uv_period);
-
-    // --- Accotement / remblai -------------------------------------------------
-    // Le seul élément dont le profil VARIE le long de la voie : son point extérieur est
-    // calé sur une altitude ABSOLUE (le plan de sol), pas sur la voie. La hauteur du
-    // remblai est donc exactement l'altitude locale de la spline au-dessus du sol — c'est
-    // ce qui raccorde la voie au terrain quelle que soit la colline, sans plus jamais
-    // flotter ni s'enterrer. Gardé aux deux LOD : il ne coûte qu'une arête par côté et
-    // sans lui la voie lointaine « décollerait » du sol.
-    for (std::size_t i = 0; i + 1 < frames.size(); ++i) {
-        for (const float side : {1.0f, -1.0f}) {
-            const Frame& f0 = frames[i];
-            const Frame& f1 = frames[i + 1];
-            // t du point extérieur : profondeur du sol SOUS le repère local. On divise par
-            // up.y car `up` est incliné par la pente (l'erreur serait sinon de 1 %).
-            // Le point extérieur se cale sur le TERRAIN à sa position monde exacte. On
-            // divise par up.y car `up` est incliné par la pente (erreur de 1 % sinon).
-            auto outer_t = [&](const Frame& f) {
-                const glm::dvec3 world = origin + glm::dvec3(f.center) +
-                                         glm::dvec3(f.right) * static_cast<double>(
-                                             side * profile.shoulder_half);
-                const double ground = terrain.height(world.x, world.z);
-                return static_cast<float>((ground - world.y) /
-                                          std::max(static_cast<double>(f.up.y), 1e-3));
-            };
-            const P2 inner{side * profile.ballast_base_half, profile.ballast_base_y};
-            const P2 outer0{side * profile.shoulder_half, outer_t(f0)};
-            const P2 outer1{side * profile.shoulder_half, outer_t(f1)};
-
-            const glm::vec3 a = world_of(f0, inner, 0.0f);
-            const glm::vec3 b = world_of(f1, inner, 0.0f);
-            const glm::vec3 c = world_of(f1, outer1, 0.0f);
-            const glm::vec3 d = world_of(f0, outer0, 0.0f);
-
-            const glm::vec3 tangent = glm::normalize(b - a);
-            glm::vec3 normal = glm::normalize(glm::cross(tangent, d - a));
-            if (normal.y < 0.0f) {
-                normal = -normal;  // un talus se voit du dessus : normale toujours vers le haut
-            }
-            const float w = glm::dot(glm::cross(normal, tangent), d - a) < 0.0f ? -1.0f : 1.0f;
-            const glm::vec4 tangent4(tangent, w);
-            const float v_out = (profile.shoulder_half - profile.ballast_base_half) / uv_period;
-
-            const auto base = static_cast<std::uint32_t>(out.shoulder.vertices.size());
-            out.shoulder.vertices.push_back(render::MeshVertex{a, normal, {f0.u, 0.0f}, tangent4});
-            out.shoulder.vertices.push_back(render::MeshVertex{b, normal, {f1.u, 0.0f}, tangent4});
-            out.shoulder.vertices.push_back(render::MeshVertex{c, normal, {f1.u, v_out}, tangent4});
-            out.shoulder.vertices.push_back(render::MeshVertex{d, normal, {f0.u, v_out}, tangent4});
-            out.shoulder.indices.insert(out.shoulder.indices.end(),
-                                        {base, base + 1, base + 2, base, base + 2, base + 3});
-        }
-    }
 
     // --- Traverses ------------------------------------------------------------
     // ABANDONNÉES au loin : à elles seules, elles pèsent ~80 k sommets par tuile (3333

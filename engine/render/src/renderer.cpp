@@ -18,6 +18,7 @@
 #include "shaders/mesh_textured.vert.spv.h"
 #include "shaders/prefilter_env.comp.spv.h"
 #include "shaders/shadow.vert.spv.h"
+#include "shaders/terrain.frag.spv.h"
 #include "shaders/skybox.frag.spv.h"
 #include "shaders/skybox.vert.spv.h"
 
@@ -136,11 +137,13 @@ bool Renderer::initialize(const RendererCreateInfo& info) {
     // Textures / matériaux : sampler partagé, layout+pool du set 1 (3 textures PBR),
     // pipeline texturé, puis les secours 1x1 et le matériau par défaut.
     if (!create_sampler() || !create_material_descriptor_layout() ||
-        !create_material_descriptor_pool() || !create_textured_pipeline_layout()) {
+        !create_terrain_descriptor_layout() || !create_material_descriptor_pool() ||
+        !create_textured_pipeline_layout() || !create_terrain_pipeline_layout()) {
         return false;
     }
     pipeline_textured_ = build_textured_pipeline();
-    if (pipeline_textured_ == VK_NULL_HANDLE) {
+    pipeline_terrain_ = build_terrain_pipeline();
+    if (pipeline_textured_ == VK_NULL_HANDLE || pipeline_terrain_ == VK_NULL_HANDLE) {
         return false;
     }
     if (!create_default_textures() || !create_default_material() || !create_default_environment()) {
@@ -1262,10 +1265,83 @@ bool Renderer::create_material_descriptor_layout() {
     return true;
 }
 
+bool Renderer::create_terrain_descriptor_layout() {
+    // set 1 du terrain : DEUX jeux PBR (herbe 0-2, craie 3-5). C'est la seule raison
+    // d'être d'un pipeline distinct — le set 1 ordinaire n'a que 3 bindings, et on ne
+    // peut pas lier 6 textures sur 3.
+    std::array<VkDescriptorSetLayoutBinding, kTerrainTextures> bindings{};
+    for (std::uint32_t i = 0; i < kTerrainTextures; ++i) {
+        bindings[i].binding = i;
+        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    info.bindingCount = static_cast<std::uint32_t>(bindings.size());
+    info.pBindings = bindings.data();
+    if (vkCreateDescriptorSetLayout(context_.device(), &info, nullptr, &terrain_set_layout_) !=
+        VK_SUCCESS) {
+        log::error("Vulkan : création du set layout de terrain échouée");
+        return false;
+    }
+    return true;
+}
+
+bool Renderer::create_terrain_pipeline_layout() {
+    // Mêmes sets 0 et 2 et MÊMES push constants que le pipeline texturé : seul le set 1
+    // change. C'est ce qui permet de réutiliser mesh_textured.vert tel quel.
+    VkPushConstantRange push{};
+    push.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    push.offset = 0;
+    push.size = sizeof(TexturedPushConstants);
+    const std::array<VkDescriptorSetLayout, 3> sets{descriptor_set_layout_, terrain_set_layout_,
+                                                    env_set_layout_};
+    VkPipelineLayoutCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    info.setLayoutCount = static_cast<std::uint32_t>(sets.size());
+    info.pSetLayouts = sets.data();
+    info.pushConstantRangeCount = 1;
+    info.pPushConstantRanges = &push;
+    if (vkCreatePipelineLayout(context_.device(), &info, nullptr, &terrain_pipeline_layout_) !=
+        VK_SUCCESS) {
+        log::error("Vulkan : création du pipeline layout de terrain échouée");
+        return false;
+    }
+    return true;
+}
+
+MaterialId Renderer::create_terrain_material(const TerrainMaterialDesc& desc) {
+    Material material;
+    material.textures = {desc.grass_base, desc.grass_metallic_rough, desc.grass_normal,
+                         desc.chalk_base, desc.chalk_metallic_rough, desc.chalk_normal};
+    material.texture_count = kTerrainTextures;
+    material.terrain = true;
+    // Le terrain ne pousse aucun facteur : ses deux jeux portent tout. Les push constants
+    // restent envoyés (même layout) mais terrain.frag ne lit que `model`.
+    material.base_color_factor = glm::vec4(1.0f);
+    material.pbr_factors = glm::vec4(1.0f, 1.0f, 1.0f, 0.0f);
+
+    VkDescriptorSetAllocateInfo alloc{};
+    alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    alloc.descriptorPool = material_pool_;
+    alloc.descriptorSetCount = 1;
+    alloc.pSetLayouts = &terrain_set_layout_;
+    if (vkAllocateDescriptorSets(context_.device(), &alloc, &material.descriptor) != VK_SUCCESS) {
+        log::error("Renderer : allocation du set de terrain échouée");
+        return 0;
+    }
+    const MaterialId id = next_material_id_++;
+    materials_.emplace(id, material);
+    return id;
+}
+
 bool Renderer::create_material_descriptor_pool() {
     VkDescriptorPoolSize pool_size{};
     pool_size.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    pool_size.descriptorCount = kMaxMaterials * kMaterialTextures;
+    // Dimensionné sur le PIRE cas (6 descripteurs/set, cf. terrain) : à 3, allouer un
+    // seul matériau de terrain épuiserait le pool bien avant kMaxMaterials sets.
+    pool_size.descriptorCount = kMaxMaterials * kTerrainTextures;
 
     VkDescriptorPoolCreateInfo info{};
     info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -1309,9 +1385,23 @@ bool Renderer::create_textured_pipeline_layout() {
     return true;
 }
 
+// Le pipeline terrain est le pipeline texturé à DEUX différences près : son fragment
+// (terrain.frag, qui mélange deux jeux) et son layout (set 1 à 6 bindings). Le VERTEX
+// est partagé — la géométrie du terrain est un MeshVertex comme les autres.
+VkPipeline Renderer::build_terrain_pipeline() {
+    return build_surface_pipeline(terrain_frag_spv, terrain_frag_spv_size,
+                                  terrain_pipeline_layout_);
+}
+
 VkPipeline Renderer::build_textured_pipeline() {
+    return build_surface_pipeline(mesh_textured_frag_spv, mesh_textured_frag_spv_size,
+                                  textured_pipeline_layout_);
+}
+
+VkPipeline Renderer::build_surface_pipeline(const unsigned char* frag_spv, std::size_t frag_size,
+                                            VkPipelineLayout layout) {
     VkShaderModule vert = create_shader_module(mesh_textured_vert_spv, mesh_textured_vert_spv_size);
-    VkShaderModule frag = create_shader_module(mesh_textured_frag_spv, mesh_textured_frag_spv_size);
+    VkShaderModule frag = create_shader_module(frag_spv, frag_size);
     if (vert == VK_NULL_HANDLE || frag == VK_NULL_HANDLE) {
         return VK_NULL_HANDLE;
     }
@@ -1417,7 +1507,7 @@ VkPipeline Renderer::build_textured_pipeline() {
     pipe.pDepthStencilState = &depth_stencil;
     pipe.pColorBlendState = &blend;
     pipe.pDynamicState = &dynamic;
-    pipe.layout = textured_pipeline_layout_;
+    pipe.layout = layout;
     pipe.renderPass = render_pass_;
     pipe.subpass = 0;
 
@@ -1429,7 +1519,7 @@ VkPipeline Renderer::build_textured_pipeline() {
     vkDestroyShaderModule(context_.device(), frag, nullptr);
 
     if (result != VK_SUCCESS) {
-        log::error("Vulkan : création du pipeline texturé échouée");
+        log::error("Vulkan : création d'un pipeline de surface échouée");
         return VK_NULL_HANDLE;
     }
     return pipeline;
@@ -1584,9 +1674,8 @@ TextureId Renderer::resolve_texture(TextureId requested, TextureId fallback) con
 
 MaterialId Renderer::create_material(const MaterialDesc& desc) {
     Material material;
-    material.base_color = desc.base_color;
-    material.metallic_roughness = desc.metallic_roughness;
-    material.normal = desc.normal;
+    material.textures = {desc.base_color, desc.metallic_roughness, desc.normal, 0, 0, 0};
+    material.texture_count = kMaterialTextures;
     material.base_color_factor = desc.base_color_factor;
     material.pbr_factors =
         glm::vec4(desc.metallic_factor, desc.roughness_factor, desc.normal_scale, 0.0f);
@@ -1613,16 +1702,16 @@ void Renderer::update_pending_materials() {
         if (material.written) {
             continue;
         }
-        const std::array<TextureId, kMaterialTextures> resolved{
-            resolve_texture(material.base_color, white_texture_),
-            resolve_texture(material.metallic_roughness, default_mr_texture_),
-            resolve_texture(material.normal, flat_normal_texture_)};
-
-        // Tant qu'une seule des 3 n'est pas téléversée, on attend : écrire maintenant
-        // lierait une image encore en TRANSFER_DST (donc pas échantillonnable).
+        // Secours PAR RÔLE : le terrain répète simplement le triplet (base, mr, normale)
+        // pour son second jeu, donc le rôle se déduit de l'indice modulo 3.
+        const TextureId fallbacks[3] = {white_texture_, default_mr_texture_, flat_normal_texture_};
+        std::array<TextureId, kTerrainTextures> resolved{};
         bool all_ready = true;
-        for (TextureId tex_id : resolved) {
-            if (!is_texture_ready(tex_id)) {
+        for (std::uint32_t i = 0; i < material.texture_count; ++i) {
+            resolved[i] = resolve_texture(material.textures[i], fallbacks[i % 3]);
+            // Tant qu'UNE seule n'est pas téléversée, on attend : écrire maintenant
+            // lierait une image encore en TRANSFER_DST (donc pas échantillonnable).
+            if (!is_texture_ready(resolved[i])) {
                 all_ready = false;
                 break;
             }
@@ -1631,23 +1720,22 @@ void Renderer::update_pending_materials() {
             continue;
         }
 
-        std::array<VkDescriptorImageInfo, kMaterialTextures> infos{};
-        std::array<VkWriteDescriptorSet, kMaterialTextures> writes{};
-        for (std::size_t i = 0; i < kMaterialTextures; ++i) {
+        std::array<VkDescriptorImageInfo, kTerrainTextures> infos{};
+        std::array<VkWriteDescriptorSet, kTerrainTextures> writes{};
+        for (std::uint32_t i = 0; i < material.texture_count; ++i) {
             infos[i].sampler = sampler_;
             infos[i].imageView = textures_.at(resolved[i]).view;
             infos[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
             writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             writes[i].dstSet = material.descriptor;
-            writes[i].dstBinding = static_cast<std::uint32_t>(i);
+            writes[i].dstBinding = i;
             writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             writes[i].descriptorCount = 1;
             writes[i].pImageInfo = &infos[i];
         }
         // Sûr : le set n'a jamais pu être lié (les draws sautent les matériaux non
         // écrits), donc aucune frame en vol ne le référence.
-        vkUpdateDescriptorSets(context_.device(), static_cast<std::uint32_t>(writes.size()),
-                               writes.data(), 0, nullptr);
+        vkUpdateDescriptorSets(context_.device(), material.texture_count, writes.data(), 0, nullptr);
         material.written = true;
     }
 }
@@ -2537,12 +2625,17 @@ void Renderer::record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
             if (env_set == VK_NULL_HANDLE) {
                 continue;
             }
+            // Le terrain a son propre pipeline et son propre layout (set 1 à 6 bindings) ;
+            // tout le reste — vertex, sets 0 et 2, push constants — est commun.
+            const VkPipeline pipeline = material.terrain ? pipeline_terrain_ : pipeline_textured_;
+            const VkPipelineLayout layout =
+                material.terrain ? terrain_pipeline_layout_ : textured_pipeline_layout_;
             const std::array<VkDescriptorSet, 3> sets{frame_ubo, material.descriptor, env_set};
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_textured_);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, textured_pipeline_layout_,
-                                    0, static_cast<std::uint32_t>(sets.size()), sets.data(), 0,
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0,
+                                    static_cast<std::uint32_t>(sets.size()), sets.data(), 0,
                                     nullptr);
-            vkCmdPushConstants(cmd, textured_pipeline_layout_,
+            vkCmdPushConstants(cmd, layout,
                                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                                sizeof(push), &push);
             vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertex_buffer.buffer, &offset);
@@ -2733,6 +2826,18 @@ void Renderer::shutdown() {
     if (pipeline_textured_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(dev, pipeline_textured_, nullptr);
         pipeline_textured_ = VK_NULL_HANDLE;
+    }
+    if (pipeline_terrain_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(dev, pipeline_terrain_, nullptr);
+        pipeline_terrain_ = VK_NULL_HANDLE;
+    }
+    if (terrain_pipeline_layout_ != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(dev, terrain_pipeline_layout_, nullptr);
+        terrain_pipeline_layout_ = VK_NULL_HANDLE;
+    }
+    if (terrain_set_layout_ != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(dev, terrain_set_layout_, nullptr);
+        terrain_set_layout_ = VK_NULL_HANDLE;
     }
     if (textured_pipeline_layout_ != VK_NULL_HANDLE) {
         vkDestroyPipelineLayout(dev, textured_pipeline_layout_, nullptr);

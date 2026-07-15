@@ -23,6 +23,13 @@ struct ClipmapConfig {
     int levels = 7;               // 7 niveaux => maille 8..512 m, portée ±16 km
     int cells_per_side = 64;      // par niveau ; le niveau N couvre exactement le trou du N+1
     float uv_period = 8.0f;       // 1 unité UV = 8 m : le grain des textures de sol
+    // Référence FIXE des UV. Indispensable pour DEUX raisons :
+    //  * précision — nos coordonnées monde valent ~1e6 ; un UV = wx/8 vaudrait 125 000, où
+    //    l'ulp d'un float32 fait 0.008, soit 6 cm de quantification visible (mesuré) ;
+    //  * stabilité — les caler sur le centre du clipmap, qui bouge tous les 16 m, ferait
+    //    GLISSER la texture et le bruit de splatting sous les pieds du joueur.
+    // Relatifs à une origine fixe, les UV restent dans ±2000 (ulp = 1 mm) ET absolus.
+    glm::dvec2 uv_origin{0.0, 0.0};
 };
 
 // Terrain en GEO-CLIPMAP : des anneaux concentriques centrés sur le train, chacun deux

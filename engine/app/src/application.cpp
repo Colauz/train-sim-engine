@@ -1,6 +1,7 @@
 #include "noire/app/application.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -207,9 +208,17 @@ struct Application::Impl {
           track(kTrackOrigin),
           terrain(track),
           wagon(make_loco_config()),
-          streamer(track, terrain, jobs, make_streamer_config()),
-          clipmap(terrain, jobs),
+          streamer(track, jobs, make_streamer_config()),
+          clipmap(terrain, jobs, make_clipmap_config()),
           resources(renderer, jobs, asset_paths) {}
+
+    static scene::ClipmapConfig make_clipmap_config() {
+        scene::ClipmapConfig cc;
+        // Les UV se calent sur l'origine de la voie : fixe, donc la texture ne glisse
+        // jamais, et les valeurs restent petites malgré des coordonnées monde à 7 chiffres.
+        cc.uv_origin = glm::dvec2(kTrackOrigin.x, kTrackOrigin.z);
+        return cc;
+    }
 
     static scene::StreamerConfig make_streamer_config() {
         scene::StreamerConfig sc;
@@ -255,6 +264,9 @@ struct Application::Impl {
     resource::TextureHandle ballast_arm;
     resource::TextureHandle ballast_nor;
     bool ballast_textured = false;
+    // Splatting du terrain (M11 phase 2) : deux jeux PBR complets, herbe et craie.
+    std::array<resource::TextureHandle, 6> terrain_maps;
+    bool terrain_textured = false;
     bool rumble_source_applied = false;
 
     // Sol : plan solide texturé (M8 étape 2), il reçoit l'ombre portée du train.
@@ -266,6 +278,8 @@ struct Application::Impl {
     render::MaterialId rail_material = 0;
     render::MaterialId sleeper_material = 0;
     render::MaterialId ballast_material = 0;
+    // Terrain : secours = le sol procédural, remplacé par le splatting dès qu'il est prêt.
+    render::MaterialId terrain_material = 0;
 
     // Cubes de debug M4, dessinés uniquement en fallback / pendant le chargement.
     render::MeshId bogie_mesh = 0;
@@ -293,6 +307,7 @@ struct Application::Impl {
         return sky_ready_reported &&                    // HDRI chargé ET lié (SH + IBL + skybox)
                train_model && train_model->ready &&     // le gabarit
                ballast_textured &&                      // les 3 cartes du ballast
+               terrain_textured &&                      // les 6 cartes du splatting
                streamer.active_chunk_count() > 0 &&     // au moins une tuile de voie
                clipmap.ready();                         // et le relief sous le train
     }
@@ -398,6 +413,19 @@ struct Application::Impl {
                                              render::TextureFormat::LinearData);
         ballast_nor = resources.load_texture("textures/ballast/gravel_nor_gl.jpg",
                                              render::TextureFormat::LinearData);
+
+        // Terrain (Poly Haven CC0). `aerial_grass_rock` est une texture AÉRIENNE, pensée
+        // pour être vue de dessus : c'est exactement notre cas. Même règle qu'ailleurs —
+        // l'espace colorimétrique est dicté par le RÔLE, pas par le fichier.
+        const char* terrain_files[6] = {
+            "textures/terrain/grass_diff.jpg", "textures/terrain/grass_arm.jpg",
+            "textures/terrain/grass_nor_gl.jpg", "textures/terrain/chalk_diff.jpg",
+            "textures/terrain/chalk_arm.jpg", "textures/terrain/chalk_nor_gl.jpg"};
+        for (std::size_t i = 0; i < 6; ++i) {
+            terrain_maps[i] = resources.load_texture(
+                terrain_files[i], i % 3 == 0 ? render::TextureFormat::SrgbColor
+                                             : render::TextureFormat::LinearData);
+        }
         // Ciel HDR (M8 étape 6a). 1024 par face => ~64 Mio de VRAM avec les mips, le
         // compromis retenu pour un iGPU. Absent => le fond uni est conservé.
         sky = resources.load_environment("textures/sky/kloofendal_puresky_2k.hdr", 1024);
@@ -506,6 +534,30 @@ struct Application::Impl {
                 log::info("M9 : ballast texturé (gravier Poly Haven CC0, base+ARM+normale)");
             }
             ballast_textured = true;  // une seule tentative, réussie ou non
+        }
+
+        // Terrain texturé : le matériau de splatting est créé dès que les 6 cartes sont
+        // sur le GPU. Comme le ballast, on ne réécrit JAMAIS un matériau (son set serait
+        // en vol) : on en crée un neuf et on change la référence.
+        if (!terrain_textured) {
+            bool all = true;
+            for (const auto& h : terrain_maps) {
+                all = all && h && h->id != 0;
+            }
+            if (all) {
+                render::TerrainMaterialDesc td;
+                td.grass_base = terrain_maps[0]->id;
+                td.grass_metallic_rough = terrain_maps[1]->id;
+                td.grass_normal = terrain_maps[2]->id;
+                td.chalk_base = terrain_maps[3]->id;
+                td.chalk_metallic_rough = terrain_maps[4]->id;
+                td.chalk_normal = terrain_maps[5]->id;
+                if (const render::MaterialId m = renderer.create_terrain_material(td)) {
+                    terrain_material = m;
+                    log::info("M11 : terrain splatté (herbe + craie Poly Haven CC0)");
+                }
+                terrain_textured = true;
+            }
         }
 
         if (!model_ready_reported && train_model && train_model->ready) {
@@ -633,14 +685,15 @@ struct Application::Impl {
         // les 7 niveaux => un seul draw call, un seul upload par régénération.
         if (clipmap.ready()) {
             items.push_back(render::DrawItem{camera.relative_model(clipmap.origin()),
-                                             clipmap.mesh(), ground_material});
+                                             clipmap.mesh(),
+                                             terrain_material != 0 ? terrain_material
+                                                                   : ground_material});
         }
 
         // Voie streamée (une origine par tuile) : 3 sous-maillages, 3 matériaux (M9).
         for (const scene::ChunkRenderInfo& chunk : streamer.renderables()) {
             const glm::mat4 model = camera.relative_model(chunk.origin);
-            const std::pair<render::MeshId, render::MaterialId> parts[4] = {
-                {chunk.shoulder, ground_material},  // remblai : c'est du terrain, pas de la voie
+            const std::pair<render::MeshId, render::MaterialId> parts[3] = {
                 {chunk.ballast, ballast_material},
                 {chunk.sleepers, sleeper_material},
                 {chunk.rails, rail_material},

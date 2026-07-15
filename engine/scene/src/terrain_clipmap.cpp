@@ -53,7 +53,8 @@ void build(const Terrain& terrain, const ClipmapConfig& cfg, const WorldPosition
                 render::MeshVertex v;
                 v.position = glm::vec3(glm::dvec3(wx, h, wz) - center);  // origine flottante
                 v.normal = normal;
-                v.uv = glm::vec2(static_cast<float>(wx / period), static_cast<float>(wz / period));
+                v.uv = glm::vec2(static_cast<float>((wx - cfg.uv_origin.x) / period),
+                                 static_cast<float>((wz - cfg.uv_origin.y) / period));
                 v.tangent = glm::vec4(tangent, -1.0f);
                 vertices.push_back(v);
             }

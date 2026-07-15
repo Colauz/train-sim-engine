@@ -72,6 +72,17 @@ struct MaterialDesc {
     float normal_scale = 1.0f;
 };
 
+// Matériau de terrain : deux jeux PBR complets (M11 phase 2). Chaque texture peut valoir
+// 0 => secours 1x1 du rôle, comme pour MaterialDesc.
+struct TerrainMaterialDesc {
+    TextureId grass_base = 0;          // sRGB
+    TextureId grass_metallic_rough = 0;  // linéaire — _arm de Poly Haven convient tel quel
+    TextureId grass_normal = 0;        // linéaire
+    TextureId chalk_base = 0;
+    TextureId chalk_metallic_rough = 0;
+    TextureId chalk_normal = 0;
+};
+
 // Un objet à dessiner : sa matrice Model (déjà relative à la caméra, en float), le
 // maillage, et — pour les maillages indexés (MeshVertex) — le matériau à appliquer.
 // `material == 0` => matériau par défaut. Ignoré pour les maillages legacy (Vertex
@@ -126,6 +137,11 @@ public:
     // est false et les DrawItem qui le référencent ne sont pas dessinés (même contrat
     // que is_mesh_ready). 0 = échec.
     MaterialId create_material(const MaterialDesc& desc);
+    // Matériau de TERRAIN (M11 phase 2) : deux jeux PBR complets mélangés dans le shader
+    // par pente + bruit. Il lui faut un set à 6 bindings, donc son propre layout et son
+    // propre pipeline — le set 1 ordinaire n'en a que 3. Même contrat de disponibilité
+    // que create_material : rien n'est dessiné avant que les 6 textures soient prêtes.
+    MaterialId create_terrain_material(const TerrainMaterialDesc& desc);
     [[nodiscard]] bool is_material_ready(MaterialId id) const;
     void destroy_material(MaterialId id);
 
@@ -175,9 +191,10 @@ private:
     // téléversées, donc AVANT tout bind : on ne réécrit jamais un set en vol.
     struct Material {
         VkDescriptorSet descriptor = VK_NULL_HANDLE;
-        TextureId base_color = 0;
-        TextureId metallic_roughness = 0;
-        TextureId normal = 0;
+        // 3 textures (matériau ordinaire) ou 6 (terrain : herbe + craie).
+        std::array<TextureId, 6> textures{};
+        std::uint32_t texture_count = 3;
+        bool terrain = false;  // => set layout et pipeline terrain
         glm::vec4 base_color_factor{1.0f};
         glm::vec4 pbr_factors{1.0f, 1.0f, 1.0f, 0.0f};  // x=metallic, y=roughness, z=normal_scale
         bool written = false;
@@ -243,6 +260,9 @@ private:
     // Textures / matériaux (M7 étape 3, étendu M8 étape 3).
     bool create_sampler();
     bool create_material_descriptor_layout();  // set=1 : 3 combined image samplers (frag)
+    bool create_terrain_descriptor_layout();   // set=1 : 6 (deux jeux PBR)
+    bool create_terrain_pipeline_layout();
+    VkPipeline build_terrain_pipeline();
     bool create_material_descriptor_pool();
     bool create_textured_pipeline_layout();    // set0 (UBO) + set1 (matériau) + push
     bool create_default_textures();            // secours 1x1 : blanc, metal/rough, normale
@@ -305,6 +325,9 @@ private:
 
     VkPipeline build_pipeline(Topology topology);
     VkPipeline build_textured_pipeline();
+    // Fabrique commune : même vertex (MeshVertex), fragment et layout paramétrés.
+    VkPipeline build_surface_pipeline(const unsigned char* frag_spv, std::size_t frag_size,
+                                      VkPipelineLayout layout);
     VkShaderModule create_shader_module(const unsigned char* code, std::size_t size);
     void record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
                          const std::vector<DrawItem>& items);
@@ -331,6 +354,9 @@ private:
     VkDescriptorPool material_pool_ = VK_NULL_HANDLE;
     VkPipelineLayout textured_pipeline_layout_ = VK_NULL_HANDLE;  // set0 + set1
     VkPipeline pipeline_textured_ = VK_NULL_HANDLE;               // MeshVertex + matériau
+    VkDescriptorSetLayout terrain_set_layout_ = VK_NULL_HANDLE;   // set=1 (6 bindings)
+    VkPipelineLayout terrain_pipeline_layout_ = VK_NULL_HANDLE;
+    VkPipeline pipeline_terrain_ = VK_NULL_HANDLE;
     std::unordered_map<TextureId, Texture> textures_;
     std::unordered_map<MaterialId, Material> materials_;
     TextureId next_texture_id_ = 1;
@@ -343,6 +369,7 @@ private:
     static constexpr std::uint32_t kMaxTextures = 128;
     static constexpr std::uint32_t kMaxMaterials = 64;
     static constexpr std::uint32_t kMaterialTextures = 3;  // bindings du set 1
+    static constexpr std::uint32_t kTerrainTextures = 6;   // bindings du set 1 terrain
 
     // --- Environnement / skybox (M8 étape 6a) --------------------------------
     // Dessinée EN DERNIER dans la passe principale : la géométrie déjà en profondeur

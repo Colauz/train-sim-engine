@@ -7,7 +7,6 @@
 #include <vector>
 
 #include "noire/core/math.hpp"
-#include "noire/core/terrain.hpp"
 #include "noire/core/track_source.hpp"
 #include "noire/render/vertex.hpp"
 #include "noire/scene/track_mesh.hpp"
@@ -41,7 +40,6 @@ struct ChunkRenderInfo {
     render::MeshId rails = 0;
     render::MeshId sleepers = 0;
     render::MeshId ballast = 0;
-    render::MeshId shoulder = 0;  // remblai : porté par le matériau du SOL
     WorldPosition origin{};
 };
 
@@ -55,8 +53,7 @@ struct ChunkRenderInfo {
 //   * un chunk en cours de génération n'est JAMAIS supprimé (le worker écrit dedans).
 class WorldStreamer {
 public:
-    WorldStreamer(const TrackSource& track, const Terrain& terrain, JobSystem& jobs,
-                  StreamerConfig config = {});
+    WorldStreamer(const TrackSource& track, JobSystem& jobs, StreamerConfig config = {});
     ~WorldStreamer();
     WorldStreamer(const WorldStreamer&) = delete;
     WorldStreamer& operator=(const WorldStreamer&) = delete;
@@ -80,7 +77,6 @@ private:
         render::MeshId rails = 0;
         render::MeshId sleepers = 0;
         render::MeshId ballast = 0;
-        render::MeshId shoulder = 0;
         bool has_mesh = false;
         TrackLod lod = TrackLod::Distant;      // LOD des maillages ACTUELLEMENT affichés
         TrackLod building_lod = TrackLod::Distant;  // LOD que le worker est en train de bâtir
@@ -92,7 +88,6 @@ private:
     [[nodiscard]] TrackLod desired_lod(long index, long current) const;
 
     const TrackSource& track_;
-    const Terrain& terrain_;
     JobSystem& jobs_;
     StreamerConfig config_;
     std::unordered_map<long, std::unique_ptr<Chunk>> chunks_;

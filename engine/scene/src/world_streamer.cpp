@@ -7,9 +7,8 @@
 
 namespace noire::scene {
 
-WorldStreamer::WorldStreamer(const TrackSource& track, const Terrain& terrain, JobSystem& jobs,
-                             StreamerConfig config)
-    : track_(track), terrain_(terrain), jobs_(jobs), config_(config) {}
+WorldStreamer::WorldStreamer(const TrackSource& track, JobSystem& jobs, StreamerConfig config)
+    : track_(track), jobs_(jobs), config_(config) {}
 
 WorldStreamer::~WorldStreamer() = default;
 
@@ -28,7 +27,7 @@ void WorldStreamer::generate_async(Chunk& chunk, TrackLod lod) {
     const WorldPosition origin = chunk.origin;
     const RailProfile profile = config_.rail_profile;
     jobs_.submit([this, raw, x0, x1, origin, profile, lod] {
-        raw->cpu_mesh = generate_track_mesh(track_, terrain_, x0, x1, origin, profile, lod);
+        raw->cpu_mesh = generate_track_mesh(track_, x0, x1, origin, profile, lod);
         // Barrière release : rend visibles les écritures ci-dessus au thread principal.
         raw->state.store(State::CpuReady, std::memory_order_release);
     });
@@ -91,14 +90,13 @@ void WorldStreamer::update(double wagon_chainage, render::Renderer& renderer) {
             const render::MeshId new_rails = upload(chunk->cpu_mesh.rails);
             const render::MeshId new_sleepers = upload(chunk->cpu_mesh.sleepers);
             const render::MeshId new_ballast = upload(chunk->cpu_mesh.ballast);
-            const render::MeshId new_shoulder = upload(chunk->cpu_mesh.shoulder);
 
             // Changement de LOD : les anciens maillages ont été affichés jusqu'à cette
             // frame incluse. Leur destruction est DIFFÉRÉE côté Renderer, donc la
             // substitution est sûre même s'ils sont encore référencés par une frame en vol.
             if (chunk->has_mesh) {
                 for (const render::MeshId id :
-                     {chunk->rails, chunk->sleepers, chunk->ballast, chunk->shoulder}) {
+                     {chunk->rails, chunk->sleepers, chunk->ballast}) {
                     if (id != 0) {
                         renderer.destroy_mesh(id);
                     }
@@ -107,7 +105,6 @@ void WorldStreamer::update(double wagon_chainage, render::Renderer& renderer) {
             chunk->rails = new_rails;
             chunk->sleepers = new_sleepers;
             chunk->ballast = new_ballast;
-            chunk->shoulder = new_shoulder;
             chunk->lod = chunk->building_lod;
             chunk->has_mesh = true;
             chunk->state.store(State::Active, std::memory_order_relaxed);
@@ -127,7 +124,7 @@ void WorldStreamer::update(double wagon_chainage, render::Renderer& renderer) {
         if (out_of_range && state != State::Generating) {
             if (c->has_mesh) {
                 // Destruction GPU DIFFÉRÉE (voir Renderer) : 0 est ignoré côté renderer.
-                for (const render::MeshId id : {c->rails, c->sleepers, c->ballast, c->shoulder}) {
+                for (const render::MeshId id : {c->rails, c->sleepers, c->ballast}) {
                     if (id != 0) {
                         renderer.destroy_mesh(id);
                     }
@@ -144,8 +141,7 @@ void WorldStreamer::update(double wagon_chainage, render::Renderer& renderer) {
     for (auto& [index, chunk] : chunks_) {
         if (chunk->has_mesh) {
             renderables_.push_back(
-                ChunkRenderInfo{chunk->rails, chunk->sleepers, chunk->ballast, chunk->shoulder,
-                                chunk->origin});
+                ChunkRenderInfo{chunk->rails, chunk->sleepers, chunk->ballast, chunk->origin});
         }
     }
 }

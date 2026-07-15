@@ -4,7 +4,6 @@
 #include <vector>
 
 #include "noire/core/math.hpp"
-#include "noire/core/terrain.hpp"
 #include "noire/core/track_source.hpp"
 #include "noire/render/vertex.hpp"
 
@@ -56,18 +55,6 @@ struct RailProfile {
     float ballast_base_y = -0.80f;       // pied du talus
     float ballast_base_half = 2.65f;     // demi-largeur au pied (pente ~1:1.5)
 
-    // --- Accotement / remblai (M9 correction) ---------------------------------
-    // La voie suit une spline qui ondule (±6 m), le sol est un plan PLAT : sans raccord,
-    // le ballast flotte ou s'enterre au gré des collines. L'accotement est le remblai qui
-    // descend du pied du ballast jusqu'au sol — exactement ce que fait une vraie ligne.
-    //
-    // Depuis le M11, le point extérieur de l'accotement se cale sur le TERRAIN réel
-    // (Terrain::height), plus sur une altitude figée. Le terrain étant lui-même aplani
-    // dans le corridor ferroviaire, les deux se raccordent PAR CONSTRUCTION : c'est la
-    // même fonction des deux côtés, il n'y a rien à synchroniser. Ça libère aussi la voie
-    // de la contrainte M9 « toujours en remblai » — elle peut enfin entrer en tranchée,
-    // puisque c'est le terrain qui se creuse.
-    float shoulder_half = 22.0f;   // largeur de l'accotement, de l'axe vers l'extérieur
 };
 
 // Un sous-maillage : sommets PBR + indices, prêts pour create_mesh_indexed.
@@ -79,11 +66,15 @@ struct RailMeshData {
 
 // La voie complète d'une tuile, séparée PAR MATÉRIAU : un maillage ne peut porter qu'un
 // seul descriptor set, et acier / béton / gravier n'ont rien en commun.
+//
+// PLUS D'ACCOTEMENT depuis le M11 : il n'existait que parce que le sol était un plan plat
+// à la mauvaise altitude. Le corridor du Terrain aplanit désormais le sol jusqu'à 25 m de
+// l'axe, exactement au pied du ballast — l'accotement y était non seulement inutile mais
+// NUISIBLE : coplanaire avec le terrain, il z-fightait avec lui.
 struct TrackMeshData {
     RailMeshData rails;     // acier : metallic 1, poli par les roues
     RailMeshData sleepers;  // béton : diélectrique mat
     RailMeshData ballast;   // gravier : diélectrique très rugueux
-    RailMeshData shoulder;  // remblai : même matériau que le sol (herbe/terre)
     [[nodiscard]] bool empty() const { return rails.empty(); }
 };
 
@@ -91,9 +82,8 @@ struct TrackMeshData {
 // traverses et lit de ballast. Sommets exprimés RELATIVEMENT à `origin` (float) =>
 // compatible origine flottante, chaque tuile ayant la sienne. Fonction PURE (aucun état,
 // aucune API GPU) => appelable depuis un worker du JobSystem.
-[[nodiscard]] TrackMeshData generate_track_mesh(const TrackSource& track, const Terrain& terrain,
-                                                double x_start, double x_end,
-                                                const WorldPosition& origin,
+[[nodiscard]] TrackMeshData generate_track_mesh(const TrackSource& track, double x_start,
+                                                double x_end, const WorldPosition& origin,
                                                 const RailProfile& profile = {},
                                                 TrackLod lod = TrackLod::Full);
 
