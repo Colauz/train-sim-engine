@@ -21,6 +21,8 @@
 #include "shaders/mesh_textured.vert.spv.h"
 #include "shaders/prefilter_env.comp.spv.h"
 #include "shaders/shadow.vert.spv.h"
+#include "shaders/shadow_foliage.frag.spv.h"
+#include "shaders/shadow_instanced.vert.spv.h"
 #include "shaders/terrain.frag.spv.h"
 #include "shaders/skybox.frag.spv.h"
 #include "shaders/skybox.vert.spv.h"
@@ -69,6 +71,16 @@ struct TexturedPushConstants {
     glm::vec4 pbr_factors;         // offset 80 : x=metallic, y=roughness, z=normal_scale
 };
 static_assert(sizeof(TexturedPushConstants) == 96,
+              "les push constants doivent tenir dans les 128 octets garantis par la spec");
+
+// Push constants de l'ombre du FEUILLAGE. Le temps y passe plutôt que par le set 0 :
+// ce set porte aussi les sampler2DShadow, or la passe est en train d'écrire dedans.
+struct ShadowFoliagePushConstants {
+    glm::mat4 light_mvp;           // offset 0  : lightViewProj * model
+    glm::vec4 wind_params;         // offset 64 : x = temps (s)
+    glm::vec4 base_color_factor;   // offset 80 : son .a entre dans le test alpha
+};
+static_assert(sizeof(ShadowFoliagePushConstants) == 96,
               "les push constants doivent tenir dans les 128 octets garantis par la spec");
 
 // Format des shadow maps : profondeur pure 32 bits (pas de stencil).
@@ -149,6 +161,17 @@ bool Renderer::initialize(const RendererCreateInfo& info) {
         !create_textured_pipeline_layout() || !create_terrain_pipeline_layout()) {
         return false;
     }
+    // L'ombre du FEUILLAGE ne peut être bâtie qu'ICI, et pas plus haut avec les autres
+    // pipelines d'ombre : son layout référence material_set_layout_ (elle lit l'alpha de
+    // la base color), qui vient tout juste d'être créé.
+    if (!create_shadow_foliage_pipeline_layout()) {
+        return false;
+    }
+    shadow_pipeline_foliage_ = build_shadow_foliage_pipeline();
+    if (shadow_pipeline_foliage_ == VK_NULL_HANDLE) {
+        return false;
+    }
+
     pipeline_textured_ = build_textured_pipeline();
     pipeline_terrain_ = build_terrain_pipeline();
     pipeline_foliage_ = build_foliage_pipeline();
@@ -1055,6 +1078,149 @@ VkPipeline Renderer::build_shadow_pipeline(std::uint32_t vertex_stride) {
     return pipeline;
 }
 
+bool Renderer::create_shadow_foliage_pipeline_layout() {
+    // Deux sets déclarés, un seul lié. Le set 0 (global) n'est PAS utilisé par ces
+    // shaders — mais le matériau vit au set 1 partout dans ce moteur, et changer sa place
+    // ici pour économiser une déclaration rendrait le shader trompeur. Vulkan n'exige une
+    // liaison que pour les bindings réellement lus : le set 0 restera vide.
+    const std::array<VkDescriptorSetLayout, 2> layouts{descriptor_set_layout_,
+                                                       material_set_layout_};
+
+    // La plage couvre les DEUX étages : le vertex lit light_mvp et wind_params, le
+    // fragment lit base_color_factor.
+    VkPushConstantRange push_range{};
+    push_range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    push_range.offset = 0;
+    push_range.size = sizeof(ShadowFoliagePushConstants);
+
+    VkPipelineLayoutCreateInfo layout_info{};
+    layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    layout_info.setLayoutCount = static_cast<std::uint32_t>(layouts.size());
+    layout_info.pSetLayouts = layouts.data();
+    layout_info.pushConstantRangeCount = 1;
+    layout_info.pPushConstantRanges = &push_range;
+
+    if (vkCreatePipelineLayout(context_.device(), &layout_info, nullptr,
+                               &shadow_foliage_pipeline_layout_) != VK_SUCCESS) {
+        log::error("Vulkan : création du pipeline layout d'ombre du feuillage échouée");
+        return false;
+    }
+    return true;
+}
+
+VkPipeline Renderer::build_shadow_foliage_pipeline() {
+    VkShaderModule vert =
+        create_shader_module(shadow_instanced_vert_spv, shadow_instanced_vert_spv_size);
+    VkShaderModule frag =
+        create_shader_module(shadow_foliage_frag_spv, shadow_foliage_frag_spv_size);
+    if (vert == VK_NULL_HANDLE || frag == VK_NULL_HANDLE) {
+        return VK_NULL_HANDLE;
+    }
+    VkPipelineShaderStageCreateInfo vs{};
+    vs.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    vs.stage = VK_SHADER_STAGE_VERTEX_BIT;
+    vs.module = vert;
+    vs.pName = "main";
+    VkPipelineShaderStageCreateInfo fs{};
+    fs.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    fs.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    fs.module = frag;
+    fs.pName = "main";
+    const std::array<VkPipelineShaderStageCreateInfo, 2> stages{vs, fs};
+
+    // Mêmes deux bindings que le pipeline de feuillage de la vue caméra : le maillage par
+    // sommet, les instances par ARBRE.
+    std::array<VkVertexInputBindingDescription, 2> bindings{};
+    bindings[0].binding = 0;
+    bindings[0].stride = sizeof(MeshVertex);
+    bindings[0].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+    bindings[1].binding = 1;
+    bindings[1].stride = sizeof(InstanceData);
+    bindings[1].inputRate = VK_VERTEX_INPUT_RATE_INSTANCE;
+
+    std::array<VkVertexInputAttributeDescription, 6> attrs{};
+    attrs[0] = {0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(MeshVertex, position)};
+    attrs[1] = {1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(MeshVertex, normal)};
+    attrs[2] = {2, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(MeshVertex, uv)};
+    attrs[3] = {3, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(MeshVertex, tangent)};
+    attrs[4] = {4, 1, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(InstanceData, position_scale)};
+    attrs[5] = {5, 1, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(InstanceData, rotation_phase)};
+
+    VkPipelineVertexInputStateCreateInfo vi{};
+    vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vi.vertexBindingDescriptionCount = static_cast<std::uint32_t>(bindings.size());
+    vi.pVertexBindingDescriptions = bindings.data();
+    vi.vertexAttributeDescriptionCount = static_cast<std::uint32_t>(attrs.size());
+    vi.pVertexAttributeDescriptions = attrs.data();
+
+    VkPipelineInputAssemblyStateCreateInfo ia{};
+    ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vp{};
+    vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    vp.viewportCount = 1;
+    vp.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs{};
+    rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;  // une carte de feuillage projette des deux côtés
+    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth = 1.0f;
+    rs.depthBiasEnable = VK_TRUE;
+    rs.depthBiasConstantFactor = kDepthBiasConstant;
+    rs.depthBiasSlopeFactor = kDepthBiasSlope;
+    rs.depthBiasClamp = 0.0f;
+    VkPipelineMultisampleStateCreateInfo ms{};
+    ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineDepthStencilStateCreateInfo ds{};
+    ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    ds.depthTestEnable = VK_TRUE;
+    ds.depthWriteEnable = VK_TRUE;
+    // La passe d'ombre est ORTHOGRAPHIQUE et garde la profondeur NORMALE : le reverse-z
+    // du M9 ne concerne que la caméra (une ortho est déjà linéaire, il ne lui apporterait
+    // rien). D'où LESS ici, et non GREATER.
+    ds.depthCompareOp = VK_COMPARE_OP_LESS;
+    VkPipelineColorBlendStateCreateInfo cb{};
+    cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    cb.attachmentCount = 0;  // depth-only : la render pass n'a aucune cible de couleur
+    // Biais STATIQUE, comme le pipeline d'ombre ordinaire : le déclarer dynamique
+    // obligerait à un vkCmdSetDepthBias, sans quoi il serait indéfini.
+    const std::array<VkDynamicState, 2> dyn_states{VK_DYNAMIC_STATE_VIEWPORT,
+                                                   VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dyn{};
+    dyn.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dyn.dynamicStateCount = static_cast<std::uint32_t>(dyn_states.size());
+    dyn.pDynamicStates = dyn_states.data();
+
+    VkGraphicsPipelineCreateInfo pipe{};
+    pipe.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pipe.stageCount = static_cast<std::uint32_t>(stages.size());
+    pipe.pStages = stages.data();
+    pipe.pVertexInputState = &vi;
+    pipe.pInputAssemblyState = &ia;
+    pipe.pViewportState = &vp;
+    pipe.pRasterizationState = &rs;
+    pipe.pMultisampleState = &ms;
+    pipe.pDepthStencilState = &ds;
+    pipe.pColorBlendState = &cb;
+    pipe.pDynamicState = &dyn;
+    pipe.layout = shadow_foliage_pipeline_layout_;
+    pipe.renderPass = shadow_render_pass_;
+    pipe.subpass = 0;
+
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    const VkResult res =
+        vkCreateGraphicsPipelines(context_.device(), VK_NULL_HANDLE, 1, &pipe, nullptr, &pipeline);
+    vkDestroyShaderModule(context_.device(), frag, nullptr);
+    vkDestroyShaderModule(context_.device(), vert, nullptr);
+    if (res != VK_SUCCESS) {
+        log::error("Vulkan : création du pipeline d'ombre du feuillage échouée");
+        return VK_NULL_HANDLE;
+    }
+    return pipeline;
+}
+
 bool Renderer::create_shadow_pipelines() {
     shadow_pipeline_mesh_ = build_shadow_pipeline(sizeof(MeshVertex));
     shadow_pipeline_legacy_ = build_shadow_pipeline(sizeof(Vertex));
@@ -1062,6 +1228,8 @@ bool Renderer::create_shadow_pipelines() {
 }
 
 void Renderer::update_shadow_cascades(const FrameUniforms& uniforms) {
+    shadow_time_ = uniforms.params.y;  // horloge du vent, pour shadow_instanced.vert
+
     // Direction VERS le soleil. L'app la fournit ; on se protège d'un vecteur nul.
     glm::vec3 to_sun(uniforms.sun_direction);
     if (glm::dot(to_sun, to_sun) < 1e-6f) {
@@ -1225,25 +1393,51 @@ void Renderer::record_shadow_pass(VkCommandBuffer cmd, const std::vector<DrawIte
             if (!mesh.ready || mesh.topology == Topology::Lines) {
                 continue;  // transfert en cours, ou géométrie filaire (ne porte pas d'ombre)
             }
-            // La végétation ne passe PAS par cette boucle. Elle ne le peut pas : ce
-            // pipeline n'a qu'un binding de sommets (il dessinerait UN arbre à l'origine
-            // du groupe, pas les 454), et surtout il n'a AUCUN fragment shader — donc
-            // aucun test alpha, donc chaque carte de feuillage projetterait l'ombre d'un
-            // RECTANGLE plein. Les deux manques se corrigent ensemble (vert instancié +
-            // frag à discard + set 1), pas séparément. En attendant, la végétation ne
-            // porte pas d'ombre — c'est un manque assumé, pas un oubli.
-            if (item.instances != 0 && item.instance_count > 0) {
-                continue;
-            }
-
             // model est déjà relatif à la caméra, et lightViewProj est cadrée dans ce
             // même espace : le produit reste petit et précis.
             const glm::mat4 light_mvp = cascade.light_view_proj * item.model;
+            const bool instanced = item.instances != 0 && item.instance_count > 0;
+            const auto inst_it =
+                instanced ? instance_buffers_.find(item.instances) : instance_buffers_.end();
+            if (instanced && inst_it == instance_buffers_.end()) {
+                continue;  // tampon détruit entre-temps
+            }
+            VkDeviceSize offset = 0;
+
+            if (instanced) {
+                // Végétation : pipeline dédié (binding d'instances + test alpha). Son set 1
+                // porte la base color, dont on ne lit QUE l'alpha — mais c'est ce qui fait
+                // la différence entre l'ombre d'un arbre et celle d'un rectangle.
+                const MaterialId material_id = item.material != 0 ? item.material : default_material_;
+                const auto material_it = materials_.find(material_id);
+                if (material_it == materials_.end() || !material_it->second.written) {
+                    continue;  // set 1 pas encore écrit : ses textures arrivent
+                }
+                const Material& material = material_it->second;
+
+                ShadowFoliagePushConstants push{};
+                push.light_mvp = light_mvp;
+                push.wind_params = glm::vec4(shadow_time_, 0.0f, 0.0f, 0.0f);
+                push.base_color_factor = material.base_color_factor;
+
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, shadow_pipeline_foliage_);
+                vkCmdPushConstants(cmd, shadow_foliage_pipeline_layout_,
+                                   VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                                   sizeof(push), &push);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                        shadow_foliage_pipeline_layout_, 1, 1,
+                                        &material.descriptor, 0, nullptr);
+                vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertex_buffer.buffer, &offset);
+                vkCmdBindVertexBuffers(cmd, 1, 1, &inst_it->second.buffer, &offset);
+                vkCmdBindIndexBuffer(cmd, mesh.index_buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
+                vkCmdDrawIndexed(cmd, mesh.index_count, item.instance_count, 0, 0, 0);
+                continue;
+            }
+
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                               mesh.indexed ? shadow_pipeline_mesh_ : shadow_pipeline_legacy_);
             vkCmdPushConstants(cmd, shadow_pipeline_layout_, VK_SHADER_STAGE_VERTEX_BIT, 0,
                                sizeof(glm::mat4), &light_mvp);
-            VkDeviceSize offset = 0;
             vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertex_buffer.buffer, &offset);
             if (mesh.indexed) {
                 vkCmdBindIndexBuffer(cmd, mesh.index_buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
@@ -3172,6 +3366,14 @@ void Renderer::shutdown() {
     if (shadow_sampler_ != VK_NULL_HANDLE) {
         vkDestroySampler(dev, shadow_sampler_, nullptr);
         shadow_sampler_ = VK_NULL_HANDLE;
+    }
+    if (shadow_pipeline_foliage_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(dev, shadow_pipeline_foliage_, nullptr);
+        shadow_pipeline_foliage_ = VK_NULL_HANDLE;
+    }
+    if (shadow_foliage_pipeline_layout_ != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(dev, shadow_foliage_pipeline_layout_, nullptr);
+        shadow_foliage_pipeline_layout_ = VK_NULL_HANDLE;
     }
     if (shadow_pipeline_mesh_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(dev, shadow_pipeline_mesh_, nullptr);

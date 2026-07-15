@@ -36,6 +36,8 @@ noire_add_shaders(noire_render
     shaders/terrain.frag
     shaders/mesh_instanced.vert
     shaders/foliage.frag
+    shaders/shadow_instanced.vert
+    shaders/shadow_foliage.frag
     shaders/prefilter_env.comp)
 
 noire_set_warnings(noire_render)

@@ -2,6 +2,7 @@
 
 #extension GL_GOOGLE_include_directive : require
 #include "common/global_ubo.glsl"
+#include "common/foliage.glsl"
 
 // Miroir de TexturedPushConstants. `model` place le GROUPE (l'origine de la tuile) ;
 // c'est le tampon d'instances qui place chaque arbre à l'intérieur.
@@ -26,34 +27,11 @@ layout(location = 1) out vec3 cameraRelPos;
 layout(location = 2) out vec3 fragNormal;
 layout(location = 3) out vec4 fragTangent;
 
-// Vent de Champagne : lent et ample, pas une tempête.
-const float kWindSpeed = 1.35;
-const float kWindAmplitude = 0.22;  // débattement de la cime, en mètres
-const float kTreeHeight = 7.2;      // cf. tools/gen_tree.py
-
 void main() {
-    float yaw = instRotationPhase.x;
-    float c = cos(yaw);
-    float s = sin(yaw);
-    mat3 rot = mat3(c, 0.0, -s, 0.0, 1.0, 0.0, s, 0.0, c);
-
-    vec3 local = rot * (inPosition * instPositionScale.w);
-
-    // --- Vent ---------------------------------------------------------------
-    // La phase vient de la POSITION MONDE de l'instance (calculée au semis) : sans elle,
-    // toute la forêt ondulerait à l'unisson comme un ballet, ce qui trahit le procédé
-    // instantanément.
-    // Le poids est le CARRÉ de la hauteur relative du sommet : nul au pied (le tronc est
-    // planté, il ne glisse pas sur le sol) et maximal à la cime. Le carré, plutôt qu'un
-    // linéaire, concentre le mouvement dans le feuillage et raidit le bas du tronc.
-    float t = u.params.y;  // temps (s), fourni par l'app
-    float h = clamp(local.y / (kTreeHeight * instPositionScale.w), 0.0, 1.0);
-    float weight = h * h;
-    float phase = instRotationPhase.y;
-    // Deux fréquences incommensurables : une seule sinusoïde se lit comme un métronome.
-    float sway = (sin(t * kWindSpeed + phase) + 0.45 * sin(t * kWindSpeed * 2.37 + phase * 1.7));
-    local.x += sway * kWindAmplitude * weight;
-    local.z += sway * kWindAmplitude * 0.55 * weight;
+    mat3 rot = foliageYaw(instRotationPhase.x);
+    // Échelle + lacet + vent, depuis common/foliage.glsl : shadow_instanced.vert appelle
+    // la MÊME fonction, c'est ce qui garantit que l'ombre suit le balancement.
+    vec3 local = foliageLocal(inPosition, instPositionScale, instRotationPhase, u.params.y);
 
     vec4 rel = object.model * vec4(instPositionScale.xyz + local, 1.0);
     cameraRelPos = rel.xyz;

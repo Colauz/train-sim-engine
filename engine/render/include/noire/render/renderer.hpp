@@ -342,6 +342,10 @@ private:
     bool create_shadow_pipeline_layout();  // push constant : lightViewProj * model
     bool create_shadow_pipelines();
     VkPipeline build_shadow_pipeline(std::uint32_t vertex_stride);
+    // Ombre de la végétation : instanciée (binding 1) ET testée en alpha (donc un
+    // fragment shader et le set 1), d'où un layout et un pipeline à part.
+    bool create_shadow_foliage_pipeline_layout();
+    VkPipeline build_shadow_foliage_pipeline();
     // Recalcule le cadrage des cascades pour cette frame (dans l'espace flottant).
     void update_shadow_cascades(const FrameUniforms& uniforms);
     void record_shadow_pass(VkCommandBuffer cmd, const std::vector<DrawItem>& items);
@@ -434,6 +438,12 @@ private:
     VkPipelineLayout shadow_pipeline_layout_ = VK_NULL_HANDLE;
     VkPipeline shadow_pipeline_mesh_ = VK_NULL_HANDLE;    // MeshVertex (modèles indexés)
     VkPipeline shadow_pipeline_legacy_ = VK_NULL_HANDLE;  // Vertex (rails, géométrie debug)
+    VkPipelineLayout shadow_foliage_pipeline_layout_ = VK_NULL_HANDLE;
+    VkPipeline shadow_pipeline_foliage_ = VK_NULL_HANDLE;  // MeshVertex + instances + discard
+    // Horloge du vent, relevée avec les cascades. record_shadow_pass ne reçoit pas les
+    // uniforms, et le vent DOIT être le même que dans la vue caméra : sinon l'arbre se
+    // balance et son ombre reste plantée.
+    float shadow_time_ = 0.0f;
     std::array<ShadowCascade, kShadowCascades> shadow_cascades_{};
 
     // Profondeur (partagée) pour le test de profondeur 3D.

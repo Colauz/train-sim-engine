@@ -2,6 +2,7 @@
 
 #extension GL_GOOGLE_include_directive : require
 #include "common/pbr.glsl"
+#include "common/foliage.glsl"
 
 // set = 1 : matériau ordinaire (3 textures). Le feuillage n'utilise que la base color —
 // mais pour son ALPHA autant que pour sa couleur.
@@ -22,10 +23,6 @@ layout(location = 3) in vec4 fragTangent;
 
 layout(location = 0) out vec4 outColor;
 
-// Seuil de découpe (alphaCutoff glTF). Binaire : notre pipeline n'a pas de blending trié,
-// seulement ce test.
-const float kAlphaCutoff = 0.5;
-
 void main() {
     vec4 base = texture(baseColorMap, fragUV) * object.baseColorFactor;
 
@@ -34,7 +31,7 @@ void main() {
     // pipeline (le GPU ne peut pas rejeter un fragment avant d'avoir su s'il survit au
     // test), d'où le dessin de la végétation APRÈS le terrain opaque : ainsi le
     // depth-test rejette au moins ce qui est caché par le sol.
-    if (base.a < kAlphaCutoff) {
+    if (base.a < kFoliageAlphaCutoff) {
         discard;
     }
 
