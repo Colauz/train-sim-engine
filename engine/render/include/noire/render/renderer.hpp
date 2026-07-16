@@ -131,6 +131,13 @@ struct DrawItem {
     // pipeline change (entrée de sommets différente + vent), pas le matériau.
     InstanceBufferId instances = 0;
     std::uint32_t instance_count = 0;
+    // Culling CPU (M15) : si non nul, la PASSE PRINCIPALE dessine CES instances (le
+    // sous-ensemble visible, filtré par frustum côté app) au lieu de `instances` — elles
+    // sont téléversées dans un tampon de streaming par-frame. `instances`/`instance_count`
+    // restent utilisés tels quels par la PASSE D'OMBRES : un arbre hors champ caméra peut
+    // encore projeter une ombre visible, on ne le retire donc pas des ombres. Le vecteur
+    // pointé doit vivre jusqu'au retour de draw_frame (copié pendant l'enregistrement).
+    const std::vector<InstanceData>* cpu_instances = nullptr;
 };
 
 // HUD (M13) — affichage écran. Générique : le Renderer sait dessiner du texte à des
@@ -164,6 +171,10 @@ struct HudRect {
 struct Hud {
     std::vector<HudRect> rects;
     std::vector<TextDraw> texts;
+    // Fondu d'ouverture (M15) : voile noir plein écran d'opacité `fade`, émis EN DERNIER
+    // (donc au-dessus de tout, HUD compris). 0 = rien, 1 = écran noir. Passe par le même
+    // pipeline que les glyphes — c'est un glyphe plein aux dimensions de l'écran.
+    float fade = 0.0f;
 };
 
 // Renderer générique : il ne connaît PAS la scène. L'app crée des maillages puis
@@ -409,6 +420,9 @@ private:
     // courante. Renvoie le nombre d'instances (0 = rien à dessiner).
     std::uint32_t upload_hud(const Hud& hud);
     void record_hud(VkCommandBuffer cmd, std::uint32_t glyph_count);
+    // Culling CPU (M15) : tampon d'instances de STREAMING, un par frame en vol, rempli à
+    // la volée pendant l'enregistrement avec les sous-ensembles visibles des DrawItem.
+    bool create_stream_buffers();
 
     // Pluie (M14) : plein écran, un seul push constant, ni set ni UBO.
     bool create_rain_pipeline();  // crée aussi son layout (push-constant-only)
@@ -486,6 +500,15 @@ private:
     // 512 glyphes = ~8 lignes de 60 caractères, très au-delà d'un HUD de cabine. À
     // 40 octets l'instance, les deux tampons pèsent 40 Ko.
     static constexpr std::uint32_t kMaxGlyphs = 512;
+
+    // --- Instances de streaming (M15, culling CPU) -----------------------------
+    // Un tampon par frame en vol, réécrit chaque frame avec les instances visibles des
+    // DrawItem qui portent cpu_instances. Curseur remis à zéro à chaque enregistrement.
+    std::vector<GpuBuffer> stream_buffers_;   // kFramesInFlight
+    std::uint32_t stream_cursor_bytes_ = 0;   // avance pendant record_commands
+    // 8192 instances = ~18x notre densité d'arbres typique : marge pour un culling large
+    // et pour d'éventuels autres flux instanciés. 8192 * 32 o * 2 frames = 512 Ko.
+    static constexpr std::uint32_t kMaxStreamInstances = 8192;
 
     // --- Pluie (M14) : effet plein écran, push-constant-only --------------------
     VkPipelineLayout rain_pipeline_layout_ = VK_NULL_HANDLE;  // 0 set, 1 push constant

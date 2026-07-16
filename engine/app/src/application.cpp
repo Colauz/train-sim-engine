@@ -304,6 +304,13 @@ struct Application::Impl {
     WorldPosition tree_origin{};
     long tree_snap_x = 0, tree_snap_z = 0;
     bool tree_snap_valid = false;
+    // Culling CPU (M15) : la liste COMPLÈTE des arbres (conservée pour la retester chaque
+    // frame contre le frustum) et le sous-ensemble VISIBLE recalculé à chaque frame. Ce
+    // dernier est un membre pour éviter une réallocation par frame — on le vide et le
+    // remplit, sa capacité se stabilise. Passé au Renderer par pointeur (DrawItem).
+    std::vector<render::InstanceData> tree_list;
+    std::vector<render::InstanceData> visible_trees;
+    std::uint32_t visible_tree_count = 0;
     double sim_time = 0.0;  // horloge du vent (s)
     long present_index = 0;  // compte les présentations (banc de mesure, cf. NOIRE_CREEP)
     std::chrono::steady_clock::time_point perf_t0 = std::chrono::steady_clock::now();
@@ -351,6 +358,11 @@ struct Application::Impl {
     bool model_ready_reported = false;
     bool sky_ready_reported = false;
     bool loading_done_reported = false;
+    // Fondu d'ouverture (M15) : armé à la toute première frame complète, il ramène un voile
+    // noir de 1 à 0 sur kFadeDuration secondes — le monde se révèle en douceur.
+    bool fade_active = false;
+    double fade_t = 0.0;
+    static constexpr double kFadeDuration = 0.5;
 
     // --- Écran de chargement (M9 correction) ---------------------------------
     // Tant que les assets FONDATEURS ne sont pas sur le GPU, on ne dessine RIEN (noir).
@@ -662,10 +674,10 @@ struct Application::Impl {
 
         if (++telemetry_ticks % 120 == 0) {
             log::info("v={:6.1f} km/h | pente={:+5.1f}% | {} | chunks={} | pluie={:.0f}% | "
-                      "{:.0f} fps (GPU {:.1f} ms) | arbres={}",
+                      "{:.0f} fps (GPU {:.1f} ms) | arbres={}/{} vis",
                       wagon.speed() * 3.6, wagon.grade_percent(),
                       wagon.slipping() ? "PATINE   " : "adherent ", streamer.active_chunk_count(),
-                      wetness * 100.0f, perf_fps, perf_gpu_ms, tree_count);
+                      wetness * 100.0f, perf_fps, perf_gpu_ms, visible_tree_count, tree_count);
         }
     }
 
@@ -792,6 +804,57 @@ struct Application::Impl {
         tree_instances = renderer.create_instances(instances);
         tree_count = static_cast<std::uint32_t>(instances.size());
         tree_origin = wp;
+        // Conserve la liste CPU : c'est elle qu'on retestera contre le frustum chaque frame
+        // (le tampon GPU persistant, lui, sert la passe d'ombres qui n'est pas cullée).
+        tree_list = std::move(instances);
+    }
+
+    // Culling CPU de la végétation (M15). Reteste la liste complète contre le frustum
+    // caméra et remplit `visible_trees`. Espace CAMÉRA-RELATIF : chaque arbre est ramené
+    // par rapport à la caméra (comme tout le rendu en origine flottante), puis testé
+    // contre les 6 plans extraits de proj*view. ~450 tests => quelques microsecondes.
+    void cull_vegetation(const glm::mat4& view, const glm::mat4& proj) {
+        visible_trees.clear();
+        // Décalage du groupe d'arbres par rapport à la caméra (float, faible) : identique à
+        // la translation de camera.relative_model(tree_origin).
+        const glm::vec3 group = glm::vec3(tree_origin - camera.position());
+
+        // Plans du frustum par Gribb-Hartmann sur clip = proj * view (view sans
+        // translation : la caméra est à l'origine, donc `group + inst.pos` est directement
+        // le point à tester). Reverse-z : l'extraction reste correcte (près/loin sont juste
+        // permutés, mais les 6 plans bornent le même volume).
+        const glm::mat4 clip = proj * view;
+        // Lignes de la matrice (glm est column-major : ligne i = (m[0][i]..m[3][i])).
+        const glm::vec4 rx{clip[0][0], clip[1][0], clip[2][0], clip[3][0]};
+        const glm::vec4 ry{clip[0][1], clip[1][1], clip[2][1], clip[3][1]};
+        const glm::vec4 rz{clip[0][2], clip[1][2], clip[2][2], clip[3][2]};
+        const glm::vec4 rw{clip[0][3], clip[1][3], clip[2][3], clip[3][3]};
+        std::array<glm::vec4, 6> planes{rw + rx, rw - rx, rw + ry, rw - ry, rw + rz, rw - rz};
+        for (glm::vec4& p : planes) {
+            const float len = glm::length(glm::vec3(p));
+            if (len > 1e-6f) p /= len;  // normalise => la marge du rayon est en mètres
+        }
+
+        for (const render::InstanceData& inst : tree_list) {
+            const glm::vec3 c = group + glm::vec3(inst.position_scale);
+            // Sphère englobante : base sur le sol, l'arbre monte. Centre remonté à la
+            // mi-hauteur, rayon généreux (l'échelle est dans .w). Trop serré ferait
+            // « popper » un arbre en bord d'écran ; trop large ne culle plus rien.
+            const float scale = inst.position_scale.w;
+            const glm::vec3 center = c + glm::vec3(0.0f, 5.0f * scale, 0.0f);
+            const float radius = 7.0f * scale;
+            bool inside = true;
+            for (const glm::vec4& p : planes) {
+                if (glm::dot(glm::vec3(p), center) + p.w < -radius) {
+                    inside = false;
+                    break;
+                }
+            }
+            if (inside) {
+                visible_trees.push_back(inst);
+            }
+        }
+        visible_tree_count = static_cast<std::uint32_t>(visible_trees.size());
     }
 
     // Caténaire : ré-engendrée quand le train a franchi kCatenaryStep. Les poteaux étant
@@ -963,12 +1026,27 @@ struct Application::Impl {
             black.proj = camera.projection_matrix(static_cast<float>(size.width) /
                                                   static_cast<float>(size.height));
             black.fog_color_density = glm::vec4(0.0f, 0.0f, 0.0f, 0.0f);  // fond noir
-            renderer.draw_frame(black, {});
+            // M15 : plus d'écran noir vide — un message centré au HUD 35 bits pendant que
+            // le monde se charge. Le fond reste noir (aucun item, brouillard noir).
+            render::Hud hud;
+            const std::string msg = "CHARGEMENT DU MONDE...";
+            constexpr float scale = 3.0f;
+            const float text_w = static_cast<float>(msg.size()) * 6.0f * scale;
+            const float text_h = 7.0f * scale;
+            hud.texts.push_back({{(static_cast<float>(size.width) - text_w) * 0.5f,
+                                  (static_cast<float>(size.height) - text_h) * 0.5f},
+                                 scale,
+                                 glm::vec4(0.85f, 0.87f, 0.92f, 1.0f),
+                                 msg});
+            renderer.draw_frame(black, {}, hud);
             return;
         }
         if (!loading_done_reported) {
             log::info("M9 : assets fondateurs prêts — première frame complète");
             loading_done_reported = true;
+            // Arme le fondu d'ouverture : la première frame complète part d'un voile noir.
+            fade_active = true;
+            fade_t = 0.0;
         }
 
         // Delta de temps réel pour la vitesse de la caméra (Doppler du listener).
@@ -1108,14 +1186,28 @@ struct Application::Impl {
         // ce qui INTERDIT l'early-z sur ce pipeline. En la mettant en dernier, au moins le
         // depth-test rejette tout ce que le sol cache déjà.
         if (tree_model && tree_model->ready && tree_instances != 0 && tree_count > 0) {
+            // Frustum culling CPU (M15) : ne garde que les arbres dans le champ. Le résultat
+            // (visible_trees) part par pointeur dans cpu_instances => la PASSE PRINCIPALE
+            // dessine ce sous-ensemble. La passe d'ombres, elle, reçoit toujours le tampon
+            // complet (tree_instances/tree_count) : un arbre hors champ projette encore.
+            // NOIRE_NOCULL : désactive le frustum culling (dessine TOUS les arbres dans la
+            // passe principale), pour mesurer le gain. Même esprit que les autres leviers
+            // de banc (NOIRE_PIN_CAM / STILL / CREEP / SPEED).
+            static const bool nocull = std::getenv("NOIRE_NOCULL") != nullptr;
+            if (!nocull) {
+                cull_vegetation(uniforms.view, uniforms.proj);
+            } else {
+                visible_tree_count = tree_count;
+            }
             const glm::mat4 group = camera.relative_model(tree_origin);
             for (const resource::Model::Primitive& prim : tree_model->primitives) {
                 render::DrawItem item;
                 item.model = group;
                 item.mesh = prim.mesh;
                 item.material = prim.material ? prim.material->id : 0;
-                item.instances = tree_instances;
+                item.instances = tree_instances;       // complet => ombres
                 item.instance_count = tree_count;
+                item.cpu_instances = nocull ? nullptr : &visible_trees;  // cullé => vue caméra
                 items.push_back(item);
             }
         }
@@ -1168,7 +1260,17 @@ struct Application::Impl {
                                              catenary_mesh, wire_material});
         }
 
-        renderer.draw_frame(uniforms, items, build_hud());
+        render::Hud hud = build_hud();
+        // Fondu d'ouverture : le voile noir tombe de 1 à 0 sur kFadeDuration secondes.
+        if (fade_active) {
+            fade_t += dt_render;
+            const float a = 1.0f - static_cast<float>(fade_t / kFadeDuration);
+            hud.fade = glm::clamp(a, 0.0f, 1.0f);
+            if (a <= 0.0f) {
+                fade_active = false;
+            }
+        }
+        renderer.draw_frame(uniforms, items, hud);
     }
 
     void shutdown() {

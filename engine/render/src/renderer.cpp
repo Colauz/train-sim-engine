@@ -223,6 +223,12 @@ bool Renderer::initialize(const RendererCreateInfo& info) {
         return false;
     }
 
+    // Instances de streaming (M15) : tampons par-frame pour le sous-ensemble visible après
+    // culling CPU. Aucun pipeline à part — ils alimentent le pipeline de feuillage existant.
+    if (!create_stream_buffers()) {
+        return false;
+    }
+
     // Pluie (M14) : plein écran, ne dépend que de render_pass_.
     if (!create_rain_pipeline()) {
         return false;
@@ -1999,6 +2005,19 @@ bool Renderer::create_hud_buffers() {
     return true;
 }
 
+bool Renderer::create_stream_buffers() {
+    stream_buffers_.resize(kFramesInFlight);
+    const VkDeviceSize size = sizeof(InstanceData) * kMaxStreamInstances;
+    for (int i = 0; i < kFramesInFlight; ++i) {
+        if (!context_.create_buffer(size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                                    /*host_visible=*/true,
+                                    stream_buffers_[static_cast<std::size_t>(i)])) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool Renderer::create_hud_pipeline() {
     VkShaderModule vert = create_shader_module(hud_vert_spv, hud_vert_spv_size);
     VkShaderModule frag = create_shader_module(hud_frag_spv, hud_frag_spv_size);
@@ -2123,7 +2142,7 @@ bool Renderer::create_hud_pipeline() {
 }
 
 std::uint32_t Renderer::upload_hud(const Hud& hud) {
-    if (hud.rects.empty() && hud.texts.empty()) {
+    if (hud.rects.empty() && hud.texts.empty() && hud.fade <= 0.001f) {
         return 0;
     }
 
@@ -2171,6 +2190,19 @@ std::uint32_t Renderer::upload_hud(const Hud& hud) {
             }
             pen += advance;
         }
+    }
+
+    // Voile de fondu (M15) EN DERNIER : un glyphe plein aux dimensions de l'écran, donc
+    // par-dessus tout ce qui précède (plaques ET texte). L'écran s'éclaircit à mesure que
+    // `fade` tombe vers 0.
+    if (hud.fade > 0.001f && instances.size() < kMaxGlyphs) {
+        const VkExtent2D ext = swapchain_.extent();
+        GlyphInstance gi{};
+        gi.position = glm::vec2(0.0f, 0.0f);
+        gi.size = glm::vec2(static_cast<float>(ext.width), static_cast<float>(ext.height));
+        gi.bits = pack_bits(font::kGlyphBlock);
+        gi.color = glm::vec4(0.0f, 0.0f, 0.0f, glm::clamp(hud.fade, 0.0f, 1.0f));
+        instances.push_back(gi);
     }
 
     if (instances.empty()) {
@@ -3569,6 +3601,11 @@ void Renderer::record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
 
     const VkDescriptorSet frame_ubo = descriptor_sets_[current_frame_];
 
+    // Curseur du tampon de streaming (M15) : remis à zéro à chaque frame, avancé au fil des
+    // DrawItem cullés. L'écriture se fait ICI, après le vkWaitForFences de draw_frame, donc
+    // le slot n'est plus lu par le GPU — même garantie que l'UBO et le HUD.
+    stream_cursor_bytes_ = 0;
+
     for (const DrawItem& item : items) {
         const auto mesh_it = meshes_.find(item.mesh);
         if (mesh_it == meshes_.end()) {
@@ -3603,12 +3640,41 @@ void Renderer::record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
             }
             // Le terrain a son propre pipeline et son propre layout (set 1 à 6 bindings) ;
             // tout le reste — vertex, sets 0 et 2, push constants — est commun.
-            const bool instanced = item.instances != 0 && item.instance_count > 0;
-            const auto inst_it = instanced ? instance_buffers_.find(item.instances)
-                                           : instance_buffers_.end();
-            if (instanced && inst_it == instance_buffers_.end()) {
+            //
+            // M15 : deux sources d'instances possibles. `cpu_instances` (culling CPU) =>
+            // sous-ensemble visible téléversé dans le tampon de streaming de la frame.
+            // Sinon => tampon d'instances persistant (comportement d'avant).
+            const bool has_cpu = item.cpu_instances != nullptr;
+            const bool instanced = has_cpu || (item.instances != 0 && item.instance_count > 0);
+            const auto inst_it = (instanced && !has_cpu) ? instance_buffers_.find(item.instances)
+                                                         : instance_buffers_.end();
+            if (instanced && !has_cpu && inst_it == instance_buffers_.end()) {
                 continue;  // tampon détruit entre-temps
             }
+
+            VkBuffer instance_buffer = VK_NULL_HANDLE;
+            VkDeviceSize instance_offset = 0;
+            std::uint32_t instance_draw = 1;
+            if (has_cpu) {
+                const std::vector<InstanceData>& data = *item.cpu_instances;
+                const std::uint32_t used = stream_cursor_bytes_ / sizeof(InstanceData);
+                const std::uint32_t count =
+                    std::min(static_cast<std::uint32_t>(data.size()), kMaxStreamInstances - used);
+                if (count == 0) {
+                    continue;  // rien de visible après culling : aucun draw
+                }
+                std::memcpy(static_cast<char*>(stream_buffers_[current_frame_].mapped) +
+                                stream_cursor_bytes_,
+                            data.data(), static_cast<std::size_t>(count) * sizeof(InstanceData));
+                instance_buffer = stream_buffers_[current_frame_].buffer;
+                instance_offset = stream_cursor_bytes_;
+                instance_draw = count;
+                stream_cursor_bytes_ += count * static_cast<std::uint32_t>(sizeof(InstanceData));
+            } else if (instanced) {
+                instance_buffer = inst_it->second.buffer;
+                instance_draw = item.instance_count;
+            }
+
             const bool terrain = material.shading == Shading::Terrain;
             const VkPipeline pipeline =
                 material.shading == Shading::Wire ? pipeline_wire_
@@ -3627,10 +3693,10 @@ void Renderer::record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
                                sizeof(push), &push);
             vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertex_buffer.buffer, &offset);
             if (instanced) {
-                vkCmdBindVertexBuffers(cmd, 1, 1, &inst_it->second.buffer, &offset);
+                vkCmdBindVertexBuffers(cmd, 1, 1, &instance_buffer, &instance_offset);
             }
             vkCmdBindIndexBuffer(cmd, mesh.index_buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
-            vkCmdDrawIndexed(cmd, mesh.index_count, instanced ? item.instance_count : 1, 0, 0, 0);
+            vkCmdDrawIndexed(cmd, mesh.index_count, instanced ? instance_draw : 1, 0, 0, 0);
         } else {
             // Géométrie debug (grille, rails, cubes de secours) : couleur par sommet.
             VkPipeline pipeline =
@@ -3882,6 +3948,10 @@ void Renderer::shutdown() {
         context_.destroy_buffer(buffer);
     }
     hud_buffers_.clear();
+    for (GpuBuffer& buffer : stream_buffers_) {  // M15
+        context_.destroy_buffer(buffer);
+    }
+    stream_buffers_.clear();
     // Pluie (M14).
     if (rain_pipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(dev, rain_pipeline_, nullptr);
