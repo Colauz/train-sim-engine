@@ -2,22 +2,42 @@
 
 #include "noire/core/math.hpp"
 #include "noire/core/track_source.hpp"
+#include "noire/physics/air_brake.hpp"
 #include "noire/physics/bogie.hpp"
 
 namespace noire::physics {
 
 struct WagonConfig {
     double mass = 40000.0;
+    // Masse portée par les essieux MOTEURS — c'est elle, et non la masse totale, qui
+    // décide de l'adhérence EN TRACTION. Sur une rame TGV, seules les deux motrices sont
+    // motrices (~136 t sur 400 t) : compter les 400 t rendrait le patinage impossible.
+    // Le FREINAGE, lui, reste sur la masse totale (tous les essieux sont freinés).
+    // 0 => masse totale (engin dont tous les essieux sont moteurs).
+    double adhesive_mass = 0.0;
     double wheelbase = 12.0;
 
     double max_tractive_effort = 150000.0;
+    // Puissance maximale à la jante (W). Au-delà de la vitesse de base
+    // v_base = max_power / max_tractive_effort, l'effort disponible n'est plus l'effort
+    // maximal mais P/v : c'est l'HYPERBOLE DE PUISSANCE, et c'est elle qui donne son
+    // inertie à un train lancé. Sans elle, un engin garderait son effort de démarrage à
+    // 300 km/h et accélérerait comme au départ.
+    // 0 => effort constant à toute vitesse (comportement d'avant le M13).
+    double max_power = 0.0;
     double max_brake_force = 180000.0;
 
     double adhesion_static = 0.33;
     double adhesion_kinetic = 0.18;
 
-    double rolling_c0 = 800.0;
-    double rolling_c2 = 8.0;
+    // Résistance à l'avancement de DAVIS : R(v) = a + b*|v| + c*v² (N, v en m/s).
+    //   a : roulement et frottements secs, indépendants de la vitesse
+    //   b : résistance mécanique/rail, proportionnelle à la vitesse
+    //   c : TRAÎNÉE AÉRODYNAMIQUE — le terme qui domine tout à grande vitesse
+    // Le terme linéaire manquait avant le M13 (le modèle n'avait que a et c).
+    double davis_a = 800.0;
+    double davis_b = 0.0;
+    double davis_c = 8.0;
 
     double body_height = 2.2;
 
@@ -40,7 +60,11 @@ public:
     void attach(const TrackSource* track) { track_ = track; }
     void place_at(double chainage);
     void set_speed(double meters_per_second) { velocity_ = meters_per_second; }
-    void set_controls(double throttle, double brake);
+    // `brake` = position du robinet 0..1 ; `emergency` court-circuite le service.
+    void set_controls(double throttle, double brake, bool emergency = false);
+    // Échelle d'adhérence (1 = sec). Couple la météo à la tenue du rail : sous la pluie,
+    // l'adhérence chute et le patinage devient possible. Multiplie les deux coefficients.
+    void set_adhesion_scale(double scale) { adhesion_scale_ = scale; }
 
     void update(double dt);  // fixed_update — déterministe
 
@@ -51,10 +75,14 @@ public:
 
     [[nodiscard]] double speed() const { return velocity_; }
     [[nodiscard]] double chainage() const { return chainage_; }
+    // Traction RÉELLEMENT appliquée (0..1), après la rampe de la chaîne de traction —
+    // à ne pas confondre avec la position du manipulateur, qui est la consigne.
+    [[nodiscard]] double throttle() const { return throttle_; }
     [[nodiscard]] double tractive_effort() const { return tractive_effort_; }
     [[nodiscard]] double grade_percent() const { return grade_percent_; }
     [[nodiscard]] bool slipping() const { return slipping_; }
     [[nodiscard]] const WagonConfig& config() const { return config_; }
+    [[nodiscard]] const AirBrake& air_brake() const { return air_brake_; }
 
 private:
     void update_body(double dt, double longitudinal_accel);
@@ -66,7 +94,8 @@ private:
     double velocity_ = 0.0;
     double throttle_ = 0.0;
     double throttle_input_ = 0.0;
-    double brake_ = 0.0;
+    double adhesion_scale_ = 1.0;
+    AirBrake air_brake_;
 
     bool slipping_ = false;
     double tractive_effort_ = 0.0;

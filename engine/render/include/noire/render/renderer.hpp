@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -44,8 +45,13 @@ struct FrameUniforms {
     // de texels solidaire du MONDE. Sans elle, le snap se fait dans un repère qui suit la
     // caméra — donc il ne snappe rien du tout (le centre y est constant).
     glm::dvec3 camera_world_position{0.0, 0.0, 0.0};
-    glm::vec4 fog_color_density;  // rgb = couleur du brouillard, a = densité
-    glm::vec4 params;             // x = wetness (humidité 0..1), reste = réserve
+    // INITIALISÉS : glm ne construit pas ses vecteurs par défaut (GLM_FORCE_CTOR_INIT
+    // n'est pas posé, cf. cmake/Dependencies.cmake). L'écran de chargement instancie un
+    // FrameUniforms sans renseigner params, que draw_frame lit et dont
+    // update_shadow_cascades latche .y comme horloge du vent : sans initialiseur, c'est
+    // une lecture indéterminée.
+    glm::vec4 fog_color_density{0.0f};  // rgb = couleur du brouillard, a = densité
+    glm::vec4 params{0.0f};             // x = wetness (humidité 0..1), y = temps (vent)
     // xyz = direction VERS le soleil (normalisée, espace monde). Cadre les cascades
     // d'ombre ET éclaire les modèles : une seule source de vérité pour le soleil.
     glm::vec4 sun_direction{-0.4f, 0.8f, 0.3f, 0.0f};
@@ -118,6 +124,39 @@ struct DrawItem {
     std::uint32_t instance_count = 0;
 };
 
+// HUD (M13) — affichage écran. Générique : le Renderer sait dessiner du texte à des
+// pixels, pas ce qu'est une vitesse. Le contenu reste à l'app.
+//
+// Une ligne de texte. `position` en PIXELS, origine HAUT-GAUCHE. `color` en LINÉAIRE :
+// la swapchain est SRGB et l'encodage est matériel, comme partout ailleurs dans le
+// moteur (cf. FrameUniforms::sun_color).
+struct TextDraw {
+    glm::vec2 position{0.0f, 0.0f};
+    // Pixels par texel de police. ARRONDI À L'ENTIER par le Renderer : c'est ce qui
+    // garantit qu'un texel couvre un bloc exact de pixels, donc que le texte est net.
+    // Une échelle fractionnaire donnerait des jambages irréguliers (2 px ici, 3 px là).
+    float scale = 2.0f;
+    glm::vec4 color{1.0f, 1.0f, 1.0f, 1.0f};
+    std::string text;
+};
+
+// Plaque de fond, pour que le texte reste lisible sur un ciel clair. Elle emprunte le
+// MÊME chemin d'instance que les glyphes : c'est un glyphe dont les 35 bits sont à 1
+// (cf. font::kGlyphBlock). Donc aucun pipeline de plus, aucun draw de plus.
+struct HudRect {
+    glm::vec2 position{0.0f, 0.0f};
+    glm::vec2 size{0.0f, 0.0f};
+    glm::vec4 color{0.0f, 0.0f, 0.0f, 0.5f};
+};
+
+// Tout le HUD d'une frame. Les rects sont émis AVANT les textes : le HUD tient en un
+// seul draw, donc l'ordre des instances EST l'ordre de mélange — une plaque émise
+// après son texte le recouvrirait.
+struct Hud {
+    std::vector<HudRect> rects;
+    std::vector<TextDraw> texts;
+};
+
 // Renderer générique : il ne connaît PAS la scène. L'app crée des maillages puis
 // soumet une liste de DrawItem par frame. Toute la logique de simulation/monde
 // (et les double) reste au-dessus.
@@ -187,7 +226,9 @@ public:
     InstanceBufferId create_instances(const std::vector<InstanceData>& instances);
     void destroy_instances(InstanceBufferId id);
 
-    void draw_frame(const FrameUniforms& uniforms, const std::vector<DrawItem>& items);
+    // `hud` par défaut = aucun HUD : l'écran de chargement appelle draw_frame sans lui.
+    void draw_frame(const FrameUniforms& uniforms, const std::vector<DrawItem>& items,
+                    const Hud& hud = {});
     void wait_idle();
     void notify_resized() { framebuffer_resized_ = true; }
 
@@ -351,6 +392,15 @@ private:
     void record_skybox(VkCommandBuffer cmd);
     void destroy_environment_gpu(Environment& env);
 
+    // HUD (M13) : pipeline écran, instancié, sans texture ni push constant.
+    bool create_hud_pipeline_layout();  // set 0 seul, ZÉRO push constant
+    bool create_hud_pipeline();
+    bool create_hud_buffers();  // un tampon d'instances par frame en vol
+    // Convertit le HUD de l'app en instances et les écrit dans le tampon de la frame
+    // courante. Renvoie le nombre d'instances (0 = rien à dessiner).
+    std::uint32_t upload_hud(const Hud& hud);
+    void record_hud(VkCommandBuffer cmd, std::uint32_t glyph_count);
+
     // Ombres (M8 étape 1) : passe depth-only du soleil, une par cascade.
     bool create_shadow_render_pass();
     bool create_shadow_resources();        // images + vues + framebuffers des cascades
@@ -374,7 +424,7 @@ private:
                                       VkPipelineLayout layout);
     VkShaderModule create_shader_module(const unsigned char* code, std::size_t size);
     void record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
-                         const std::vector<DrawItem>& items);
+                         const std::vector<DrawItem>& items, std::uint32_t glyph_count);
     void recreate_swapchain();
     void destroy_depth_resources();
     void process_deferred_deletes();
@@ -408,6 +458,21 @@ private:
     // l'instance (amplitude du vent), pas dans le pipeline.
     VkPipeline pipeline_foliage_ = VK_NULL_HANDLE;
     VkPipeline pipeline_wire_ = VK_NULL_HANDLE;  // câbles (M12) : ruban + fondu alpha
+
+    // --- HUD (M13) -----------------------------------------------------------
+    // Dessiné en TOUT DERNIER dans la passe principale, après le ciel : sans profondeur
+    // et par-dessus tout le reste. Un seul draw instancié pour l'écran entier.
+    VkPipelineLayout hud_pipeline_layout_ = VK_NULL_HANDLE;  // set 0 seul, 0 push
+    VkPipeline hud_pipeline_ = VK_NULL_HANDLE;
+    // Un tampon PAR FRAME EN VOL : contrairement aux tampons d'instances de la
+    // végétation (écrits une fois au semis), celui-ci est réécrit à chaque frame. En
+    // écrire un seul reviendrait à modifier de la mémoire encore lue par la frame
+    // précédente. Même raisonnement, et même durée de vie, que uniform_buffers_.
+    std::vector<GpuBuffer> hud_buffers_;  // kFramesInFlight
+    // 512 glyphes = ~8 lignes de 60 caractères, très au-delà d'un HUD de cabine. À
+    // 40 octets l'instance, les deux tampons pèsent 40 Ko.
+    static constexpr std::uint32_t kMaxGlyphs = 512;
+
     std::unordered_map<InstanceBufferId, GpuBuffer> instance_buffers_;
     InstanceBufferId next_instance_id_ = 1;
     std::unordered_map<TextureId, Texture> textures_;

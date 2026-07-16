@@ -38,6 +38,8 @@ noire_add_shaders(noire_render
     shaders/wire.frag
     shaders/mesh_instanced.vert
     shaders/foliage.frag
+    shaders/hud.vert
+    shaders/hud.frag
     shaders/shadow_instanced.vert
     shaders/shadow_foliage.frag
     shaders/prefilter_env.comp)

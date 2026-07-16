@@ -11,12 +11,15 @@
 #include <cstring>
 
 #include "noire/core/log.hpp"
+#include "hud_font.hpp"
 
 // En-têtes SPIR-V embarqués (générés au build : voir cmake/Shaders.cmake).
 #include "shaders/mesh.frag.spv.h"
 #include "shaders/mesh.vert.spv.h"
 #include "shaders/mesh_textured.frag.spv.h"
 #include "shaders/foliage.frag.spv.h"
+#include "shaders/hud.frag.spv.h"
+#include "shaders/hud.vert.spv.h"
 #include "shaders/mesh_instanced.vert.spv.h"
 #include "shaders/mesh_textured.vert.spv.h"
 #include "shaders/prefilter_env.comp.spv.h"
@@ -64,6 +67,18 @@ struct GpuFrameUniforms {
     glm::vec4 sh[9];
 };
 static_assert(kShadowCascades <= 4, "cascade_splits (vec4) ne porte que 4 distances");
+
+// Une instance du HUD (M13) : UN glyphe, ou UNE plaque de fond (= un glyphe plein).
+// Miroir exact des entrées de hud.vert. C'est un tampon de SOMMETS, pas un bloc
+// uniforme : aucune règle std140 ne s'y applique, seul l'alignement des attributs
+// compte (tous multiples de 4 octets, stride 40).
+struct GlyphInstance {
+    glm::vec2 position;  // px, coin haut-gauche
+    glm::vec2 size;      // px
+    glm::uvec2 bits;     // masque 5x7 : x = bits 0..31, y = bits 32..34
+    glm::vec4 color;     // LINÉAIRE
+};
+static_assert(sizeof(GlyphInstance) == 40, "stride décrit à la main dans create_hud_pipeline");
 
 // Push constants du pipeline texturé : miroir exact du bloc du même nom dans
 // mesh_textured.vert/.frag. Le modèle est lu au vertex, les facteurs au fragment.
@@ -187,6 +202,13 @@ bool Renderer::initialize(const RendererCreateInfo& info) {
     }
 
     if (!create_skybox_pipeline_layout() || !create_skybox_pipeline()) {
+        return false;
+    }
+
+    // HUD (M13). Ne dépend que de render_pass_ et descriptor_set_layout_ (set 0) : ni
+    // matériau, ni texture, ni environnement. Sa police est embarquée en dur, donc il est
+    // dessinable dès la toute première frame.
+    if (!create_hud_pipeline_layout() || !create_hud_buffers() || !create_hud_pipeline()) {
         return false;
     }
 
@@ -1923,6 +1945,252 @@ VkPipeline Renderer::build_wire_pipeline() {
     return pipeline;
 }
 
+// --- HUD (M13) ---------------------------------------------------------------------
+//
+// TOUT LE HUD TIENT EN UN vkCmdDraw. Un glyphe = une instance ; une plaque de fond = une
+// instance (un glyphe dont les 35 bits sont à 1). Le quad est engendré depuis
+// gl_VertexIndex, le masque de la police voyage DANS l'instance : donc aucune texture,
+// aucun sampler, aucun descriptor set propre, et rien à attendre d'un téléversement
+// asynchrone. ~100 glyphes de 15x21 px sans profondeur ni fetch => ~0,02 ms.
+
+bool Renderer::create_hud_pipeline_layout() {
+    // set 0 SEUL, et zéro push constant : le HUD n'a besoin que de la taille du viewport,
+    // déjà publiée dans l'UBO global (params.zw). Le layout du set 0 porte aussi le
+    // sampler des cascades d'ombre, que hud.frag ne consomme pas — c'est permis, et déjà
+    // le cas de mesh.frag (cf. create_descriptor_set_layout).
+    VkPipelineLayoutCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    info.setLayoutCount = 1;
+    info.pSetLayouts = &descriptor_set_layout_;
+    if (vkCreatePipelineLayout(context_.device(), &info, nullptr, &hud_pipeline_layout_) !=
+        VK_SUCCESS) {
+        log::error("Renderer : création du pipeline layout du HUD échouée");
+        return false;
+    }
+    return true;
+}
+
+bool Renderer::create_hud_buffers() {
+    hud_buffers_.resize(kFramesInFlight);
+    const VkDeviceSize size = sizeof(GlyphInstance) * kMaxGlyphs;
+    for (int i = 0; i < kFramesInFlight; ++i) {
+        if (!context_.create_buffer(size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                                    /*host_visible=*/true,
+                                    hud_buffers_[static_cast<std::size_t>(i)])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool Renderer::create_hud_pipeline() {
+    VkShaderModule vert = create_shader_module(hud_vert_spv, hud_vert_spv_size);
+    VkShaderModule frag = create_shader_module(hud_frag_spv, hud_frag_spv_size);
+    if (vert == VK_NULL_HANDLE || frag == VK_NULL_HANDLE) {
+        return false;
+    }
+    VkPipelineShaderStageCreateInfo vs{};
+    vs.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    vs.stage = VK_SHADER_STAGE_VERTEX_BIT;
+    vs.module = vert;
+    vs.pName = "main";
+    VkPipelineShaderStageCreateInfo fs{};
+    fs.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    fs.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    fs.module = frag;
+    fs.pName = "main";
+    const std::array<VkPipelineShaderStageCreateInfo, 2> stages{vs, fs};
+
+    // UNE SEULE binding, et elle est par INSTANCE : il n'y a aucun tampon de géométrie,
+    // les 6 sommets du quad sortent de gl_VertexIndex. Un pipeline dont la seule entrée
+    // est cadencée à l'instance est parfaitement légal.
+    VkVertexInputBindingDescription binding{};
+    binding.binding = 0;
+    binding.stride = sizeof(GlyphInstance);
+    binding.inputRate = VK_VERTEX_INPUT_RATE_INSTANCE;
+
+    std::array<VkVertexInputAttributeDescription, 4> attrs{};
+    attrs[0] = {0, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(GlyphInstance, position)};
+    attrs[1] = {1, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(GlyphInstance, size)};
+    // _UINT et non _SFLOAT : hud.vert lit un uvec2. Un décalage de type numérique entre
+    // l'attribut et l'entrée du shader est une erreur de création de pipeline, pas une
+    // conversion silencieuse.
+    attrs[2] = {2, 0, VK_FORMAT_R32G32_UINT, offsetof(GlyphInstance, bits)};
+    attrs[3] = {3, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(GlyphInstance, color)};
+
+    VkPipelineVertexInputStateCreateInfo vi{};
+    vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vi.vertexBindingDescriptionCount = 1;
+    vi.pVertexBindingDescriptions = &binding;
+    vi.vertexAttributeDescriptionCount = static_cast<std::uint32_t>(attrs.size());
+    vi.pVertexAttributeDescriptions = attrs.data();
+
+    VkPipelineInputAssemblyStateCreateInfo ia{};
+    ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkPipelineViewportStateCreateInfo vp{};
+    vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    vp.viewportCount = 1;
+    vp.scissorCount = 1;
+
+    VkPipelineRasterizationStateCreateInfo rs{};
+    rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo ms{};
+    ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineDepthStencilStateCreateInfo ds{};
+    ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    // SEUL pipeline du moteur sans test de profondeur : le HUD est à l'écran, pas dans
+    // le monde. La structure doit rester renseignée (sType compris) et fournie : le
+    // subpass a un attachement de profondeur, un pDepthStencilState nul y serait une faute.
+    ds.depthTestEnable = VK_FALSE;
+    ds.depthWriteEnable = VK_FALSE;
+
+    VkPipelineColorBlendAttachmentState ba{};
+    ba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                        VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    // Mélange « over » classique (même bloc que les câbles). Il a lieu en espace LINÉAIRE :
+    // l'attachement est _SRGB, donc le matériel décode avant de mélanger et réencode après.
+    // C'est le comportement CORRECT pour nos couleurs linéaires — ne pas le « corriger ».
+    ba.blendEnable = VK_TRUE;
+    ba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+    ba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    ba.colorBlendOp = VK_BLEND_OP_ADD;
+    ba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    ba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    ba.alphaBlendOp = VK_BLEND_OP_ADD;
+    VkPipelineColorBlendStateCreateInfo cb{};
+    cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    cb.attachmentCount = 1;
+    cb.pAttachments = &ba;
+
+    const std::array<VkDynamicState, 2> dyn_states{VK_DYNAMIC_STATE_VIEWPORT,
+                                                   VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dyn{};
+    dyn.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dyn.dynamicStateCount = static_cast<std::uint32_t>(dyn_states.size());
+    dyn.pDynamicStates = dyn_states.data();
+
+    VkGraphicsPipelineCreateInfo pipe{};
+    pipe.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pipe.stageCount = static_cast<std::uint32_t>(stages.size());
+    pipe.pStages = stages.data();
+    pipe.pVertexInputState = &vi;
+    pipe.pInputAssemblyState = &ia;
+    pipe.pViewportState = &vp;
+    pipe.pRasterizationState = &rs;
+    pipe.pMultisampleState = &ms;
+    pipe.pDepthStencilState = &ds;
+    pipe.pColorBlendState = &cb;
+    pipe.pDynamicState = &dyn;
+    pipe.layout = hud_pipeline_layout_;
+    pipe.renderPass = render_pass_;
+    pipe.subpass = 0;
+
+    const VkResult res = vkCreateGraphicsPipelines(context_.device(), VK_NULL_HANDLE, 1, &pipe,
+                                                   nullptr, &hud_pipeline_);
+    vkDestroyShaderModule(context_.device(), frag, nullptr);
+    vkDestroyShaderModule(context_.device(), vert, nullptr);
+    if (res != VK_SUCCESS) {
+        log::error("Vulkan : création du pipeline du HUD échouée");
+        hud_pipeline_ = VK_NULL_HANDLE;
+        return false;
+    }
+    return true;
+}
+
+std::uint32_t Renderer::upload_hud(const Hud& hud) {
+    if (hud.rects.empty() && hud.texts.empty()) {
+        return 0;
+    }
+
+    // On construit CÔTÉ CPU puis on écrit d'un seul memcpy : la mémoire mappée est
+    // allouée en HOST_ACCESS_SEQUENTIAL_WRITE, donc potentiellement write-combined. La
+    // relire (ou l'écrire dans le désordre) coûterait très cher.
+    std::vector<GlyphInstance> instances;
+    instances.reserve(hud.rects.size() + 64);
+
+    auto pack_bits = [](std::uint64_t bits) {
+        return glm::uvec2(static_cast<std::uint32_t>(bits & 0xffffffffu),
+                          static_cast<std::uint32_t>(bits >> 32));
+    };
+
+    // Les plaques D'ABORD : un seul draw => l'ordre des instances est l'ordre de mélange.
+    for (const HudRect& rect : hud.rects) {
+        if (instances.size() >= kMaxGlyphs) break;
+        GlyphInstance gi{};
+        gi.position = glm::round(rect.position);
+        gi.size = glm::round(rect.size);
+        gi.bits = pack_bits(font::kGlyphBlock);
+        gi.color = rect.color;
+        instances.push_back(gi);
+    }
+
+    for (const TextDraw& text : hud.texts) {
+        // ÉCHELLE ENTIÈRE : c'est ce qui rend le texte net. Le fragment retrouve son
+        // texel par un floor() sur une grille 5x7 ; si un texel couvrait 2,5 px, il en
+        // prendrait tantôt 2 tantôt 3 et les jambages seraient irréguliers.
+        const auto px = static_cast<float>(std::max(1L, std::lround(text.scale)));
+        const float advance = (font::kGlyphWidth + 1) * px;  // 1 texel de chasse
+        const glm::vec2 origin = glm::round(text.position);
+        float pen = 0.0f;
+        for (const char c : text.text) {
+            const std::uint64_t bits = font::glyph_bits(c);
+            // Espace et caractères hors police : on avance sans émettre d'instance.
+            if (bits != 0) {
+                if (instances.size() >= kMaxGlyphs) break;
+                GlyphInstance gi{};
+                gi.position = origin + glm::vec2(pen, 0.0f);
+                gi.size = glm::vec2(font::kGlyphWidth, font::kGlyphHeight) * px;
+                gi.bits = pack_bits(bits);
+                gi.color = text.color;
+                instances.push_back(gi);
+            }
+            pen += advance;
+        }
+    }
+
+    if (instances.empty()) {
+        return 0;
+    }
+    if (instances.size() >= kMaxGlyphs) {
+        log::warn("HUD : {} glyphes demandés, tronqué à {}", instances.size(), kMaxGlyphs);
+    }
+
+    // Même point, et même garantie, que le memcpy de l'UBO juste au-dessus : le
+    // vkWaitForFences de CE slot est déjà passé, donc plus aucune frame en vol ne lit ce
+    // tampon. Mémoire cohérente => aucun flush (le moteur entier en fait déjà le pari).
+    std::memcpy(hud_buffers_[current_frame_].mapped, instances.data(),
+                instances.size() * sizeof(GlyphInstance));
+    return static_cast<std::uint32_t>(instances.size());
+}
+
+void Renderer::record_hud(VkCommandBuffer cmd, std::uint32_t glyph_count) {
+    // Chemin NORMAL au chargement (HUD vide) : dessiner 0 instance reste une faute, les
+    // bindings de sommets étant vérifiés quel qu'en soit le nombre.
+    if (glyph_count == 0 || hud_pipeline_ == VK_NULL_HANDLE) {
+        return;
+    }
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, hud_pipeline_);
+    // CE BIND N'EST PAS FACULTATIF. hud_pipeline_layout_ n'a aucun push constant, alors
+    // que textured_pipeline_layout_ en a 96 octets : des plages de push différentes
+    // rendent les layouts INCOMPATIBLES, ce qui défait TOUS les sets déjà liés. Et on ne
+    // peut pas non plus hériter du bind de la skybox : record_skybox retourne sans rien
+    // faire quand aucun environnement n'est prêt.
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, hud_pipeline_layout_, 0, 1,
+                            &descriptor_sets_[current_frame_], 0, nullptr);
+    const VkDeviceSize offset = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &hud_buffers_[current_frame_].buffer, &offset);
+    vkCmdDraw(cmd, 6, glyph_count, 0, 0);
+}
+
 VkPipeline Renderer::build_terrain_pipeline() {
     return build_surface_pipeline(terrain_frag_spv, terrain_frag_spv_size,
                                   terrain_pipeline_layout_);
@@ -3091,7 +3359,7 @@ void Renderer::destroy_texture(TextureId id) {
 }
 
 void Renderer::record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
-                               const std::vector<DrawItem>& items) {
+                               const std::vector<DrawItem>& items, std::uint32_t glyph_count) {
     VkCommandBufferBeginInfo begin{};
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     vkBeginCommandBuffer(cmd, &begin);
@@ -3226,6 +3494,11 @@ void Renderer::record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
     // coûterait un fragment plein écran systématiquement.
     record_skybox(cmd);
 
+    // Le HUD APRÈS le ciel, donc en tout dernier : il est à l'écran, sans profondeur, et
+    // doit couvrir la scène entière. Toujours dans la MÊME passe : aucun attachement à
+    // retransitionner, aucune render pass de plus.
+    record_hud(cmd, glyph_count);
+
     vkCmdEndRenderPass(cmd);
 
     if (timestamp_pool_ != VK_NULL_HANDLE) {
@@ -3235,7 +3508,8 @@ void Renderer::record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
     vkEndCommandBuffer(cmd);
 }
 
-void Renderer::draw_frame(const FrameUniforms& uniforms, const std::vector<DrawItem>& items) {
+void Renderer::draw_frame(const FrameUniforms& uniforms, const std::vector<DrawItem>& items,
+                          const Hud& hud) {
     VkDevice dev = context_.device();
 
     // Compteur de frames monotone + traitement des destructions GPU différées.
@@ -3305,11 +3579,14 @@ void Renderer::draw_frame(const FrameUniforms& uniforms, const std::vector<DrawI
     }
     std::memcpy(uniform_buffers_[current_frame_].mapped, &gpu, sizeof(GpuFrameUniforms));
 
+    // Glyphes du HUD : même slot, même fence, donc même garantie que l'UBO ci-dessus.
+    const std::uint32_t glyph_count = upload_hud(hud);
+
     vkResetFences(dev, 1, &in_flight_[current_frame_]);
 
     VkCommandBuffer cmd = command_buffers_[current_frame_];
     vkResetCommandBuffer(cmd, 0);
-    record_commands(cmd, image_index, items);
+    record_commands(cmd, image_index, items, glyph_count);
 
     VkSemaphore wait_semaphores[] = {image_available_[current_frame_]};
     VkPipelineStageFlags wait_stages[] = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
@@ -3433,6 +3710,19 @@ void Renderer::shutdown() {
         vkDestroyPipeline(dev, pipeline_wire_, nullptr);
         pipeline_wire_ = VK_NULL_HANDLE;
     }
+    // HUD (M13) : pipeline avant son layout, comme partout ailleurs.
+    if (hud_pipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(dev, hud_pipeline_, nullptr);
+        hud_pipeline_ = VK_NULL_HANDLE;
+    }
+    if (hud_pipeline_layout_ != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(dev, hud_pipeline_layout_, nullptr);
+        hud_pipeline_layout_ = VK_NULL_HANDLE;
+    }
+    for (GpuBuffer& buffer : hud_buffers_) {
+        context_.destroy_buffer(buffer);
+    }
+    hud_buffers_.clear();
     for (auto& [id, buffer] : instance_buffers_) {
         context_.destroy_buffer(buffer);
     }

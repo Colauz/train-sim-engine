@@ -6,6 +6,8 @@
 #include <cstdlib>
 #include <cmath>
 #include <cstdint>
+#include <format>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -35,12 +37,37 @@ namespace {
 
 constexpr WorldPosition kTrackOrigin{1000000.0, 0.0, 1000000.0};
 
-physics::WagonConfig make_loco_config() {
+// Rame TGV (M13). Chiffres calés sur un TGV Duplex, et cohérents entre eux — c'est cette
+// cohérence, pas chaque valeur prise isolément, qui fait la conduite.
+//
+// DEUX ÉCHELLES, UN SEUL CORPS — à savoir avant de toucher à quoi que ce soit ici : le
+// maillage visible est UNE motrice (d'où wheelbase = 14 m), mais la physique simule la
+// RAME ENTIÈRE (400 t, 200 m). `wheelbase` sert donc la géométrie visible, et
+// `train_length` (frein pneumatique) la longueur réelle. Les deux ne se contredisent pas,
+// elles ne parlent simplement pas du même objet.
+physics::WagonConfig make_tgv_config() {
     physics::WagonConfig c;
-    c.mass = 80000.0;
+    c.mass = 400000.0;  // rame complète en charge
+    // 2 motrices x 68 t. Le reste de la rame est REMORQUÉ : ces 136 t sont tout ce qui
+    // tient le rail en traction. Voir WagonConfig::adhesive_mass.
+    c.adhesive_mass = 136000.0;
     c.wheelbase = 14.0;
-    c.max_tractive_effort = 300000.0;
-    c.max_brake_force = 350000.0;
+    c.max_tractive_effort = 220000.0;  // effort au démarrage
+    // 8800 kW à la jante => vitesse de base = 8.8e6 / 220e3 = 40 m/s = 144 km/h. Au-delà,
+    // l'effort s'effondre en P/v : à 320 km/h il ne reste que 99 kN.
+    c.max_power = 8800000.0;
+    c.max_brake_force = 300000.0;  // service maximal => 0,75 m/s²
+    // Davis calé pour que R(320 km/h) = 74 kN, soit 6,6 MW en croisière sur les 8,8
+    // disponibles : la réserve de puissance est réaliste, et l'équilibre P/v = R tombe
+    // vers 98 m/s (354 km/h). 320 est donc atteignable, mais pas gratuit.
+    c.davis_a = 3000.0;
+    c.davis_b = 90.0;
+    c.davis_c = 8.0;  // traînée aéro : 63 kN des 74 kN à 320 km/h
+    // RÉ-ÉTALONNÉ AU M13 (0.03 -> 0.12) : le tangage est proportionnel à l'accélération
+    // longitudinale, qui passe de 3,75 m/s² (l'ancienne loco de 80 t) à 0,55 m/s² sur une
+    // rame de 400 t — sept fois moins. À 0.03, la caisse ne bougeait plus du tout et le
+    // M13 aurait supprimé en silence la suspension du M4.
+    c.pitch_gain = 0.12;
     return c;
 }
 
@@ -208,7 +235,7 @@ struct Application::Impl {
           engine(EngineConfig{config.simulation_hz, 0}),
           track(kTrackOrigin),
           terrain(track),
-          wagon(make_loco_config()),
+          wagon(make_tgv_config()),
           streamer(track, jobs, make_streamer_config()),
           clipmap(terrain, jobs, make_clipmap_config()),
           resources(renderer, jobs, asset_paths) {}
@@ -352,6 +379,17 @@ struct Application::Impl {
     float orbit_pitch = 0.30f;
     float orbit_distance = 42.0f;
 
+    // Manipulateur de traction : position PERSISTANTE 0..1, poussée à ~0,5/s (course
+    // complète en 2 s). Intégrée au pas FIXE dans update_physics, jamais à la fréquence
+    // d'affichage : le Wagon est déterministe, et y injecter un intégrateur cadencé sur
+    // le temps réel casserait la reproductibilité (le motif même qui a imposé NOIRE_PIN_CAM).
+    double throttle_handle = 0.0;
+    // Consignes relevées par update_input (variable), consommées par update_physics (fixe).
+    bool key_throttle_up = false;
+    bool key_throttle_down = false;
+    bool key_brake = false;
+    bool key_emergency = false;
+
     float wetness = 0.0f;
     float wetness_target = 0.0f;
     bool prev_m_down = false;
@@ -489,7 +527,12 @@ struct Application::Impl {
 
         wagon.attach(&track);
         wagon.place_at(0.0);
-        wagon.set_speed(25.0);
+        // NOIRE_SPEED : vitesse initiale en km/h, pour le banc. Une rame de 400 t met
+        // 5 min 30 pour atteindre 320 km/h — c'est le RÉSULTAT VOULU du M13, mais ça rend
+        // intenable le moindre essai à grande vitesse. Même esprit que NOIRE_STILL /
+        // NOIRE_PIN_CAM / NOIRE_CREEP : un levier de mesure, jamais un défaut de jeu.
+        const char* speed_env = std::getenv("NOIRE_SPEED");
+        wagon.set_speed(speed_env != nullptr ? std::atof(speed_env) / 3.6 : 25.0);
         window.set_cursor_captured(true);
 
         EngineHooks hooks;
@@ -500,15 +543,23 @@ struct Application::Impl {
         hooks.render = [this](double /*interpolation*/) { render_frame(); };
         engine.set_hooks(std::move(hooks));
 
-        log::info("Commandes : W/Z=traction, S=frein, M=pluie | souris=orbite, Espace/Maj=zoom, Échap=quitter");
+        log::info("Commandes : Z/S (ou Flèches)=manipulateur de traction, Espace=frein, "
+                  "E=URGENCE, M=pluie | souris=orbite, Ctrl/Maj=zoom, Échap=quitter");
         return engine.initialize();
     }
 
     void update_input(double dt) {
         using platform::Key;
 
-        wagon.set_controls((window.is_key_down(Key::W) || window.is_key_down(Key::Z)) ? 1.0 : 0.0,
-                           window.is_key_down(Key::S) ? 1.0 : 0.0);
+        // On RELÈVE seulement l'état des touches ici (variable_update, cadencé sur
+        // l'affichage). L'intégration du manipulateur se fait au pas fixe dans
+        // update_physics : voir throttle_handle. W est synonyme de Z (l'enum sert AZERTY
+        // et QWERTY), Flèche Haut/Bas double Z/S.
+        key_throttle_up = window.is_key_down(Key::Z) || window.is_key_down(Key::W) ||
+                          window.is_key_down(Key::Up);
+        key_throttle_down = window.is_key_down(Key::S) || window.is_key_down(Key::Down);
+        key_brake = window.is_key_down(Key::Space);      // frein de service (maintenu)
+        key_emergency = window.is_key_down(Key::E);      // frein d'urgence
         if (window.is_key_down(Key::Escape)) {
             window.request_close();
         }
@@ -539,7 +590,8 @@ struct Application::Impl {
         const platform::CursorDelta d = window.consume_cursor_delta();
         orbit_yaw += static_cast<float>(d.dx) * 0.005f;
         orbit_pitch = glm::clamp(orbit_pitch - static_cast<float>(d.dy) * 0.005f, -1.30f, 1.30f);
-        if (window.is_key_down(Key::Space)) orbit_distance += static_cast<float>(25.0 * dt);
+        // Zoom déplacé sur Ctrl/Maj gauche : Espace est désormais le frein de service.
+        if (window.is_key_down(Key::LeftControl)) orbit_distance += static_cast<float>(25.0 * dt);
         if (window.is_key_down(Key::LeftShift)) orbit_distance -= static_cast<float>(25.0 * dt);
         orbit_distance = glm::clamp(orbit_distance, 12.0f, 200.0f);
     }
@@ -552,6 +604,20 @@ struct Application::Impl {
             sim_time += dt;
             return;
         }
+
+        // Manipulateur de traction : intégré ICI, au pas FIXE, pour rester déterministe.
+        // Course complète en 2 s (0,5/s). Persistant : il reste où on le laisse.
+        if (key_throttle_up) {
+            throttle_handle = std::min(1.0, throttle_handle + dt * 0.5);
+        } else if (key_throttle_down) {
+            throttle_handle = std::max(0.0, throttle_handle - dt * 0.5);
+        }
+        wagon.set_controls(throttle_handle, key_brake ? 1.0 : 0.0, key_emergency);
+        // La météo pilote l'adhérence : sec = 1, pluie battante = 0,36 (µ ~ 0,12). C'est
+        // ce qui rend le patinage — hors d'atteinte à sec avec ces chiffres — possible
+        // sous la pluie au-delà de ~71 % de traction.
+        wagon.set_adhesion_scale(static_cast<double>(glm::mix(1.0f, 0.36f, wetness)));
+
         wagon.update(dt);
 
         // --- Audio ferroviaire procédural (piloté par l'état physique) ---
@@ -581,6 +647,64 @@ struct Application::Impl {
                       wagon.slipping() ? "PATINE   " : "adherent ", streamer.active_chunk_count(),
                       wetness * 100.0f, perf_fps, perf_gpu_ms, tree_count);
         }
+    }
+
+    // --- HUD (M13) ---------------------------------------------------------------
+    // Le pupitre. Le Renderer sait dessiner du texte à des pixels ; ce qu'on y écrit se
+    // décide ICI, avec le reste de la logique de simulation.
+    //
+    // Toutes les couleurs sont LINÉAIRES : la swapchain est SRGB et l'encodage est
+    // matériel. Un « blanc » à 0.8 linéaire sort donc bien plus clair que 0.8 sRGB.
+    [[nodiscard]] render::Hud build_hud() const {
+        // Échelle ENTIÈRE (le Renderer l'arrondit de toute façon) : à 3, un glyphe fait
+        // 15x21 px et sa chasse 18 px.
+        constexpr float kScale = 3.0f;
+        constexpr float kAdvance = 6.0f * kScale;   // (5 + 1 texel de chasse) * échelle
+        constexpr float kLine = 7.0f * kScale + 8.0f;  // hauteur du glyphe + interligne
+        constexpr float kPad = 14.0f;
+        constexpr float kOrigin = 24.0f;
+
+        const glm::vec4 label{0.75f, 0.78f, 0.82f, 1.0f};
+        const glm::vec4 value{1.0f, 1.0f, 1.0f, 1.0f};
+        const glm::vec4 alert{1.0f, 0.15f, 0.10f, 1.0f};
+
+        const auto& brake = wagon.air_brake();
+        std::vector<std::pair<std::string, glm::vec4>> lines;
+        lines.emplace_back(std::format("VITESSE  {:>5.0f} KM/H", wagon.speed() * 3.6), value);
+        // Position du MANIPULATEUR (la consigne du mécanicien), pas l'effort réellement
+        // appliqué après la rampe de la chaîne de traction.
+        lines.emplace_back(std::format("TRACTION {:>5.0f} %", throttle_handle * 100.0), value);
+        // CG = conduite générale. Sa pression EST l'état du frein que lit le mécanicien :
+        // 5 bar = desserré, elle chute quand on serre.
+        lines.emplace_back(std::format("CG      {:>5.1f} BAR", brake.pipe_pressure()),
+                           brake.emergency() ? alert : value);
+        lines.emplace_back(std::format("PENTE    {:>+5.1f} %", wagon.grade_percent()), label);
+        lines.emplace_back(std::format("{:>3.0f} FPS  GPU {:.1f} MS", perf_fps, perf_gpu_ms), label);
+        if (brake.emergency()) {
+            lines.emplace_back("URGENCE", alert);
+        } else if (wagon.slipping()) {
+            // À sec, seul le patinage à la TRACTION lève ce témoin (le freinage n'atteint
+            // jamais l'adhérence). Sous la pluie, l'enrayage d'un freinage d'urgence aussi.
+            lines.emplace_back("PATINAGE", alert);
+        }
+
+        // La plaque se dimensionne sur le contenu : une taille en dur se décalerait au
+        // premier libellé rallongé.
+        std::size_t widest = 0;
+        for (const auto& [text, color] : lines) {
+            widest = std::max(widest, text.size());
+        }
+        const float plate_w = static_cast<float>(widest) * kAdvance + 2.0f * kPad;
+        const float plate_h = static_cast<float>(lines.size()) * kLine + 2.0f * kPad - 8.0f;
+
+        render::Hud hud;
+        hud.rects.push_back({{kOrigin, kOrigin}, {plate_w, plate_h}, {0.0f, 0.0f, 0.0f, 0.45f}});
+        float y = kOrigin + kPad;
+        for (const auto& [text, color] : lines) {
+            hud.texts.push_back({{kOrigin + kPad, y}, kScale, color, text});
+            y += kLine;
+        }
+        return hud;
     }
 
     // Sème la végétation autour du train. Appelé quand le train change de cellule.
@@ -1006,7 +1130,7 @@ struct Application::Impl {
                                              catenary_mesh, wire_material});
         }
 
-        renderer.draw_frame(uniforms, items);
+        renderer.draw_frame(uniforms, items, build_hud());
     }
 
     void shutdown() {

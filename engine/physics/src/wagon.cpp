@@ -11,9 +11,9 @@ constexpr double kGravity = 9.81;
 double clamp01(double x) { return std::clamp(x, 0.0, 1.0); }
 }  // namespace
 
-void Wagon::set_controls(double throttle, double brake) {
+void Wagon::set_controls(double throttle, double brake, bool emergency) {
     throttle_input_ = clamp01(throttle);
-    brake_ = clamp01(brake);
+    air_brake_.set_handle(brake, emergency);
 }
 
 void Wagon::place_at(double chainage) {
@@ -32,6 +32,11 @@ void Wagon::update(double dt) {
         return;
     }
 
+    // Vitesse d'ENTRÉE du pas. Relevée ici, avant toute modification : l'hyperbole de
+    // puissance comme l'accélération longitudinale (tangage) s'y réfèrent, et les faire
+    // travailler sur une vitesse déjà à moitié intégrée mélangerait deux instants.
+    const double v_before = velocity_;
+
     // Rampe de traction vers la consigne (notch) : montée ~2 s, coupure plus rapide.
     if (throttle_ < throttle_input_) {
         throttle_ = std::min(throttle_input_, throttle_ + dt / 2.0);
@@ -48,37 +53,70 @@ void Wagon::update(double dt) {
     grade_percent_ = (cos_theta > 1e-6) ? (sin_theta / cos_theta) * 100.0 : 0.0;
 
     const double normal_force = config_.mass * kGravity * cos_theta;
+    // Charge sur les essieux MOTEURS. Elle seule tient le rail en traction : le reste de
+    // la rame est remorqué. Les deux limites diffèrent donc, et pas d'un peu — sur un
+    // TGV, la masse adhérente vaut un tiers de la masse totale.
+    const double adhesive_mass =
+        (config_.adhesive_mass > 0.0) ? config_.adhesive_mass : config_.mass;
+    const double traction_normal_force = adhesive_mass * kGravity * cos_theta;
 
-    // --- Traction limitée par l'adhérence ---
-    const double demand = throttle_ * config_.max_tractive_effort;
-    const double adhesion_static = config_.adhesion_static * normal_force;
-    const double adhesion_kinetic = config_.adhesion_kinetic * normal_force;
+    // --- Effort disponible : plafond d'effort, puis hyperbole de puissance ---
+    // Le plafond s'applique AVANT le manipulateur, jamais après : prendre
+    // min(throttle * effort_max, P/v) donnerait la PLEINE PUISSANCE à mi-manipulateur,
+    // puisque le minimum retomberait sur P/v dès que la vitesse est un peu élevée.
+    double available = config_.max_tractive_effort;
+    if (config_.max_power > 0.0) {
+        // v_before : la vitesse de CE pas, avant que la phase 1 ne la modifie.
+        // Le plancher évite la division par zéro à l'arrêt (et le 0/0 = NaN si jamais
+        // max_power venait à valoir 0 malgré la garde).
+        const double v = std::max(std::abs(v_before), 1e-3);
+        available = std::min(available, config_.max_power / v);
+    }
+    const double demand = throttle_ * available;
+
+    // --- Traction limitée par l'adhérence (des seuls essieux moteurs) ---
+    // adhesion_scale_ : la météo. Sous la pluie il tombe sous 1, l'adhérence avec, et le
+    // patinage — impossible à sec avec ces chiffres — redevient atteignable.
+    const double mu_static = config_.adhesion_static * adhesion_scale_;
+    const double mu_kinetic = config_.adhesion_kinetic * adhesion_scale_;
+    const double traction_adhesion_static = mu_static * traction_normal_force;
+    const double traction_adhesion_kinetic = mu_kinetic * traction_normal_force;
+    const double adhesion_static = mu_static * normal_force;
+    const double adhesion_kinetic = mu_kinetic * normal_force;
     slipping_ = false;
     double tractive = demand;
-    if (demand > adhesion_static) {
+    if (demand > traction_adhesion_static) {
         slipping_ = true;
-        tractive = adhesion_kinetic;
+        tractive = traction_adhesion_kinetic;
     }
     tractive_effort_ = tractive;
 
     // --- Gravité projetée sur la voie ---
     const double gravity_force = -config_.mass * kGravity * sin_theta;
 
-    const double v_before = velocity_;
-
     // Phase 1 — propulsif.
     const double propulsive = tractive + gravity_force;
     velocity_ += (propulsive / config_.mass) * dt;
 
     // Phase 2 — résistif (ne peut pas inverser le sens).
-    double brake_force = brake_ * config_.max_brake_force;
+    // Frein pneumatique : sa fraction d'effort sort de toute la chaîne CG -> cylindres.
+    // Serrer le robinet ne fait donc PAS chuter brake_force tout de suite — l'onde met un
+    // temps mort à partir, puis l'effort monte de lui-même sur plusieurs secondes.
+    air_brake_.update(dt);
+    double brake_force = air_brake_.force_fraction() * config_.max_brake_force;
+    // Enrayage : au-delà de l'adhérence (des essieux freinés, donc masse TOTALE), la roue
+    // se bloque et glisse. À sec c'est hors d'atteinte (1,3 MN contre 300 kN), mais un
+    // freinage d'urgence (480 kN) sous la pluie franchit le seuil — sans cas particulier.
     if (brake_force > adhesion_static) {
         brake_force = adhesion_kinetic;
         slipping_ = true;
     }
     double resistive = brake_force;
     if (std::abs(velocity_) > 0.01) {
-        resistive += config_.rolling_c0 + config_.rolling_c2 * velocity_ * velocity_;
+        // Davis : a + b*|v| + c*v². Le terme en v² est la traînée aérodynamique — à
+        // 320 km/h elle pèse à elle seule 85 % de la résistance totale d'un TGV.
+        const double v = std::abs(velocity_);
+        resistive += config_.davis_a + config_.davis_b * v + config_.davis_c * v * v;
     }
     const double dv = (resistive / config_.mass) * dt;
     if (velocity_ > 0.0) {
