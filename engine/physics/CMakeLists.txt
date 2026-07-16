@@ -1,6 +1,8 @@
 add_library(noire_physics
     src/air_brake.cpp
     src/bogie.cpp
+    src/car_body.cpp
+    src/consist.cpp
     src/wagon.cpp)
 add_library(noire::physics ALIAS noire_physics)
 

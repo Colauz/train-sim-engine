@@ -4,6 +4,7 @@
 #include "noire/core/track_source.hpp"
 #include "noire/physics/air_brake.hpp"
 #include "noire/physics/bogie.hpp"
+#include "noire/physics/car_body.hpp"
 
 namespace noire::physics {
 
@@ -48,6 +49,19 @@ struct WagonConfig {
     double pitch_gain = 0.03;
 };
 
+// Dérive les réglages de caisse depuis la config du wagon. Le roll (M16) prend ses
+// défauts : la motrice s'incline donc comme les voitures, d'un même mouvement.
+[[nodiscard]] inline CarBodyConfig to_car_body_config(const WagonConfig& c) {
+    CarBodyConfig b;
+    b.body_height = c.body_height;
+    b.heave_frequency = c.heave_frequency;
+    b.heave_damping = c.heave_damping;
+    b.pitch_frequency = c.pitch_frequency;
+    b.pitch_damping = c.pitch_damping;
+    b.pitch_gain = c.pitch_gain;
+    return b;
+}
+
 // Wagon multi-corps (2 bogies + caisse) posé sur une voie INFINIE (TrackSource).
 // L'état longitudinal est un « chainage » x (paramètre le long de la voie) et une
 // vitesse v (le long de l'arc). La dynamique reste identique au M4 ; seule la
@@ -55,7 +69,8 @@ struct WagonConfig {
 // longueur d'arc). Plus aucune borne : la voie ne finit jamais.
 class Wagon {
 public:
-    explicit Wagon(WagonConfig config = {}) : config_(config) {}
+    explicit Wagon(WagonConfig config = {})
+        : config_(config), caisse_(to_car_body_config(config)) {}
 
     void attach(const TrackSource* track) { track_ = track; }
     void place_at(double chainage);
@@ -70,8 +85,8 @@ public:
 
     [[nodiscard]] const Bogie& front_bogie() const { return front_; }
     [[nodiscard]] const Bogie& rear_bogie() const { return rear_; }
-    [[nodiscard]] const WorldPosition& body_position() const { return body_position_; }
-    [[nodiscard]] const glm::mat4& body_orientation() const { return body_orientation_; }
+    [[nodiscard]] const WorldPosition& body_position() const { return caisse_.position(); }
+    [[nodiscard]] const glm::mat4& body_orientation() const { return caisse_.orientation(); }
 
     [[nodiscard]] double speed() const { return velocity_; }
     [[nodiscard]] double chainage() const { return chainage_; }
@@ -85,8 +100,6 @@ public:
     [[nodiscard]] const AirBrake& air_brake() const { return air_brake_; }
 
 private:
-    void update_body(double dt, double longitudinal_accel);
-
     WagonConfig config_;
     const TrackSource* track_ = nullptr;
 
@@ -103,15 +116,7 @@ private:
 
     Bogie front_;
     Bogie rear_;
-    WorldPosition body_position_{0.0, 0.0, 0.0};
-    glm::mat4 body_orientation_{1.0f};
-
-    bool suspension_ready_ = false;
-    double body_y_ = 0.0;
-    double body_vy_ = 0.0;
-    double prev_support_y_ = 0.0;
-    double pitch_ = 0.0;
-    double pitch_vel_ = 0.0;
+    CarBody caisse_;  // caisse de la motrice — même modèle que les voitures (M16)
 };
 
 }  // namespace noire::physics

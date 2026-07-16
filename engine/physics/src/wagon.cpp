@@ -23,7 +23,7 @@ void Wagon::place_at(double chainage) {
         const double half = (config_.wheelbase * 0.5) / rate;
         front_.follow(*track_, chainage_ + half);
         rear_.follow(*track_, chainage_ - half);
-        update_body(1.0 / 120.0, 0.0);
+        caisse_.update(front_.position(), rear_.position(), 1.0 / 120.0, 0.0, 0.0);
     }
 }
 
@@ -136,53 +136,12 @@ void Wagon::update(double dt) {
     front_.follow(*track_, chainage_ + half);
     rear_.follow(*track_, chainage_ - half);
 
-    update_body(dt, longitudinal_accel);
-}
-
-void Wagon::update_body(double dt, double longitudinal_accel) {
-    const glm::dvec3 front_pos = front_.position();
-    const glm::dvec3 rear_pos = rear_.position();
-    const glm::dvec3 center = (front_pos + rear_pos) * 0.5;
-
-    const glm::vec3 forward = glm::vec3(glm::normalize(front_pos - rear_pos));
-    const glm::vec3 world_up(0.0f, 1.0f, 0.0f);
-    const glm::vec3 right = glm::normalize(glm::cross(forward, world_up));
-    const glm::vec3 up = glm::cross(right, forward);
-
-    const double support_y = center.y;
-    if (!suspension_ready_) {
-        body_y_ = support_y;
-        prev_support_y_ = support_y;
-        suspension_ready_ = true;
-    }
-
-    // Pilonnement : oscillateur excité par la base.
-    const double base_velocity = (support_y - prev_support_y_) / dt;
-    prev_support_y_ = support_y;
-    const double wn = 2.0 * glm::pi<double>() * config_.heave_frequency;
-    const double k = wn * wn;
-    const double c = 2.0 * config_.heave_damping * wn;
-    const double heave_accel = -k * (body_y_ - support_y) - c * (body_vy_ - base_velocity);
-    body_vy_ += heave_accel * dt;
-    body_y_ += body_vy_ * dt;
-    const double heave = body_y_ - support_y;
-
-    // Tangage : oscillateur forcé par l'accélération longitudinale.
-    const double target_pitch = -config_.pitch_gain * longitudinal_accel;
-    const double wp = 2.0 * glm::pi<double>() * config_.pitch_frequency;
-    const double pitch_accel =
-        wp * wp * (target_pitch - pitch_) - 2.0 * config_.pitch_damping * wp * pitch_vel_;
-    pitch_vel_ += pitch_accel * dt;
-    pitch_ += pitch_vel_ * dt;
-
-    body_position_ = center + glm::dvec3(0.0, config_.body_height + heave, 0.0);
-
-    glm::mat4 basis(1.0f);
-    basis[0] = glm::vec4(right, 0.0f);
-    basis[1] = glm::vec4(up, 0.0f);
-    basis[2] = glm::vec4(-forward, 0.0f);
-    body_orientation_ =
-        basis * glm::rotate(glm::mat4(1.0f), static_cast<float>(pitch_), glm::vec3(1.0f, 0.0f, 0.0f));
+    // Caisse : cinématique inverse entre les deux bogies + suspension (M16 : logique
+    // extraite dans CarBody, partagée avec les voitures). Le roll vient de l'accélération
+    // latérale déduite des tangentes des deux bogies.
+    const double lateral_accel =
+        signed_lateral_accel(front_.tangent(), rear_.tangent(), velocity_, config_.wheelbase);
+    caisse_.update(front_.position(), rear_.position(), dt, longitudinal_accel, lateral_accel);
 }
 
 }  // namespace noire::physics

@@ -20,6 +20,7 @@
 #include "noire/core/math.hpp"
 #include "noire/core/procedural_track.hpp"
 #include "noire/core/terrain.hpp"
+#include "noire/physics/consist.hpp"
 #include "noire/physics/wagon.hpp"
 #include "noire/platform/window.hpp"
 #include "noire/render/renderer.hpp"
@@ -166,6 +167,10 @@ struct ModelTransform {
 // c'est-à-dire sur le plan de roulement (vérifié : bbox acier y[-2.20, -1.15]). Un modèle
 // importé, lui, aura presque toujours besoin des trois champs.
 constexpr ModelTransform kLocoTransform{1.0f, 0.0f, 0.0f};
+// Voiture et bogie Jacobs (M16), générés dans le même repère caisse (rail à -2.20 pour la
+// voiture ; origine au plan de roulement pour le bogie). Calibrage neutre, comme la motrice.
+constexpr ModelTransform kCarTransform{1.0f, 0.0f, 0.0f};
+constexpr ModelTransform kBogieTransform{1.0f, 0.0f, 0.0f};
 
 std::uint32_t hash_u32(std::uint32_t x) {
     x ^= x >> 16;
@@ -235,10 +240,16 @@ struct Application::Impl {
           engine(EngineConfig{config.simulation_hz, 0}),
           track(kTrackOrigin),
           terrain(track),
-          wagon(make_tgv_config()),
+          consist(make_tgv_config(), make_consist_config()),
           streamer(track, jobs, make_streamer_config()),
           clipmap(terrain, jobs, make_clipmap_config()),
           resources(renderer, jobs, asset_paths) {}
+
+    static physics::ConsistConfig make_consist_config() {
+        physics::ConsistConfig cc;
+        cc.car_count = 2;  // N=2 voitures pour valider la cinématique (le jalon le demande)
+        return cc;
+    }
 
     static scene::ClipmapConfig make_clipmap_config() {
         scene::ClipmapConfig cc;
@@ -273,7 +284,11 @@ struct Application::Impl {
     ProceduralTrack track;
     Terrain terrain;
     JobSystem jobs;
-    physics::Wagon wagon;
+    // Rame articulée (M16) : motrice + N voitures sur bogies Jacobs. `wagon` reste une
+    // référence vers la motrice — tout le code qui lit l'état de tête (vitesse, chainage,
+    // caisse...) est inchangé ; seuls les appels qui PILOTENT la rame passent par `consist`.
+    physics::Consist consist;
+    physics::Wagon& wagon = consist.loco();
     scene::WorldStreamer streamer;
     scene::TerrainClipmap clipmap;
 
@@ -285,6 +300,8 @@ struct Application::Impl {
     resource::ResourceManager resources;
     resource::ModelHandle tree_model;
     resource::ModelHandle train_model;
+    resource::ModelHandle voiture_model;       // voiture voyageurs (M16)
+    resource::ModelHandle jacobs_bogie_model;  // bogie Jacobs partagé (M16)
     resource::AudioHandle rumble_clip;
     resource::EnvironmentHandle sky;
     // Textures PBR du ballast (Poly Haven, CC0). Maintenues vivantes par ces handles :
@@ -381,6 +398,8 @@ struct Application::Impl {
     [[nodiscard]] bool assets_ready() const {
         return sky_ready_reported &&                    // HDRI chargé ET lié (SH + IBL + skybox)
                train_model && train_model->ready &&     // le gabarit
+               voiture_model && voiture_model->ready &&  // + les voitures (M16 : rame entière)
+               jacobs_bogie_model && jacobs_bogie_model->ready &&  // + les bogies Jacobs
                ballast_textured &&                      // les 3 cartes du ballast
                terrain_textured &&                      // les 6 cartes du splatting
                streamer.active_chunk_count() > 0 &&     // au moins une tuile de voie
@@ -510,6 +529,10 @@ struct Application::Impl {
         // Motrice TGV procédurale (M10) : carrosserie loftée (superellipse + Béziers),
         // nez plongeant, vraies roues cylindriques. Remplace le gabarit-boîtes du M9.
         train_model = resources.load_model("models/tgv_procedural.glb");
+        // Rame articulée (M16) : voiture voyageurs (caisse-tube + vitres) et bogie Jacobs
+        // partagé, générés par tools/gen_tgv_voiture.py.
+        voiture_model = resources.load_model("models/tgv_voiture.glb");
+        jacobs_bogie_model = resources.load_model("models/tgv_bogie.glb");
         tree_model = resources.load_model("models/tree.glb");
         rumble_clip = resources.load_audio("audio/roulement.wav");
 
@@ -541,14 +564,14 @@ struct Application::Impl {
         // compromis retenu pour un iGPU. Absent => le fond uni est conservé.
         sky = resources.load_environment("textures/sky/kloofendal_puresky_2k.hdr", 1024);
 
-        wagon.attach(&track);
-        wagon.place_at(0.0);
+        consist.attach(&track);
+        consist.place_at(0.0);
         // NOIRE_SPEED : vitesse initiale en km/h, pour le banc. Une rame de 400 t met
         // 5 min 30 pour atteindre 320 km/h — c'est le RÉSULTAT VOULU du M13, mais ça rend
         // intenable le moindre essai à grande vitesse. Même esprit que NOIRE_STILL /
         // NOIRE_PIN_CAM / NOIRE_CREEP : un levier de mesure, jamais un défaut de jeu.
         const char* speed_env = std::getenv("NOIRE_SPEED");
-        wagon.set_speed(speed_env != nullptr ? std::atof(speed_env) / 3.6 : 25.0);
+        consist.set_speed(speed_env != nullptr ? std::atof(speed_env) / 3.6 : 25.0);
         window.set_cursor_captured(true);
 
         EngineHooks hooks;
@@ -631,13 +654,13 @@ struct Application::Impl {
         } else if (key_throttle_down) {
             throttle_handle = std::max(0.0, throttle_handle - dt * 0.5);
         }
-        wagon.set_controls(throttle_handle, key_brake ? 1.0 : 0.0, key_emergency);
+        consist.set_controls(throttle_handle, key_brake ? 1.0 : 0.0, key_emergency);
         // La météo pilote l'adhérence : sec = 1, pluie battante = 0,36 (µ ~ 0,12). C'est
         // ce qui rend le patinage — hors d'atteinte à sec avec ces chiffres — possible
         // sous la pluie au-delà de ~71 % de traction.
-        wagon.set_adhesion_scale(static_cast<double>(glm::mix(1.0f, 0.36f, wetness)));
+        consist.set_adhesion_scale(static_cast<double>(glm::mix(1.0f, 0.36f, wetness)));
 
-        wagon.update(dt);
+        consist.update(dt);
 
         // --- Audio ferroviaire procédural (piloté par l'état physique) ---
         const glm::vec3 train_velocity =
@@ -1252,6 +1275,32 @@ struct Application::Impl {
             items.push_back(render::DrawItem{body_model, body_mesh});
         }
 
+        // Voitures voyageurs (M16) : chaque caisse est posée par la CINÉMATIQUE INVERSE de
+        // ses deux bogies Jacobs (consist.car(i) donne position + orientation, yaw/pitch/roll
+        // compris). Même chemin de rendu que la motrice — seul le modèle change.
+        if (voiture_model && voiture_model->ready) {
+            for (int i = 0; i < consist.car_count(); ++i) {
+                const physics::CarBody& car = consist.car(i);
+                const glm::mat4 m = camera.relative_model(car.position()) * car.orientation() *
+                                    kCarTransform.matrix();
+                for (const resource::Model::Primitive& prim : voiture_model->primitives) {
+                    const render::MaterialId mat = prim.material ? prim.material->id : 0;
+                    items.push_back(render::DrawItem{m, prim.mesh, mat});
+                }
+            }
+        }
+        // Bogies Jacobs (M16) : l'organe PARTAGÉ, dessiné une fois à chaque articulation.
+        if (jacobs_bogie_model && jacobs_bogie_model->ready) {
+            for (const physics::Bogie& b : consist.jacobs_bogies()) {
+                const glm::mat4 m = camera.relative_model(b.position()) * b.orientation() *
+                                    kBogieTransform.matrix();
+                for (const resource::Model::Primitive& prim : jacobs_bogie_model->primitives) {
+                    const render::MaterialId mat = prim.material ? prim.material->id : 0;
+                    items.push_back(render::DrawItem{m, prim.mesh, mat});
+                }
+            }
+        }
+
         // LES CÂBLES EN DERNIER, et ce n'est pas un détail : ils sont MÉLANGÉS et n'écrivent
         // pas la profondeur. Tout ce qui est opaque doit donc déjà avoir posé la sienne,
         // sans quoi un fil se peindrait par-dessus un talus qui le cache.
@@ -1276,6 +1325,8 @@ struct Application::Impl {
     void shutdown() {
         jobs.stop();          // draine les workers avant toute destruction
         train_model.reset();  // relâche le handle ; renderer.shutdown() détruit le GPU restant
+        voiture_model.reset();
+        jacobs_bogie_model.reset();
         audio.shutdown();
         renderer.wait_idle();
         renderer.shutdown();
