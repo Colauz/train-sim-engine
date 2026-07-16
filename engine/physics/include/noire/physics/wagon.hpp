@@ -46,7 +46,7 @@ struct WagonConfig {
     double heave_damping = 0.30;
     double pitch_frequency = 1.4;
     double pitch_damping = 0.35;
-    double pitch_gain = 0.03;
+    double pitch_gain = 0.02;  // faible : le tangage TGV est ~1° (cf. M17.5, + butoir CarBody)
 };
 
 // Dérive les réglages de caisse depuis la config du wagon. Le roll (M16) prend ses

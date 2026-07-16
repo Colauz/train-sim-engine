@@ -63,15 +63,32 @@ void CarBody::update(const glm::dvec3& front_pos, const glm::dvec3& rear_pos, do
         wp * wp * (target_pitch - pitch_) - 2.0 * config_.pitch_damping * wp * pitch_vel_;
     pitch_vel_ += pitch_accel * dt;
     pitch_ += pitch_vel_ * dt;
+    // BUTOIR DUR (M17.5) : la caisse ne cabre JAMAIS au-delà de max_pitch, quelle que soit
+    // l'accélération. On annule aussi la vitesse au contact du butoir : sinon l'intégrateur
+    // « pousse » contre la borne et la caisse repart d'un coup en la quittant (wind-up).
+    if (pitch_ > config_.max_pitch) {
+        pitch_ = config_.max_pitch;
+        if (pitch_vel_ > 0.0) pitch_vel_ = 0.0;
+    } else if (pitch_ < -config_.max_pitch) {
+        pitch_ = -config_.max_pitch;
+        if (pitch_vel_ < 0.0) pitch_vel_ = 0.0;
+    }
 
-    // Roulis (M16) : oscillateur forcé par l'accélération latérale. Même forme que le
-    // tangage, autour de l'axe longitudinal.
+    // Roulis (M16) : oscillateur forcé par l'accélération latérale. Même forme et même
+    // butoir que le tangage.
     const double target_roll = -config_.roll_gain * lateral_accel;
     const double wr = 2.0 * glm::pi<double>() * config_.roll_frequency;
     const double roll_accel =
         wr * wr * (target_roll - roll_) - 2.0 * config_.roll_damping * wr * roll_vel_;
     roll_vel_ += roll_accel * dt;
     roll_ += roll_vel_ * dt;
+    if (roll_ > config_.max_roll) {
+        roll_ = config_.max_roll;
+        if (roll_vel_ > 0.0) roll_vel_ = 0.0;
+    } else if (roll_ < -config_.max_roll) {
+        roll_ = -config_.max_roll;
+        if (roll_vel_ < 0.0) roll_vel_ = 0.0;
+    }
 
     position_ = center + glm::dvec3(0.0, config_.body_height + heave, 0.0);
 

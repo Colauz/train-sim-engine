@@ -13,7 +13,13 @@ struct CarBodyConfig {
     double heave_damping = 0.30;
     double pitch_frequency = 1.4;  // tangage (Hz)
     double pitch_damping = 0.35;
-    double pitch_gain = 0.03;      // rad de tangage par m/s² d'accélération longitudinale
+    // rad de tangage par m/s² d'accélération longitudinale. VOLONTAIREMENT FAIBLE (M17.5) :
+    // le tangage d'un TGV est infime (~1°). À 0,02, un freinage d'urgence (~1,2 m/s²) vise
+    // ~1,4° ; l'oscillateur sous-amorti dépasse un peu, le clamp (max_pitch) coupe le reste.
+    double pitch_gain = 0.02;
+    // BUTOIR DUR sur le tangage : la caisse ne peut PAS cabrer au-delà, quelle que soit
+    // l'accélération. 2° = 0,035 rad. C'est ce qui interdit le « wheelie » (M17.5).
+    double max_pitch = 0.035;
 
     // Roll (M16) : la caisse s'incline en courbe. La voie n'a PAS de dévers modélisé, donc
     // ce roll est une souplesse de suspension ∝ accélération latérale (v²·courbure) —
@@ -21,6 +27,7 @@ struct CarBodyConfig {
     double roll_frequency = 1.1;
     double roll_damping = 0.35;
     double roll_gain = 0.015;      // rad de roll par m/s² d'accélération latérale
+    double max_roll = 0.087;       // butoir dur : 5°
 };
 
 // CAISSE RIGIDE tendue entre DEUX bogies — le cœur de la cinématique inverse ferroviaire.

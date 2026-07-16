@@ -2,32 +2,30 @@
 
 namespace noire {
 
-// PROFIL DE LIMITATION DE VITESSE (M17) — la « carte » des vitesses le long de la voie.
+// PROFIL DE LIMITATION DE VITESSE (M17, en dur au M17.5) — la « carte » des vitesses le
+// long de la voie, calquée sur un vrai départ de ligne française :
+//     0 – 2 km   :  30 km/h   (zone de gare / dépôt)
+//     2 – 15 km  : 160 km/h   (ligne classique)
+//    15 – 20 km  : 220 km/h   (raccordement LGV)
+//    20 km et +  : 320 km/h   (LGV pleine ligne)
 //
-// Fonction PURE et DÉTERMINISTE du chainage : la voie est découpée en BLOCS de longueur
-// fixe (2 km), et chaque bloc porte une limite prise dans un petit jeu de paliers. C'est
+// Le chainage sert d'abscisse (arc_rate ≈ 1 sur notre tracé => chainage ≈ km réels). C'est
 // l'unique source de vérité, partagée par le KVB (qui l'applique) et par les panneaux
-// trackside (qui l'affichent) — les deux ne peuvent donc jamais se contredire.
-//
-// Les paliers varient DOUCEMENT d'un bloc à l'autre (au plus un cran) : une chute d'un
-// palier est freinable dans les 2 km du bloc au frein de service, sinon le KVB
-// déclencherait l'urgence sans que le conducteur ait pu réagir.
+// trackside (qui l'affichent aux points de transition EXACTS) : ils ne peuvent pas se
+// contredire.
 class SpeedLimits {
 public:
-    // Limite (km/h) applicable au chainage x = celle du bloc qui le contient.
+    // Limite (km/h) applicable au chainage x = celle de la zone qui le contient.
     [[nodiscard]] double limit_kmh(double chainage) const;
-    // Limite d'un bloc donné (par son indice).
-    [[nodiscard]] double limit_for_block(long block) const;
 
-    [[nodiscard]] long block_index(double chainage) const;
-    [[nodiscard]] double block_length() const { return block_length_; }
-    [[nodiscard]] double block_start(long block) const;
+    // Zones = panneaux. Chaque zone commence à un chainage et porte une limite ; un panneau
+    // se dresse à ce chainage pour l'annoncer.
+    [[nodiscard]] int zone_count() const;
+    [[nodiscard]] double zone_start(int zone) const;   // chainage du panneau
+    [[nodiscard]] double zone_limit(int zone) const;   // limite affichée
 
-    // Indice du palier (0..4) d'une limite — pour colorer les panneaux par gravité.
-    [[nodiscard]] int tier_for_block(long block) const;
-
-private:
-    double block_length_ = 2000.0;
+    // Palier de couleur (0 = rouge sévère .. 4 = vert libre) pour une limite donnée.
+    [[nodiscard]] int tier_for_limit(double limit_kmh) const;
 };
 
 }  // namespace noire

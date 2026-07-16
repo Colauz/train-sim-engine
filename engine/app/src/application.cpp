@@ -64,11 +64,10 @@ physics::WagonConfig make_tgv_config() {
     c.davis_a = 3000.0;
     c.davis_b = 90.0;
     c.davis_c = 8.0;  // traînée aéro : 63 kN des 74 kN à 320 km/h
-    // RÉ-ÉTALONNÉ AU M13 (0.03 -> 0.12) : le tangage est proportionnel à l'accélération
-    // longitudinale, qui passe de 3,75 m/s² (l'ancienne loco de 80 t) à 0,55 m/s² sur une
-    // rame de 400 t — sept fois moins. À 0.03, la caisse ne bougeait plus du tout et le
-    // M13 aurait supprimé en silence la suspension du M4.
-    c.pitch_gain = 0.12;
+    // TANGAGE (M17.5) : le 0.12 du M13 faisait CABRER la caisse (« wheelie ») — 8° de
+    // consigne à un freinage d'urgence, plus l'overshoot de l'oscillateur. Le tangage réel
+    // d'un TGV est ~1° : on revient à 0.02, et CarBody borne dur à 2° de toute façon.
+    c.pitch_gain = 0.02;
     return c;
 }
 
@@ -639,8 +638,11 @@ struct Application::Impl {
         // 5 min 30 pour atteindre 320 km/h — c'est le RÉSULTAT VOULU du M13, mais ça rend
         // intenable le moindre essai à grande vitesse. Même esprit que NOIRE_STILL /
         // NOIRE_PIN_CAM / NOIRE_CREEP : un levier de mesure, jamais un défaut de jeu.
+        // Départ à 20 km/h, DANS la limite de la zone de gare (30 km/h) : un vrai départ
+        // sans que le KVB ne serre l'urgence dès la première frame (M17.5). NOIRE_SPEED
+        // (km/h) reste le levier de banc pour partir lancé.
         const char* speed_env = std::getenv("NOIRE_SPEED");
-        consist.set_speed(speed_env != nullptr ? std::atof(speed_env) / 3.6 : 25.0);
+        consist.set_speed(speed_env != nullptr ? std::atof(speed_env) / 3.6 : 20.0 / 3.6);
         window.set_cursor_captured(true);
 
         EngineHooks hooks;
@@ -1367,11 +1369,18 @@ struct Application::Impl {
         // source de vérité que le KVB (consist.speed_limits()) : ils ne peuvent pas mentir.
         if (sign_mast_mesh != 0 && sign_panel_mesh != 0) {
             const auto& limits = consist.speed_limits();
-            const long b0 = limits.block_index(wagon.chainage());
+            const double x_train = wagon.chainage();
             const glm::vec3 world_up(0.0f, 1.0f, 0.0f);
-            for (long b = b0 - 1; b <= b0 + 4; ++b) {
+            // Un panneau par ZONE, planté au chainage EXACT de la transition (M17.5). On ne
+            // dessine que ceux dans une fenêtre autour du train (visibles de loin devant,
+            // gardés un peu derrière).
+            for (int z = 0; z < limits.zone_count(); ++z) {
+                const double xs = limits.zone_start(z);
+                if (xs < x_train - 800.0 || xs > x_train + 12000.0) {
+                    continue;
+                }
                 glm::dvec3 pos, tangent;
-                track.sample(limits.block_start(b), pos, tangent);
+                track.sample(xs, pos, tangent);
                 const glm::vec3 forward = glm::vec3(glm::normalize(tangent));
                 const glm::vec3 right = glm::normalize(glm::cross(forward, world_up));
                 const glm::vec3 up = glm::cross(right, forward);
@@ -1382,7 +1391,7 @@ struct Application::Impl {
                 basis[1] = glm::vec4(up, 0.0f);
                 basis[2] = glm::vec4(-forward, 0.0f);
                 const glm::mat4 m = camera.relative_model(sign_pos) * basis;
-                const int tier = limits.tier_for_block(b);
+                const int tier = limits.tier_for_limit(limits.zone_limit(z));
                 items.push_back(render::DrawItem{m, sign_mast_mesh, sign_mast_material});
                 items.push_back(
                     render::DrawItem{m, sign_panel_mesh, tier_material[static_cast<std::size_t>(tier)]});
