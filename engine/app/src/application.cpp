@@ -176,11 +176,12 @@ constexpr double kTreeRange = 620.0;
 struct ModelTransform {
     float scale = 1.0f;       // ex. 0.01 pour un modèle exporté en centimètres
     float offset_y = 0.0f;    // remonte/descend la caisse pour poser les roues sur le rail
+    float offset_z = 0.0f;    // avance/recule la caisse le long de la voie (M19)
     float rotation_y = 0.0f;  // radians, autour de la verticale : oriente l'avant du modèle
     // Ordre VOULU : rotation d'abord, translation ensuite. L'inverse ferait décrire un
     // arc à l'offset au lieu de rester vertical.
     [[nodiscard]] glm::mat4 matrix() const {
-        glm::mat4 m = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, offset_y, 0.0f));
+        glm::mat4 m = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, offset_y, offset_z));
         m = glm::rotate(m, rotation_y, glm::vec3(0.0f, 1.0f, 0.0f));
         return glm::scale(m, glm::vec3(scale));
     }
@@ -196,6 +197,16 @@ constexpr ModelTransform kLocoTransform{1.0f, 0.0f, 0.0f};
 // voiture ; origine au plan de roulement pour le bogie). Calibrage neutre, comme la motrice.
 constexpr ModelTransform kCarTransform{1.0f, 0.0f, 0.0f};
 constexpr ModelTransform kBogieTransform{1.0f, 0.0f, 0.0f};
+
+// MODÈLE EXTERNE (M19) — assets/models/train_realiste.glb, à télécharger. Un modèle du
+// commerce n'a JAMAIS la bonne échelle ni la bonne origine ; ces 4 champs alignent SA
+// carrosserie par-dessus les bogies physiques (qui, eux, ne bougent PAS). Réglables SANS
+// recompiler via les variables d'environnement :
+//   NOIRE_MODEL_SCALE  — échelle (ex. 0.01 si le modèle est en cm)
+//   NOIRE_MODEL_OFFY   — hauteur (m) : monte/descend la caisse pour poser sur les bogies
+//   NOIRE_MODEL_OFFZ   — position (m) le long de la voie : recentre le modèle sur ses bogies
+//   NOIRE_MODEL_YAW    — lacet (radians) : ~3.14159 si le modèle regarde dans l'autre sens
+constexpr ModelTransform kRealisteTransform{1.0f, 0.0f, 0.0f, 0.0f};
 
 std::uint32_t hash_u32(std::uint32_t x) {
     x ^= x >> 16;
@@ -328,6 +339,8 @@ struct Application::Impl {
     resource::ModelHandle voiture_model;       // voiture voyageurs (M16)
     resource::ModelHandle jacobs_bogie_model;  // bogie Jacobs partagé (M16)
     resource::ModelHandle station_model;       // module de gare répétable (M18)
+    resource::ModelHandle realiste_model;      // caisse externe photoréaliste (M19), optionnelle
+    ModelTransform realiste_transform = kRealisteTransform;  // ajustable par env (M19)
     resource::AudioHandle rumble_clip;
     resource::EnvironmentHandle sky;
     // Textures PBR du ballast (Poly Haven, CC0). Maintenues vivantes par ces handles :
@@ -383,6 +396,12 @@ struct Application::Impl {
     WorldPosition catenary_uploading_origin{};
     render::InstanceBufferId pole_instances = 0;
     std::uint32_t pole_count = 0;
+    // Attaches de gare (M19) : dans l'emprise de la verrière, elles remplacent les poteaux.
+    // Même origine que les poteaux (écrites en même temps), donc on réutilise pole_origin.
+    render::MeshId insulator_mesh = 0;
+    render::MaterialId insulator_material = 0;
+    render::InstanceBufferId insulator_instances = 0;
+    std::uint32_t insulator_count = 0;
     // Origine PROPRE aux poteaux : leurs instances sont écrites tout de suite, alors que les
     // fils attendent le sas. Les deux origines divergent donc pendant un téléversement, et
     // partager `catenary_origin` décalerait les poteaux de la longueur du pas.
@@ -545,10 +564,25 @@ struct Application::Impl {
         wire_desc.roughness_factor = 0.45f;
         wire_material = renderer.create_material(wire_desc);
 
+        // M19 : la gare occupe le chainage 0-400 (cf. le module de gare, 10 x 40 m). Sous sa
+        // verrière, la caténaire ne plante PAS de poteaux — ils percuteraient les quais et le
+        // toit ; elle s'y suspend par des attaches, le porteur abaissé sous la verrière.
+        catenary_profile.canopy_start = 0.0;
+        catenary_profile.canopy_end = 400.0;
+        catenary_profile.canopy_attach_height = 5.35;  // juste sous la verrière (toit à 5.40)
+
         const scene::RailMeshData pole = scene::generate_pole_mesh(catenary_profile);
         pole_mesh = renderer.create_mesh_indexed(pole.vertices, pole.indices);
         log::info("M12 : poteau caténaire — {} sommets, {} triangles", pole.vertices.size(),
                   pole.indices.size() / 3);
+        // Attache de gare (M19) : petite pièce instanciée, porcelaine claire et mate.
+        const scene::RailMeshData ins = scene::generate_insulator_mesh(catenary_profile);
+        insulator_mesh = renderer.create_mesh_indexed(ins.vertices, ins.indices);
+        render::MaterialDesc ins_desc;
+        ins_desc.base_color_factor = glm::vec4(0.78f, 0.78f, 0.74f, 1.0f);  // porcelaine
+        ins_desc.metallic_factor = 0.0f;
+        ins_desc.roughness_factor = 0.55f;
+        insulator_material = renderer.create_material(ins_desc);
 
         bogie_mesh = renderer.create_mesh(make_box_vertices(glm::vec3(0.85f, 0.15f, 0.15f)),
                                           render::Topology::Triangles);
@@ -602,6 +636,18 @@ struct Application::Impl {
         jacobs_bogie_model = resources.load_model("models/tgv_bogie.glb");
         // Gare de départ (M18) : un module répété le long de la voie sur 0-400 m.
         station_model = resources.load_model("models/station.glb");
+        // Modèle externe photoréaliste (M19), OPTIONNEL : s'il est présent et valide, il
+        // remplace la caisse procédurale de la motrice. Absent => on garde le procédural, sans
+        // la moindre erreur. On lit ses réglages d'alignement depuis l'environnement.
+        realiste_model = resources.load_model("models/train_realiste.glb");
+        auto env_float = [](const char* name, float fallback) {
+            const char* v = std::getenv(name);
+            return v != nullptr ? static_cast<float>(std::atof(v)) : fallback;
+        };
+        realiste_transform.scale = env_float("NOIRE_MODEL_SCALE", kRealisteTransform.scale);
+        realiste_transform.offset_y = env_float("NOIRE_MODEL_OFFY", kRealisteTransform.offset_y);
+        realiste_transform.offset_z = env_float("NOIRE_MODEL_OFFZ", kRealisteTransform.offset_z);
+        realiste_transform.rotation_y = env_float("NOIRE_MODEL_YAW", kRealisteTransform.rotation_y);
         tree_model = resources.load_model("models/tree.glb");
         rumble_clip = resources.load_audio("audio/roulement.wav");
 
@@ -1005,6 +1051,17 @@ struct Application::Impl {
         pole_instances = renderer.create_instances(data.poles);
         pole_count = static_cast<std::uint32_t>(data.poles.size());
         pole_origin = origin;
+
+        // Attaches de gare (M19), même chemin que les poteaux (même origine, tampon
+        // host-visible immédiat). create_instances gère un vecteur vide (aucune gare en vue).
+        if (insulator_instances != 0) {
+            renderer.destroy_instances(insulator_instances);
+            insulator_instances = 0;
+        }
+        insulator_count = static_cast<std::uint32_t>(data.insulators.size());
+        if (insulator_count > 0) {
+            insulator_instances = renderer.create_instances(data.insulators);
+        }
     }
 
     void render_frame() {
@@ -1309,18 +1366,38 @@ struct Application::Impl {
             item.instance_count = pole_count;
             items.push_back(item);
         }
+        // Attaches de gare (M19) : là où les poteaux ont été supprimés (0-400 m), instanciées
+        // à la même origine que les poteaux.
+        if (insulator_mesh != 0 && insulator_instances != 0 && insulator_count > 0) {
+            render::DrawItem item;
+            item.model = camera.relative_model(pole_origin);
+            item.mesh = insulator_mesh;
+            item.material = insulator_material;
+            item.instances = insulator_instances;
+            item.instance_count = insulator_count;
+            items.push_back(item);
+        }
 
         // Locomotive (M17.6) : la CAISSE suit la suspension (position + orientation de la
         // physique multi-corps), mais SES BOGIES sont dessinés SÉPARÉMENT — plaqués sur la
         // voie, sans le moindre tangage de caisse. C'est la HIÉRARCHIE ferroviaire correcte :
-        // le bogie roule sur le rail, la caisse flotte au-dessus sur ses ressorts. Le modèle
-        // tgv_procedural.glb ne contient donc plus de roues (générateur M17.6).
-        if (train_model && train_model->ready) {
-            const glm::mat4 loco = camera.relative_model(wagon.body_position()) *
-                                   wagon.body_orientation() * kLocoTransform.matrix();
-            for (const resource::Model::Primitive& prim : train_model->primitives) {
+        // le bogie roule sur le rail, la caisse flotte au-dessus sur ses ressorts.
+        //
+        // M19 : si le modèle externe photoréaliste est présent et valide, il remplace la
+        // caisse procédurale (aligné par realiste_transform). Sinon on garde le procédural.
+        // Dans les DEUX cas, la caisse est posée au MÊME endroit — les bogies ne bougent pas.
+        const bool realiste_ok =
+            realiste_model && realiste_model->ready && !realiste_model->empty();
+        const bool caisse_ok = realiste_ok || (train_model && train_model->ready);
+        if (caisse_ok) {
+            const glm::mat4 caisse_base =
+                camera.relative_model(wagon.body_position()) * wagon.body_orientation();
+            const resource::Model& caisse = realiste_ok ? *realiste_model : *train_model;
+            const glm::mat4 caisse_m =
+                caisse_base * (realiste_ok ? realiste_transform.matrix() : kLocoTransform.matrix());
+            for (const resource::Model::Primitive& prim : caisse.primitives) {
                 const render::MaterialId mat = prim.material ? prim.material->id : 0;
-                items.push_back(render::DrawItem{loco, prim.mesh, mat});
+                items.push_back(render::DrawItem{caisse_m, prim.mesh, mat});
             }
             // Les 2 bogies moteur, à l'orientation de la VOIE (jamais celle de la caisse).
             // Même modèle que les bogies Jacobs (empattement 3 m identique).
@@ -1469,6 +1546,7 @@ struct Application::Impl {
         voiture_model.reset();
         jacobs_bogie_model.reset();
         station_model.reset();
+        realiste_model.reset();
         audio.shutdown();
         renderer.wait_idle();
         renderer.shutdown();

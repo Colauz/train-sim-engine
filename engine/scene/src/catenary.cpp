@@ -140,12 +140,33 @@ RailMeshData generate_pole_mesh(const CatenaryProfile& p) {
     return m;
 }
 
+RailMeshData generate_insulator_mesh(const CatenaryProfile&) {
+    RailMeshData m;
+    // Origine au point d'attache du porteur. Une TIGE monte vers la verrière (0 -> +0.22),
+    // une BAGUE isolante grippe le câble autour de l'origine. Petit : c'est une « attache »,
+    // pas un mât.
+    emit_box(m, {-0.025f, 0.0f, -0.025f}, {0.025f, 0.22f, 0.025f});   // tige vers la verrière
+    emit_box(m, {-0.07f, -0.05f, -0.07f}, {0.07f, 0.03f, 0.07f});     // bague isolante
+    return m;
+}
+
 CatenaryData generate_catenary(const TrackSource& track, double x_start, double x_end,
                                const WorldPosition& origin, const CatenaryProfile& p) {
     CatenaryData out;
     if (p.span <= 0.1 || x_end <= x_start) {
         return out;
     }
+
+    // Vrai quand un chainage tombe dans l'emprise de la verrière de la gare.
+    const auto in_canopy = [&](double x) {
+        return p.canopy_end > p.canopy_start && x >= p.canopy_start && x < p.canopy_end;
+    };
+    // Hauteur d'attache du PORTEUR à un poteau donné : sous la verrière, il est suspendu à la
+    // structure (bas) ; ailleurs, il est au sommet de la « hauteur système » habituelle.
+    const auto messenger_base = [&](long pole_k) {
+        const double x = static_cast<double>(pole_k) * p.span;
+        return in_canopy(x) ? p.canopy_attach_height : (p.contact_height + p.system_height);
+    };
 
     // Grille ABSOLUE de poteaux. Indexer depuis x_start ferait glisser tous les poteaux
     // quand la fenêtre bouge : ils sont ancrés au monde, pas à la caméra.
@@ -154,23 +175,35 @@ CatenaryData generate_catenary(const TrackSource& track, double x_start, double 
 
     for (long k = k0; k < k1; ++k) {
         const double xa = static_cast<double>(k) * p.span;      // poteau amont
-        const double xb = xa + p.span;                          // poteau aval
         const Frame fa = frame_at(track, xa);
-        const Frame fb = frame_at(track, xb);
 
-        // --- Le poteau, en instance ---
-        render::InstanceData inst;
-        const glm::dvec3 pole_pos = fa.pos + fa.lateral * p.pole_offset;
-        inst.position_scale = glm::vec4(glm::vec3(pole_pos - origin), 1.0f);
-        // z = 0 : AUCUN vent. Le pipeline instancié est partagé avec la végétation, dont le
-        // vertex shader fait ployer les sommets ; un poteau d'acier qui se balance serait
-        // grotesque. C'est l'instance qui décide, pas le pipeline.
-        inst.rotation_phase = glm::vec4(pole_yaw(fa.tangent), 0.0f, 0.0f, 0.0f);
-        out.poles.push_back(inst);
+        // --- Support : poteau EN LIGNE, attache SOUS LA GARE (M19) ---
+        if (in_canopy(xa)) {
+            // Pas de poteau : une petite attache suspendue à la verrière, sur l'AXE, à la
+            // hauteur du porteur. C'est ce qui remplace le mât dans l'emprise de la gare.
+            render::InstanceData inst;
+            const glm::dvec3 att_pos = fa.pos + fa.up * p.canopy_attach_height;
+            inst.position_scale = glm::vec4(glm::vec3(att_pos - origin), 1.0f);
+            inst.rotation_phase = glm::vec4(pole_yaw(fa.tangent), 0.0f, 0.0f, 0.0f);
+            out.insulators.push_back(inst);
+        } else {
+            render::InstanceData inst;
+            const glm::dvec3 pole_pos = fa.pos + fa.lateral * p.pole_offset;
+            inst.position_scale = glm::vec4(glm::vec3(pole_pos - origin), 1.0f);
+            // z = 0 : AUCUN vent. Le pipeline instancié est partagé avec la végétation, dont
+            // le vertex shader fait ployer les sommets ; un poteau d'acier qui se balance
+            // serait grotesque. C'est l'instance qui décide, pas le pipeline.
+            inst.rotation_phase = glm::vec4(pole_yaw(fa.tangent), 0.0f, 0.0f, 0.0f);
+            out.poles.push_back(inst);
+        }
 
         // --- Désaxement aux deux extrémités de la portée ---
         const double sa = stagger_at_pole(k, p.stagger);
         const double sb = stagger_at_pole(k + 1, p.stagger);
+
+        // --- Hauteurs du porteur aux deux poteaux (abaissé sous la verrière) ---
+        const double ma = messenger_base(k);
+        const double mb = messenger_base(k + 1);
 
         // --- Fil de contact : RIGOUREUSEMENT horizontal, mais désaxé ---
         // Deux points suffiraient pour la géométrie (il est droit entre deux poteaux),
@@ -193,12 +226,17 @@ CatenaryData generate_catenary(const TrackSource& track, double x_start, double 
         // obliques, ce qui est exactement ce qu'on voit sur une vraie caténaire.
         const auto messenger_point = [&](double t) {
             const Frame f = frame_at(track, xa + t * p.span);
-            // Parabole : la chaînette vraie est y = a·cosh(x/a), mais sous faible flèche
-            // (0,7 m pour 50 m de portée, soit 1,4 %) elle et sa parabole osculatrice
-            // diffèrent de moins d'un MILLIMÈTRE — trois ordres de grandeur sous le pixel.
-            // On garde la parabole : deux multiplications au lieu d'un cosh par sommet.
-            const double sag = p.messenger_sag * 4.0 * t * (1.0 - t);
-            return f.pos + f.up * (p.contact_height + p.system_height - sag);
+            // Hauteur d'attache interpolée entre les deux poteaux (elle change au raccord
+            // avec la gare) puis flèche parabolique. La flèche est PROPORTIONNELLE à la garde
+            // au-dessus du fil de contact : sous la verrière le porteur est presque contre le
+            // contact, il ne peut donc pas pendre autant (sinon il couperait le fil).
+            const double base = glm::mix(ma, mb, t);
+            const double clearance = std::min(ma, mb) - p.contact_height;
+            const double sag_scale = glm::clamp(clearance / p.system_height, 0.0, 1.0);
+            // Parabole : la chaînette vraie est y = a·cosh(x/a), mais sous faible flèche elle
+            // et sa parabole osculatrice diffèrent de moins d'un MILLIMÈTRE.
+            const double sag = p.messenger_sag * sag_scale * 4.0 * t * (1.0 - t);
+            return f.pos + f.up * (base - sag);
         };
 
         for (int i = 0; i <= seg; ++i) {

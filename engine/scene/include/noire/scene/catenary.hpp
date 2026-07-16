@@ -52,6 +52,14 @@ struct CatenaryProfile {
     float pole_flange_half = 0.15f;  // demi-largeur des semelles du H
     float pole_web_half = 0.16f;     // demi-écart entre semelles (l'âme les relie)
     float console_y = 6.70f;         // hauteur de la potence
+
+    // --- Zone de GARE (M19) : sous la verrière, on ne plante PAS de poteaux (ils
+    // percuteraient les quais et le toit). Le porteur y est suspendu à la structure par de
+    // petites attaches, et abaissé à la hauteur de la verrière. Le fil de contact (et son
+    // zigzag) ne change pas. `canopy_end <= canopy_start` => aucune gare (défaut). ---
+    double canopy_start = 0.0;
+    double canopy_end = 0.0;
+    double canopy_attach_height = 5.35;  // hauteur d'attache du porteur sous la verrière
 };
 
 // Sortie : les fils d'une part (un maillage en RUBANS, pipeline câble), les poteaux
@@ -59,7 +67,9 @@ struct CatenaryProfile {
 // lacet changent).
 struct CatenaryData {
     RailMeshData wires;                       // fils de contact + porteurs + pendules
-    std::vector<render::InstanceData> poles;  // un jeu par poteau
+    std::vector<render::InstanceData> poles;  // un jeu par poteau (hors gare)
+    // Attaches de gare (M19) : dans l'emprise de la verrière, elles REMPLACENT les poteaux.
+    std::vector<render::InstanceData> insulators;
 };
 
 // Engendre la caténaire sur la plage de chainage [x_start, x_end]. Sommets exprimés
@@ -76,5 +86,9 @@ struct CatenaryData {
 // Le maillage d'UN poteau, en repère local : +X = le long de la voie, +Y = vers le haut,
 // +Z = vers l'axe de la voie. Engendré une seule fois, puis instancié.
 [[nodiscard]] RailMeshData generate_pole_mesh(const CatenaryProfile& profile = {});
+
+// Le maillage d'UNE attache de gare (M19), en repère local, origine au point d'attache du
+// porteur : une tige montant vers la verrière + une bague grippant le câble. Instancié.
+[[nodiscard]] RailMeshData generate_insulator_mesh(const CatenaryProfile& profile = {});
 
 }  // namespace noire::scene
