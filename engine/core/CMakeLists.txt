@@ -7,6 +7,7 @@ add_library(noire_core
     src/spline.cpp
     src/procedural_track.cpp
     src/job_system.cpp
+    src/speed_limits.cpp
     src/terrain.cpp)
 add_library(noire::core ALIAS noire_core)
 

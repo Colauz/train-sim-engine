@@ -63,10 +63,28 @@ void Consist::update_running_gear(double dt, double longitudinal_accel) {
 void Consist::place_at(double chainage) {
     loco_.place_at(chainage);
     prev_velocity_ = loco_.speed();
+    current_limit_kmh_ = limits_.limit_kmh(chainage);  // HUD sensé dès la 1re frame
     update_running_gear(1.0 / 120.0, 0.0);
 }
 
 void Consist::update(double dt) {
+    // --- KVB (M17) : appliqué AVANT la physique de tête -----------------------
+    // La limite courante est celle du bloc où se trouve le train (= le dernier panneau
+    // franchi). Hystérésis : on ARME l'urgence dès qu'on dépasse la limite de plus de la
+    // marge, et on ne la RELÂCHE qu'une fois revenu AU niveau de la limite — le conducteur
+    // doit donc réellement ralentir sous la limite pour récupérer la main.
+    current_limit_kmh_ = limits_.limit_kmh(loco_.chainage());
+    const double speed_kmh = loco_.speed() * 3.6;
+    if (speed_kmh > current_limit_kmh_ + config_.kvb_margin_kmh) {
+        kvb_active_ = true;
+    } else if (speed_kmh <= current_limit_kmh_) {
+        kvb_active_ = false;
+    }
+    // KVB actif => traction coupée + freinage d'urgence, quelle que soit la consigne.
+    const double throttle = kvb_active_ ? 0.0 : throttle_cmd_;
+    const bool emergency = emergency_cmd_ || kvb_active_;
+    loco_.set_controls(throttle, brake_cmd_, emergency);
+
     loco_.update(dt);
     // Même accélération longitudinale pour toute la rame (elle est rigide) => le tangage
     // des voitures suit celui de la motrice, sans décalage.

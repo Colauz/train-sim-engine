@@ -3,6 +3,7 @@
 #include <vector>
 
 #include "noire/core/math.hpp"
+#include "noire/core/speed_limits.hpp"
 #include "noire/core/track_source.hpp"
 #include "noire/physics/bogie.hpp"
 #include "noire/physics/car_body.hpp"
@@ -29,6 +30,10 @@ struct ConsistConfig {
     double head_to_first_jacobs = 1.0;  // jeu d'arc entre l'arrière motrice et le 1er Jacobs
 
     CarBodyConfig car_body;         // suspension des voitures (défauts CarBodyConfig)
+
+    // KVB (M17) : marge de tolérance avant déclenchement de l'urgence. Dépasser la limite
+    // de plus de kvb_margin_kmh arme le freinage d'urgence automatique.
+    double kvb_margin_kmh = 10.0;
 };
 
 class Consist {
@@ -38,8 +43,13 @@ public:
     void attach(const TrackSource* track);
     void place_at(double chainage);
     void set_speed(double meters_per_second) { loco_.set_speed(meters_per_second); }
+    // MÉMORISE la consigne du conducteur. Elle n'est appliquée qu'en update(), APRÈS le KVB
+    // — c'est ce qui permet au KVB de la court-circuiter (couper la traction, forcer
+    // l'urgence) sans que l'app ait à le savoir.
     void set_controls(double throttle, double brake, bool emergency = false) {
-        loco_.set_controls(throttle, brake, emergency);
+        throttle_cmd_ = throttle;
+        brake_cmd_ = brake;
+        emergency_cmd_ = emergency;
     }
     void set_adhesion_scale(double scale) { loco_.set_adhesion_scale(scale); }
 
@@ -53,6 +63,13 @@ public:
     [[nodiscard]] const CarBody& car(int i) const { return cars_[static_cast<std::size_t>(i)]; }
     // Bogies Jacobs (0..N), pour les dessiner.
     [[nodiscard]] const std::vector<Bogie>& jacobs_bogies() const { return jacobs_; }
+
+    // --- KVB (M17) ------------------------------------------------------------
+    [[nodiscard]] const SpeedLimits& speed_limits() const { return limits_; }
+    // Limite applicable à la position actuelle du train (km/h).
+    [[nodiscard]] double current_limit_kmh() const { return current_limit_kmh_; }
+    // true tant que le KVB force le freinage d'urgence (dépassement > marge, non résorbé).
+    [[nodiscard]] bool kvb_active() const { return kvb_active_; }
 
 private:
     // Trouve l'abscisse x telle que la distance d'ARC de x_ref à x (vers l'arrière) vaut
@@ -70,6 +87,16 @@ private:
     std::vector<Bogie> jacobs_;   // N+1
     std::vector<CarBody> cars_;   // N
     double prev_velocity_ = 0.0;  // pour l'accélération longitudinale (tangage des voitures)
+
+    // --- KVB (M17) ---
+    SpeedLimits limits_;
+    // Consigne du conducteur, en attente d'application (cf. set_controls).
+    double throttle_cmd_ = 0.0;
+    double brake_cmd_ = 0.0;
+    bool emergency_cmd_ = false;
+    // État courant du contrôle de vitesse.
+    double current_limit_kmh_ = 320.0;
+    bool kvb_active_ = false;
 };
 
 }  // namespace noire::physics

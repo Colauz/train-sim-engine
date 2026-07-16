@@ -97,6 +97,34 @@ std::vector<render::Vertex> make_box_vertices(const glm::vec3& base_color) {
     return vertices;
 }
 
+// Ajoute une boîte orientée-axes (24 sommets, 6 faces à normales propres) au format
+// MeshVertex — pour la géométrie PBR construite en code (les panneaux KVB du M17). Chaque
+// face porte sa propre normale et une tangente dans son plan : arêtes franches, éclairage
+// correct.
+void append_box(std::vector<render::MeshVertex>& verts, std::vector<std::uint32_t>& indices,
+                const glm::vec3& center, const glm::vec3& half) {
+    const glm::vec3 normals[6] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0},
+                                  {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+    for (const glm::vec3& n : normals) {
+        // Deux axes dans le plan de la face (u, v) et les demi-longueurs correspondantes.
+        const glm::vec3 ref = (std::abs(n.y) > 0.9f) ? glm::vec3(0, 0, 1) : glm::vec3(0, 1, 0);
+        const glm::vec3 u = glm::normalize(glm::cross(ref, n));
+        const glm::vec3 v = glm::cross(n, u);
+        const float hu = std::abs(glm::dot(u, half));
+        const float hv = std::abs(glm::dot(v, half));
+        const glm::vec3 fc = center + n * glm::abs(glm::dot(n, half));
+        const glm::vec4 tangent(u, 1.0f);
+        const glm::vec3 corners[4] = {fc - u * hu - v * hv, fc + u * hu - v * hv,
+                                      fc + u * hu + v * hv, fc - u * hu + v * hv};
+        const glm::vec2 uvs[4] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}};
+        const auto base = static_cast<std::uint32_t>(verts.size());
+        for (int i = 0; i < 4; ++i) {
+            verts.push_back(render::MeshVertex{corners[i], n, uvs[i], tangent});
+        }
+        indices.insert(indices.end(), {base, base + 1, base + 2, base, base + 2, base + 3});
+    }
+}
+
 // --- Sol (M8 étape 2) -------------------------------------------------------
 // Grand plan solide texturé, qui remplace la grille filaire du M2 : c'est lui qui
 // reçoit l'ombre portée du train.
@@ -372,14 +400,22 @@ struct Application::Impl {
     render::MeshId bogie_mesh = 0;
     render::MeshId body_mesh = 0;
 
+    // Signalisation KVB (M17) : un mât (gris) + un panneau (teinté par palier de vitesse),
+    // dessinés à chaque début de bloc. 5 matériaux, un par palier (vert → rouge).
+    render::MeshId sign_mast_mesh = 0;
+    render::MeshId sign_panel_mesh = 0;
+    render::MaterialId sign_mast_material = 0;
+    std::array<render::MaterialId, 5> tier_material{};
+
     bool model_ready_reported = false;
     bool sky_ready_reported = false;
     bool loading_done_reported = false;
-    // Fondu d'ouverture (M15) : armé à la toute première frame complète, il ramène un voile
-    // noir de 1 à 0 sur kFadeDuration secondes — le monde se révèle en douceur.
-    bool fade_active = false;
+    // Fondu d'ouverture : armé DÈS le départ (M17 — démarrage instantané), il ramène un
+    // voile noir de 1 à 0 sur kFadeDuration secondes, juste pour éviter le flash sec de la
+    // première frame. Il ne bloque RIEN : la scène se charge dessous en même temps.
+    bool fade_active = true;
     double fade_t = 0.0;
-    static constexpr double kFadeDuration = 0.5;
+    static constexpr double kFadeDuration = 0.4;
 
     // --- Écran de chargement (M9 correction) ---------------------------------
     // Tant que les assets FONDATEURS ne sont pas sur le GPU, on ne dessine RIEN (noir).
@@ -520,6 +556,39 @@ struct Application::Impl {
                                           render::Topology::Triangles);
         body_mesh = renderer.create_mesh(make_box_vertices(glm::vec3(0.20f, 0.38f, 0.58f)),
                                          render::Topology::Triangles);
+
+        // --- Signalisation KVB (M17) : mât + panneau, en géométrie MeshVertex ---------
+        {
+            std::vector<render::MeshVertex> mast_v, panel_v;
+            std::vector<std::uint32_t> mast_i, panel_i;
+            // Mât : poteau carré, du sol (2 m sous le rail) à 5 m au-dessus.
+            append_box(mast_v, mast_i, glm::vec3(0.0f, 1.5f, 0.0f), glm::vec3(0.10f, 3.5f, 0.10f));
+            // Panneau : plaque large déportée vers la voie (−x), face au sens de circulation.
+            append_box(panel_v, panel_i, glm::vec3(-1.0f, 4.2f, 0.0f), glm::vec3(1.0f, 0.75f, 0.10f));
+            sign_mast_mesh = renderer.create_mesh_indexed(mast_v, mast_i);
+            sign_panel_mesh = renderer.create_mesh_indexed(panel_v, panel_i);
+        }
+        render::MaterialDesc mast_desc;
+        mast_desc.base_color_factor = glm::vec4(0.42f, 0.44f, 0.47f, 1.0f);  // acier galvanisé
+        mast_desc.metallic_factor = 0.6f;
+        mast_desc.roughness_factor = 0.5f;
+        sign_mast_material = renderer.create_material(mast_desc);
+        // Couleur du panneau par palier, du plus permissif (vert) au plus sévère (rouge).
+        // Couleurs VIVES et diélectriques : elles se lisent comme un signal en plein jour.
+        const glm::vec3 tier_colors[5] = {
+            {0.80f, 0.06f, 0.05f},  // 110 : rouge
+            {0.85f, 0.32f, 0.03f},  // 160 : orange
+            {0.82f, 0.62f, 0.03f},  // 220 : ambre
+            {0.35f, 0.60f, 0.05f},  // 270 : vert-jaune
+            {0.05f, 0.58f, 0.12f},  // 320 : vert
+        };
+        for (int t = 0; t < 5; ++t) {
+            render::MaterialDesc d;
+            d.base_color_factor = glm::vec4(tier_colors[t], 1.0f);
+            d.metallic_factor = 0.0f;
+            d.roughness_factor = 0.40f;
+            tier_material[static_cast<std::size_t>(t)] = renderer.create_material(d);
+        }
 
         // M7 : découverte du dossier assets/ puis chargement ASYNCHRONE (JobSystem) de la
         // locomotive et du roulement. Fallbacks automatiques : cubes de debug si le .glb
@@ -726,6 +795,11 @@ struct Application::Impl {
         const auto& brake = wagon.air_brake();
         std::vector<std::pair<std::string, glm::vec4>> lines;
         lines.emplace_back(std::format("VITESSE  {:>5.0f} KM/H", wagon.speed() * 3.6), value);
+        // Limite KVB (M17) : rouge dès qu'on la dépasse (avertissement avant l'urgence).
+        const double limit = consist.current_limit_kmh();
+        const bool over_limit = wagon.speed() * 3.6 > limit;
+        lines.emplace_back(std::format("LIMITE   {:>5.0f} KM/H", limit),
+                           over_limit ? alert : glm::vec4{0.45f, 0.85f, 0.5f, 1.0f});
         // Position du MANIPULATEUR (la consigne du mécanicien), pas l'effort réellement
         // appliqué après la rampe de la chaîne de traction.
         lines.emplace_back(std::format("TRACTION {:>5.0f} %", throttle_handle * 100.0), value);
@@ -741,7 +815,10 @@ struct Application::Impl {
                                        static_cast<double>(wetness) * 100.0),
                            meteo_color);
         lines.emplace_back(std::format("{:>3.0f} FPS  GPU {:.1f} MS", perf_fps, perf_gpu_ms), label);
-        if (brake.emergency()) {
+        // KVB (M17) : témoin prioritaire — c'est LUI qui a déclenché l'urgence si actif.
+        if (consist.kvb_active()) {
+            lines.emplace_back("KVB URGENCE", alert);
+        } else if (brake.emergency()) {
             lines.emplace_back("URGENCE", alert);
         } else if (wagon.slipping()) {
             // À sec, seul le patinage à la TRACTION lève ce témoin (le freinage n'atteint
@@ -1039,37 +1116,20 @@ struct Application::Impl {
             renderer.notify_resized();
         }
 
-        // Écran de chargement : noir tant que les assets fondateurs ne sont pas prêts.
-        // Placé APRÈS resources.pump() et streamer.update() — sinon rien ne progresserait
-        // et on n'en sortirait jamais. Le premier pixel affiché est donc déjà l'image
-        // finale : plus de « pop » de lumière.
-        if (!assets_ready()) {
-            render::FrameUniforms black;
-            black.view = camera.view_matrix();
-            black.proj = camera.projection_matrix(static_cast<float>(size.width) /
-                                                  static_cast<float>(size.height));
-            black.fog_color_density = glm::vec4(0.0f, 0.0f, 0.0f, 0.0f);  // fond noir
-            // M15 : plus d'écran noir vide — un message centré au HUD 35 bits pendant que
-            // le monde se charge. Le fond reste noir (aucun item, brouillard noir).
-            render::Hud hud;
-            const std::string msg = "CHARGEMENT DU MONDE...";
-            constexpr float scale = 3.0f;
-            const float text_w = static_cast<float>(msg.size()) * 6.0f * scale;
-            const float text_h = 7.0f * scale;
-            hud.texts.push_back({{(static_cast<float>(size.width) - text_w) * 0.5f,
-                                  (static_cast<float>(size.height) - text_h) * 0.5f},
-                                 scale,
-                                 glm::vec4(0.85f, 0.87f, 0.92f, 1.0f),
-                                 msg});
-            renderer.draw_frame(black, {}, hud);
-            return;
-        }
-        if (!loading_done_reported) {
-            log::info("M9 : assets fondateurs prêts — première frame complète");
+        // M17 — DÉMARRAGE INSTANTANÉ : plus d'écran de chargement bloquant. On dessine la
+        // scène dès la première frame et on interagit tout de suite. Le RENDERER gère seul
+        // l'état asynchrone, sans jamais lier une ressource GPU incomplète :
+        //   * un matériau n'est LIÉ qu'une fois son descriptor set écrit, ce qui n'arrive
+        //     qu'après le téléversement de TOUTES ses textures (sinon le DrawItem est sauté) ;
+        //   * un maillage non encore téléversé n'est pas dessiné (is_mesh_ready) ;
+        //   * l'environnement retombe sur une cubemap 1x1 tant que le HDRI n'est pas prêt,
+        //     et la skybox n'est pas dessinée — le fond est alors la couleur de brouillard
+        //     (le « ciel basique »). Le HDRI se substitue en arrière-plan à son arrivée.
+        // Donc rien ne bloque, et rien ne crashe : on voit la voie et le train se compléter
+        // en quelques centaines de ms au lieu d'un écran noir.
+        if (assets_ready() && !loading_done_reported) {
+            log::info("M17 : assets fondateurs tous prêts (le jeu tournait déjà)");
             loading_done_reported = true;
-            // Arme le fondu d'ouverture : la première frame complète part d'un voile noir.
-            fade_active = true;
-            fade_t = 0.0;
         }
 
         // Delta de temps réel pour la vitesse de la caméra (Doppler du listener).
@@ -1298,6 +1358,34 @@ struct Application::Impl {
                     const render::MaterialId mat = prim.material ? prim.material->id : 0;
                     items.push_back(render::DrawItem{m, prim.mesh, mat});
                 }
+            }
+        }
+
+        // Panneaux de signalisation KVB (M17) : un panneau à chaque DÉBUT DE BLOC dans une
+        // fenêtre autour du train. Le panneau marque le début d'une zone de vitesse et sa
+        // couleur en donne la sévérité — le conducteur le voit venir et anticipe. Même
+        // source de vérité que le KVB (consist.speed_limits()) : ils ne peuvent pas mentir.
+        if (sign_mast_mesh != 0 && sign_panel_mesh != 0) {
+            const auto& limits = consist.speed_limits();
+            const long b0 = limits.block_index(wagon.chainage());
+            const glm::vec3 world_up(0.0f, 1.0f, 0.0f);
+            for (long b = b0 - 1; b <= b0 + 4; ++b) {
+                glm::dvec3 pos, tangent;
+                track.sample(limits.block_start(b), pos, tangent);
+                const glm::vec3 forward = glm::vec3(glm::normalize(tangent));
+                const glm::vec3 right = glm::normalize(glm::cross(forward, world_up));
+                const glm::vec3 up = glm::cross(right, forward);
+                // Le panneau se dresse à 8 m à DROITE de l'axe, orienté comme la voie.
+                const WorldPosition sign_pos = pos + glm::dvec3(right) * 8.0;
+                glm::mat4 basis(1.0f);
+                basis[0] = glm::vec4(right, 0.0f);
+                basis[1] = glm::vec4(up, 0.0f);
+                basis[2] = glm::vec4(-forward, 0.0f);
+                const glm::mat4 m = camera.relative_model(sign_pos) * basis;
+                const int tier = limits.tier_for_block(b);
+                items.push_back(render::DrawItem{m, sign_mast_mesh, sign_mast_material});
+                items.push_back(
+                    render::DrawItem{m, sign_panel_mesh, tier_material[static_cast<std::size_t>(tier)]});
             }
         }
 
