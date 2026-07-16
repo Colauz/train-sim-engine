@@ -46,7 +46,6 @@ struct WagonConfig {
     double heave_damping = 0.30;
     double pitch_frequency = 1.4;
     double pitch_damping = 0.35;
-    double pitch_gain = 0.02;  // faible : le tangage TGV est ~1° (cf. M17.5, + butoir CarBody)
 };
 
 // Dérive les réglages de caisse depuis la config du wagon. Le roll (M16) prend ses
@@ -58,7 +57,7 @@ struct WagonConfig {
     b.heave_damping = c.heave_damping;
     b.pitch_frequency = c.pitch_frequency;
     b.pitch_damping = c.pitch_damping;
-    b.pitch_gain = c.pitch_gain;
+    // pitch_transfer / max_pitch_travel : défauts de CarBodyConfig (M17.6, transfert de charge).
     return b;
 }
 

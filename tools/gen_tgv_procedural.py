@@ -335,17 +335,11 @@ build_band(parts[MAT_GLASS], Z_NOSE + 0.35, Z_TIP + 2.6,
 for lo, hi in ((0.28, 0.72), (math.pi - 0.72, math.pi - 0.28)):
     build_band(parts[MAT_GLASS], Z_NOSE + 2.6, Z_NOSE + 0.2, lo, hi, 6, 4, 0.03)
 
-# 5) Bogies : châssis + 4 essieux de 2 roues.
-#    Le châssis doit être NETTEMENT plus étroit que la voie. À ±0.62 il masquait ses
-#    propres roues : celles-ci commencent à 0.6475 (0.7175 - 0.07), elles ne dépassaient
-#    donc que de 2,7 cm et on n'en voyait qu'un croissant. À ±0.45 elles ressortent de
-#    20 cm et se lisent enfin comme des roues.
-for bogie_z in (-6.5, 6.5):
-    build_box(parts[MAT_BOGIE], -0.45, RAIL + 0.30, bogie_z - 2.2, 0.45, FLOOR - 0.05,
-              bogie_z + 2.2)
-for z in AXLES_Z:
-    for side in (-GAUGE_HALF, GAUGE_HALF):
-        build_wheel(parts[MAT_WHEEL], side, z, WHEEL_R, WHEEL_W / 2.0, WHEEL_SEGMENTS)
+# 5) PLUS DE BOGIES DANS LA CAISSE (M17.6). Un bogie ne tangue JAMAIS avec la caisse : il
+#    reste plaqué sur la voie. On les dessine donc SÉPARÉMENT (modèle tgv_bogie.glb, placé
+#    par la physique aux positions des bogies avec l'orientation de la VOIE). Les intégrer
+#    ici les faisait tanguer avec la caisse, d'où des roues qui décollaient.
+#    Les parts MAT_BOGIE/MAT_WHEEL restent donc vides et sont ignorées à la sérialisation.
 
 
 # --- Sérialisation glTF binaire -----------------------------------------------
@@ -353,8 +347,13 @@ def align4(n):
     return (n + 3) & ~3
 
 
+# On ne sérialise QUE les parts non vides : depuis le M17.6 les bogies/roues sont retirés
+# de la caisse, donc MAT_BOGIE/MAT_WHEEL sont vides. `used` mappe chaque primitive à son
+# matériau d'origine.
+used = [(i, p) for i, p in enumerate(parts) if p.positions]
+
 blocks, part_blocks = [], []
-for p in parts:
+for _, p in used:
     b = (b"".join(struct.pack("<fff", *v) for v in p.positions),
          b"".join(struct.pack("<fff", *v) for v in p.normals),
          b"".join(struct.pack("<ff", *v) for v in p.uvs),
@@ -373,8 +372,8 @@ for off, blk in zip(offsets, blocks):
     bin_data[off:off + len(blk)] = blk
 
 accessors, buffer_views, primitives = [], [], []
-for i, (p, blks) in enumerate(zip(parts, part_blocks)):
-    base = 5 * i  # POSITION, NORMAL, TEXCOORD_0, TANGENT, indices
+for slot, (mat_idx, p) in enumerate(used):
+    base = 5 * slot  # POSITION, NORMAL, TEXCOORD_0, TANGENT, indices
     pmin = [min(v[k] for v in p.positions) for k in range(3)]
     pmax = [max(v[k] for v in p.positions) for k in range(3)]
     accessors += [
@@ -388,17 +387,17 @@ for i, (p, blks) in enumerate(zip(parts, part_blocks)):
     targets = [34962, 34962, 34962, 34962, 34963]
     for k in range(5):
         buffer_views.append({"buffer": 0, "byteOffset": offsets[base + k],
-                             "byteLength": len(blks[k]), "target": targets[k]})
+                             "byteLength": len(part_blocks[slot][k]), "target": targets[k]})
     primitives.append({
         "attributes": {"POSITION": base, "NORMAL": base + 1, "TEXCOORD_0": base + 2,
                        "TANGENT": base + 3},
-        "indices": base + 4, "material": i})
+        "indices": base + 4, "material": slot})
 
-materials = [{"name": m["name"],
-              "pbrMetallicRoughness": {"baseColorFactor": m["factor"],
-                                       "metallicFactor": m["metallic"],
-                                       "roughnessFactor": m["roughness"]}}
-             for m in MATERIALS]
+materials = [{"name": MATERIALS[mat_idx]["name"],
+              "pbrMetallicRoughness": {"baseColorFactor": MATERIALS[mat_idx]["factor"],
+                                       "metallicFactor": MATERIALS[mat_idx]["metallic"],
+                                       "roughnessFactor": MATERIALS[mat_idx]["roughness"]}}
+             for mat_idx, _ in used]
 
 gltf = {
     "asset": {"version": "2.0", "generator": "noire-tgv-procedural (CC0)"},

@@ -29,53 +29,46 @@ double signed_lateral_accel(const glm::dvec3& front_tangent, const glm::dvec3& r
 
 void CarBody::update(const glm::dvec3& front_pos, const glm::dvec3& rear_pos, double dt,
                      double longitudinal_accel, double lateral_accel) {
-    const glm::dvec3 center = (front_pos + rear_pos) * 0.5;
+    const glm::dvec3 world_up(0.0, 1.0, 0.0);
 
-    // Base orientée : l'axe long de la caisse EST le segment entre les deux bogies. Yaw et
-    // pitch géométriques en découlent sans un seul angle calculé à la main.
-    const glm::vec3 forward = glm::vec3(glm::normalize(front_pos - rear_pos));
-    const glm::vec3 world_up(0.0f, 1.0f, 0.0f);
-    const glm::vec3 right = glm::normalize(glm::cross(forward, world_up));
-    const glm::vec3 up = glm::cross(right, forward);
-
-    const double support_y = center.y;
+    // Hauteur NOMINALE du centre de caisse : moyenne des deux bogies + hauteur de caisse.
+    const double support_y = (front_pos.y + rear_pos.y) * 0.5 + config_.body_height;
     if (!ready_) {
         body_y_ = support_y;
         prev_support_y_ = support_y;
         ready_ = true;
     }
 
-    // Pilonnement : oscillateur excité par la base (le sol qui monte/descend sous la caisse).
+    // --- Pilonnement UNIFORME : oscillateur excité par la base (le sol qui monte/descend) ---
     const double base_velocity = (support_y - prev_support_y_) / dt;
     prev_support_y_ = support_y;
     const double wn = 2.0 * glm::pi<double>() * config_.heave_frequency;
-    const double k = wn * wn;
-    const double c = 2.0 * config_.heave_damping * wn;
-    const double heave_accel = -k * (body_y_ - support_y) - c * (body_vy_ - base_velocity);
+    const double heave_accel = -(wn * wn) * (body_y_ - support_y) -
+                               2.0 * config_.heave_damping * wn * (body_vy_ - base_velocity);
     body_vy_ += heave_accel * dt;
     body_y_ += body_vy_ * dt;
     const double heave = body_y_ - support_y;
 
-    // Tangage : oscillateur forcé par l'accélération longitudinale (plonge au freinage).
-    const double target_pitch = -config_.pitch_gain * longitudinal_accel;
+    // --- TANGAGE = TRANSFERT DE CHARGE (M17.6) ---
+    // pitch_ est la DEMI-COURSE d'appui (m) : au freinage la charge passe sur l'avant, donc
+    // l'appui avant s'enfonce et l'arrière se lève (nez qui plonge). C'est une conséquence de
+    // la course de suspension, BORNÉE — la caisse ne peut jamais s'arracher des bogies.
+    double target_pitch = config_.pitch_transfer * longitudinal_accel;
+    target_pitch = std::clamp(target_pitch, -config_.max_pitch_travel, config_.max_pitch_travel);
     const double wp = 2.0 * glm::pi<double>() * config_.pitch_frequency;
     const double pitch_accel =
         wp * wp * (target_pitch - pitch_) - 2.0 * config_.pitch_damping * wp * pitch_vel_;
     pitch_vel_ += pitch_accel * dt;
     pitch_ += pitch_vel_ * dt;
-    // BUTOIR DUR (M17.5) : la caisse ne cabre JAMAIS au-delà de max_pitch, quelle que soit
-    // l'accélération. On annule aussi la vitesse au contact du butoir : sinon l'intégrateur
-    // « pousse » contre la borne et la caisse repart d'un coup en la quittant (wind-up).
-    if (pitch_ > config_.max_pitch) {
-        pitch_ = config_.max_pitch;
+    if (pitch_ > config_.max_pitch_travel) {
+        pitch_ = config_.max_pitch_travel;
         if (pitch_vel_ > 0.0) pitch_vel_ = 0.0;
-    } else if (pitch_ < -config_.max_pitch) {
-        pitch_ = -config_.max_pitch;
+    } else if (pitch_ < -config_.max_pitch_travel) {
+        pitch_ = -config_.max_pitch_travel;
         if (pitch_vel_ < 0.0) pitch_vel_ = 0.0;
     }
 
-    // Roulis (M16) : oscillateur forcé par l'accélération latérale. Même forme et même
-    // butoir que le tangage.
+    // --- Roulis : petite rotation autour de l'axe long (inchangé, borné) ---
     const double target_roll = -config_.roll_gain * lateral_accel;
     const double wr = 2.0 * glm::pi<double>() * config_.roll_frequency;
     const double roll_accel =
@@ -90,17 +83,29 @@ void CarBody::update(const glm::dvec3& front_pos, const glm::dvec3& rear_pos, do
         if (roll_vel_ < 0.0) roll_vel_ = 0.0;
     }
 
-    position_ = center + glm::dvec3(0.0, config_.body_height + heave, 0.0);
+    // --- LES DEUX APPUIS : la caisse est tendue entre eux -----------------------------
+    // Chaque appui est à `body_height` au-dessus de SON bogie, plus le pilonnement, plus/moins
+    // le transfert de charge. La caisse relie ces deux points : son orientation (yaw + pitch)
+    // en découle GÉOMÉTRIQUEMENT, et comme les appuis restent à ~body_height de leurs bogies,
+    // la caisse ne peut PAS décoller. Fini le « wheelie ».
+    const double h = config_.body_height + heave;
+    const glm::dvec3 front_support = front_pos + world_up * (h + pitch_);
+    const glm::dvec3 rear_support = rear_pos + world_up * (h - pitch_);
+    const glm::dvec3 center = (front_support + rear_support) * 0.5;
 
+    const glm::vec3 forward = glm::vec3(glm::normalize(front_support - rear_support));
+    const glm::vec3 right = glm::normalize(glm::cross(forward, glm::vec3(world_up)));
+    const glm::vec3 up = glm::cross(right, forward);
+
+    position_ = center;
     glm::mat4 basis(1.0f);
     basis[0] = glm::vec4(right, 0.0f);
     basis[1] = glm::vec4(up, 0.0f);
     basis[2] = glm::vec4(-forward, 0.0f);
-    // Tangage autour de l'axe transversal (X local), roulis autour de l'axe long (Z local).
-    glm::mat4 lean = glm::rotate(glm::mat4(1.0f), static_cast<float>(pitch_),
-                                 glm::vec3(1.0f, 0.0f, 0.0f));
-    lean = glm::rotate(lean, static_cast<float>(roll_), glm::vec3(0.0f, 0.0f, 1.0f));
-    orientation_ = basis * lean;
+    // Le tangage est DÉJÀ dans la géométrie (via forward). Il ne reste qu'à appliquer le
+    // roulis, autour de l'axe long.
+    orientation_ = basis * glm::rotate(glm::mat4(1.0f), static_cast<float>(roll_),
+                                       glm::vec3(0.0f, 0.0f, 1.0f));
 }
 
 }  // namespace noire::physics

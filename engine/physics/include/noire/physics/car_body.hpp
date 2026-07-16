@@ -11,19 +11,23 @@ struct CarBodyConfig {
 
     double heave_frequency = 1.2;  // pilonnement (Hz)
     double heave_damping = 0.30;
-    double pitch_frequency = 1.4;  // tangage (Hz)
-    double pitch_damping = 0.35;
-    // rad de tangage par m/s² d'accélération longitudinale. VOLONTAIREMENT FAIBLE (M17.5) :
-    // le tangage d'un TGV est infime (~1°). À 0,02, un freinage d'urgence (~1,2 m/s²) vise
-    // ~1,4° ; l'oscillateur sous-amorti dépasse un peu, le clamp (max_pitch) coupe le reste.
-    double pitch_gain = 0.02;
-    // BUTOIR DUR sur le tangage : la caisse ne peut PAS cabrer au-delà, quelle que soit
-    // l'accélération. 2° = 0,035 rad. C'est ce qui interdit le « wheelie » (M17.5).
-    double max_pitch = 0.035;
 
-    // Roll (M16) : la caisse s'incline en courbe. La voie n'a PAS de dévers modélisé, donc
-    // ce roll est une souplesse de suspension ∝ accélération latérale (v²·courbure) —
-    // volontairement subtile. Filtré comme le tangage.
+    // TANGAGE PAR TRANSFERT DE CHARGE (M17.6) — plus une rotation libre autour du centre
+    // (qui arrachait la caisse de ses bogies), mais une DIFFÉRENCE DE HAUTEUR entre l'appui
+    // avant et l'appui arrière. La caisse est tendue entre ses deux appuis : elle ne peut
+    // donc jamais les quitter, et le tangage est borné par la COURSE de suspension.
+    double pitch_frequency = 1.4;  // dynamique du transfert (Hz)
+    double pitch_damping = 0.35;
+    // Course d'appui (m) par m/s² d'accélération : à un freinage d'urgence (~1,2 m/s²) l'appui
+    // se déplace de ~7 cm, soit ~0,6° de tangage sur l'empattement moteur — subtil et réel.
+    double pitch_transfer = 0.06;
+    // BUTOIR DUR sur la course d'appui (m) : la suspension ne débat jamais au-delà, donc la
+    // caisse reste toujours à ~body_height de ses bogies. C'est ce qui interdit le « wheelie ».
+    double max_pitch_travel = 0.10;
+
+    // Roll (M16) : petite rotation autour de l'axe LONG, gardée telle quelle. Les flancs ne
+    // sont qu'à ~1,5 m de l'axe (les bogies sont sur la ligne médiane) : 5° ne lève un flanc
+    // que de ~13 cm et n'arrache rien. C'est une souplesse ∝ accélération latérale.
     double roll_frequency = 1.1;
     double roll_damping = 0.35;
     double roll_gain = 0.015;      // rad de roll par m/s² d'accélération latérale
@@ -58,12 +62,15 @@ private:
     CarBodyConfig config_;
 
     bool ready_ = false;
-    double body_y_ = 0.0;
+    double body_y_ = 0.0;         // hauteur filtrée du centre de caisse (pilonnement)
     double body_vy_ = 0.0;
     double prev_support_y_ = 0.0;
+    // pitch_ n'est PLUS un angle (M17.6) : c'est la demi-course d'appui, en MÈTRES. L'appui
+    // avant monte de pitch_, l'arrière descend de pitch_ (ou l'inverse). Le tangage en
+    // découle géométriquement, borné par la course => la caisse ne quitte jamais ses bogies.
     double pitch_ = 0.0;
     double pitch_vel_ = 0.0;
-    double roll_ = 0.0;
+    double roll_ = 0.0;           // roll : reste un angle (rad)
     double roll_vel_ = 0.0;
 
     WorldPosition position_{0.0, 0.0, 0.0};

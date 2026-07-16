@@ -64,10 +64,8 @@ physics::WagonConfig make_tgv_config() {
     c.davis_a = 3000.0;
     c.davis_b = 90.0;
     c.davis_c = 8.0;  // traînée aéro : 63 kN des 74 kN à 320 km/h
-    // TANGAGE (M17.5) : le 0.12 du M13 faisait CABRER la caisse (« wheelie ») — 8° de
-    // consigne à un freinage d'urgence, plus l'overshoot de l'oscillateur. Le tangage réel
-    // d'un TGV est ~1° : on revient à 0.02, et CarBody borne dur à 2° de toute façon.
-    c.pitch_gain = 0.02;
+    // Le tangage n'est plus réglé ici (M17.6) : il naît du transfert de charge entre les deux
+    // appuis (CarBodyConfig::pitch_transfer), ce qui interdit à la caisse de quitter ses bogies.
     return c;
 }
 
@@ -329,6 +327,7 @@ struct Application::Impl {
     resource::ModelHandle train_model;
     resource::ModelHandle voiture_model;       // voiture voyageurs (M16)
     resource::ModelHandle jacobs_bogie_model;  // bogie Jacobs partagé (M16)
+    resource::ModelHandle station_model;       // module de gare répétable (M18)
     resource::AudioHandle rumble_clip;
     resource::EnvironmentHandle sky;
     // Textures PBR du ballast (Poly Haven, CC0). Maintenues vivantes par ces handles :
@@ -601,6 +600,8 @@ struct Application::Impl {
         // partagé, générés par tools/gen_tgv_voiture.py.
         voiture_model = resources.load_model("models/tgv_voiture.glb");
         jacobs_bogie_model = resources.load_model("models/tgv_bogie.glb");
+        // Gare de départ (M18) : un module répété le long de la voie sur 0-400 m.
+        station_model = resources.load_model("models/station.glb");
         tree_model = resources.load_model("models/tree.glb");
         rumble_clip = resources.load_audio("audio/roulement.wav");
 
@@ -1309,17 +1310,29 @@ struct Application::Impl {
             items.push_back(item);
         }
 
-        // Locomotive : dessinée avec le transform EXACT de la caisse — position,
-        // orientation, pitch et heave issus de la physique multi-corps (M4) — suivi du
-        // CALIBRAGE du modèle (M9). Ce dernier facteur est le point d'insertion pour un
-        // vrai tgv.glb : régler kLocoTransform suffit à le mettre à l'échelle, le
-        // retourner et poser ses roues sur le rail, sans toucher ni la physique ni l'asset.
+        // Locomotive (M17.6) : la CAISSE suit la suspension (position + orientation de la
+        // physique multi-corps), mais SES BOGIES sont dessinés SÉPARÉMENT — plaqués sur la
+        // voie, sans le moindre tangage de caisse. C'est la HIÉRARCHIE ferroviaire correcte :
+        // le bogie roule sur le rail, la caisse flotte au-dessus sur ses ressorts. Le modèle
+        // tgv_procedural.glb ne contient donc plus de roues (générateur M17.6).
         if (train_model && train_model->ready) {
             const glm::mat4 loco = camera.relative_model(wagon.body_position()) *
                                    wagon.body_orientation() * kLocoTransform.matrix();
             for (const resource::Model::Primitive& prim : train_model->primitives) {
                 const render::MaterialId mat = prim.material ? prim.material->id : 0;
                 items.push_back(render::DrawItem{loco, prim.mesh, mat});
+            }
+            // Les 2 bogies moteur, à l'orientation de la VOIE (jamais celle de la caisse).
+            // Même modèle que les bogies Jacobs (empattement 3 m identique).
+            if (jacobs_bogie_model && jacobs_bogie_model->ready) {
+                for (const physics::Bogie* b : {&wagon.front_bogie(), &wagon.rear_bogie()}) {
+                    const glm::mat4 m = camera.relative_model(b->position()) * b->orientation() *
+                                        kBogieTransform.matrix();
+                    for (const resource::Model::Primitive& prim : jacobs_bogie_model->primitives) {
+                        const render::MaterialId mat = prim.material ? prim.material->id : 0;
+                        items.push_back(render::DrawItem{m, prim.mesh, mat});
+                    }
+                }
             }
         } else {
             // Fallback / pendant le chargement : cubes de debug M4 (2 bogies + caisse),
@@ -1398,6 +1411,37 @@ struct Application::Impl {
             }
         }
 
+        // Gare de départ (M18) : le module est RÉPÉTÉ le long de la voie de 0 à 400 m, posé
+        // à chaque fois sur la spline avec l'orientation de la voie — il épouse donc la
+        // courbe et la pente. Son repère local a y = 0 au plan de roulement, donc le dessus
+        // des quais (+1 m local) tombe pile au seuil des portes du TGV.
+        if (station_model && station_model->ready) {
+            const double x_train = wagon.chainage();
+            const glm::vec3 world_up(0.0f, 1.0f, 0.0f);
+            constexpr double kStationModule = 40.0;
+            constexpr int kStationModules = 10;  // 10 x 40 m = 0 à 400 m
+            for (int i = 0; i < kStationModules; ++i) {
+                const double xc = kStationModule * (static_cast<double>(i) + 0.5);
+                if (xc < x_train - 600.0 || xc > x_train + 12000.0) {
+                    continue;  // hors de la fenêtre visible : le train a quitté la gare
+                }
+                glm::dvec3 pos, tangent;
+                track.sample(xc, pos, tangent);
+                const glm::vec3 forward = glm::vec3(glm::normalize(tangent));
+                const glm::vec3 right = glm::normalize(glm::cross(forward, world_up));
+                const glm::vec3 up = glm::cross(right, forward);
+                glm::mat4 basis(1.0f);
+                basis[0] = glm::vec4(right, 0.0f);
+                basis[1] = glm::vec4(up, 0.0f);
+                basis[2] = glm::vec4(-forward, 0.0f);
+                const glm::mat4 m = camera.relative_model(pos) * basis;
+                for (const resource::Model::Primitive& prim : station_model->primitives) {
+                    const render::MaterialId mat = prim.material ? prim.material->id : 0;
+                    items.push_back(render::DrawItem{m, prim.mesh, mat});
+                }
+            }
+        }
+
         // LES CÂBLES EN DERNIER, et ce n'est pas un détail : ils sont MÉLANGÉS et n'écrivent
         // pas la profondeur. Tout ce qui est opaque doit donc déjà avoir posé la sienne,
         // sans quoi un fil se peindrait par-dessus un talus qui le cache.
@@ -1424,6 +1468,7 @@ struct Application::Impl {
         train_model.reset();  // relâche le handle ; renderer.shutdown() détruit le GPU restant
         voiture_model.reset();
         jacobs_bogie_model.reset();
+        station_model.reset();
         audio.shutdown();
         renderer.wait_idle();
         renderer.shutdown();
