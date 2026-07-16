@@ -389,6 +389,10 @@ struct Application::Impl {
     bool key_throttle_down = false;
     bool key_brake = false;
     bool key_emergency = false;
+    bool key_horn = false;         // sifflet (H) — maintenu
+    // Enveloppe du sifflet : attaque rapide quand H est tenue, détente plus lente au
+    // relâché. Évite le clic d'un volume qui saute de 0 à 1.
+    float horn_level = 0.0f;
 
     float wetness = 0.0f;
     float wetness_target = 0.0f;
@@ -544,7 +548,7 @@ struct Application::Impl {
         engine.set_hooks(std::move(hooks));
 
         log::info("Commandes : Z/S (ou Flèches)=manipulateur de traction, Espace=frein, "
-                  "E=URGENCE, M=pluie | souris=orbite, Ctrl/Maj=zoom, Échap=quitter");
+                  "E=URGENCE, H=sifflet, P=pluie | souris=orbite, Ctrl/Maj=zoom, Échap=quitter");
         return engine.initialize();
     }
 
@@ -560,17 +564,20 @@ struct Application::Impl {
         key_throttle_down = window.is_key_down(Key::S) || window.is_key_down(Key::Down);
         key_brake = window.is_key_down(Key::Space);      // frein de service (maintenu)
         key_emergency = window.is_key_down(Key::E);      // frein d'urgence
+        key_horn = window.is_key_down(Key::H);           // sifflet (maintenu)
         if (window.is_key_down(Key::Escape)) {
             window.request_close();
         }
 
-        // Pluie : bascule sur front montant de M, puis transition douce du wetness.
-        const bool m_down = window.is_key_down(Key::M);
-        if (m_down && !prev_m_down) {
+        // Pluie : bascule sur front montant de P (M14 ; M reste synonyme), puis transition
+        // douce du wetness — qui pilote à la fois le brouillard, l'adhérence ET la pluie
+        // visible, d'un seul curseur.
+        const bool rain_down = window.is_key_down(Key::P) || window.is_key_down(Key::M);
+        if (rain_down && !prev_m_down) {
             wetness_target = (wetness_target > 0.5f) ? 0.0f : 1.0f;
             log::info("Météo : {}", wetness_target > 0.5f ? "PLUIE" : "temps sec");
         }
-        prev_m_down = m_down;
+        prev_m_down = rain_down;
         const float rate = static_cast<float>(dt) * 0.7f;
         wetness += glm::clamp(wetness_target - wetness, -rate, rate);
 
@@ -638,6 +645,19 @@ struct Application::Impl {
         in.speed = wagon.speed();
         in.curvature = curvature;
         rail_audio.update(audio, dt, in);
+
+        // --- Sifflet (M14) : posé au NEZ du train, avec sa vitesse => Doppler natif ---
+        // Attaque rapide (~0,08 s), détente plus lente (~0,4 s) : le son enfle et retombe
+        // au lieu de claquer.
+        const float horn_target = key_horn ? 1.0f : 0.0f;
+        const float horn_rate = static_cast<float>(dt) * (key_horn ? 12.0f : 2.5f);
+        horn_level += glm::clamp(horn_target - horn_level, -horn_rate, horn_rate);
+        const glm::dvec3 fwd = glm::normalize(wagon.front_bogie().tangent());
+        // Le nez est en avant du bogie avant : ~8 m suffisent à séparer clairement la
+        // source du reste du train pour la spatialisation.
+        const WorldPosition nose = wagon.front_bogie().position() + fwd * 8.0;
+        audio.set_horn(nose, train_velocity, horn_level * 0.8f);
+
         sim_time += dt;
 
         if (++telemetry_ticks % 120 == 0) {
@@ -679,6 +699,12 @@ struct Application::Impl {
         lines.emplace_back(std::format("CG      {:>5.1f} BAR", brake.pipe_pressure()),
                            brake.emergency() ? alert : value);
         lines.emplace_back(std::format("PENTE    {:>+5.1f} %", wagon.grade_percent()), label);
+        // Météo (M14) : mot d'état + intensité. Bleuté sous la pluie, gris au sec.
+        const bool raining = wetness > 0.5f;
+        const glm::vec4 meteo_color = raining ? glm::vec4{0.45f, 0.65f, 1.0f, 1.0f} : label;
+        lines.emplace_back(std::format("METEO {:>4} {:>3.0f}%", raining ? "PLUIE" : "SEC",
+                                       static_cast<double>(wetness) * 100.0),
+                           meteo_color);
         lines.emplace_back(std::format("{:>3.0f} FPS  GPU {:.1f} MS", perf_fps, perf_gpu_ms), label);
         if (brake.emergency()) {
             lines.emplace_back("URGENCE", alert);
@@ -1018,6 +1044,18 @@ struct Application::Impl {
         uniforms.fog_color_density = glm::vec4(fog_color, fog_density);
         // y = temps : c'est l'horloge du vent (mesh_instanced.vert).
         uniforms.params = glm::vec4(wetness, static_cast<float>(sim_time), 0.0f, 0.0f);
+
+        // Pluie (M14) : intensité = météo, temps = horloge des gouttes. L'INCLINAISON est
+        // la vitesse du train projetée dans le repère VUE : la pluie penche dans le sens où
+        // le paysage file à l'écran. Caméra de face (train qui s'éloigne) => pas de biais
+        // latéral, la pluie tombe droite ; caméra de profil à 300 km/h => elle raye
+        // l'écran presque à l'horizontale. Le signe suit l'orbite, donc c'est cohérent.
+        uniforms.rain_intensity = wetness;
+        uniforms.rain_time = static_cast<float>(sim_time);
+        const glm::vec3 train_vel =
+            glm::vec3(wagon.front_bogie().tangent()) * static_cast<float>(wagon.speed());
+        const glm::vec3 vel_view = glm::vec3(uniforms.view * glm::vec4(train_vel, 0.0f));
+        uniforms.rain_tilt = glm::clamp(-vel_view.x / 30.0f, -2.5f, 2.5f);
 
         // Soleil : direction VERS l'astre, source de vérité unique (elle éclaire les
         // modèles ET cadre les cascades d'ombre). Depuis l'étape 6b elle est EXTRAITE du

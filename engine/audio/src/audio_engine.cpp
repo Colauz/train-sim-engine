@@ -57,6 +57,28 @@ std::vector<float> synth_squeal() {
     return s;
 }
 
+// Sifflet du TGV (M14) : deux-tons cuivré, boucle 1 s. Un avertisseur ferroviaire est un
+// ACCORD de deux notes (le « deux-tons » SNCF) ; ici une tierce majeure (~349 + 440 Hz)
+// enrichie de quelques harmoniques pour le mordant, avec une attaque douce sur le tout
+// premier instant pour éviter le clic de démarrage de boucle.
+std::vector<float> synth_horn() {
+    const int n = kSampleRate;  // 1 s, fréquences entières => boucle sans couture
+    std::vector<float> s(static_cast<std::size_t>(n));
+    const float f_lo = 349.0f;  // fa
+    const float f_hi = 440.0f;  // la (tierce majeure au-dessus)
+    for (int i = 0; i < n; ++i) {
+        const float t = static_cast<float>(i) / kSampleRate;
+        auto tone = [t](float f) {
+            // Fondamentale + 2e et 3e harmoniques décroissantes => timbre d'avertisseur.
+            return std::sin(2.0f * kPi * f * t) * 0.6f +
+                   std::sin(2.0f * kPi * 2.0f * f * t) * 0.25f +
+                   std::sin(2.0f * kPi * 3.0f * f * t) * 0.12f;
+        };
+        s[static_cast<std::size_t>(i)] = (tone(f_lo) + tone(f_hi)) * 0.45f;
+    }
+    return s;
+}
+
 // Roulement : grave filtré passe-bas + tonales basses, boucle 1 s.
 std::vector<float> synth_rumble() {
     const int n = kSampleRate;
@@ -83,6 +105,7 @@ struct AudioEngine::Impl {
     std::vector<float> clack_pcm;
     std::vector<float> squeal_pcm;
     std::vector<float> rumble_pcm;
+    std::vector<float> horn_pcm;
 
     std::array<ma_audio_buffer, kJointPoolSize> clack_bufs{};
     std::array<ma_sound, kJointPoolSize> joint_pool{};
@@ -90,8 +113,10 @@ struct AudioEngine::Impl {
 
     ma_audio_buffer squeal_buf{};
     ma_audio_buffer rumble_buf{};
+    ma_audio_buffer horn_buf{};
     ma_sound squeal_sound{};
     ma_sound rumble_sound{};
+    ma_sound horn_sound{};
 
     WorldPosition listener_pos{0.0, 0.0, 0.0};
 
@@ -171,6 +196,7 @@ bool AudioEngine::initialize() {
     impl_->clack_pcm = synth_clack();
     impl_->squeal_pcm = synth_squeal();
     impl_->rumble_pcm = synth_rumble();
+    impl_->horn_pcm = synth_horn();
 
     // Chaque clac du pool a son propre audio_buffer (curseur indépendant) mais
     // partage les mêmes données PCM (référencées, non copiées).
@@ -180,6 +206,7 @@ bool AudioEngine::initialize() {
     }
     ok = ok && Impl::make_buffer(impl_->squeal_pcm, impl_->squeal_buf);
     ok = ok && Impl::make_buffer(impl_->rumble_pcm, impl_->rumble_buf);
+    ok = ok && Impl::make_buffer(impl_->horn_pcm, impl_->horn_buf);
     if (!ok) {
         log::error("Audio : échec de création des buffers procéduraux");
         return false;
@@ -206,6 +233,14 @@ bool AudioEngine::initialize() {
     ma_sound_set_volume(&impl_->rumble_sound, 0.0f);
     ma_sound_start(&impl_->rumble_sound);
 
+    // Sifflet (M14) : même schéma — boucle continue, muette au repos, Doppler activé.
+    ma_sound_init_from_data_source(&impl_->engine, &impl_->horn_buf, 0, nullptr,
+                                   &impl_->horn_sound);
+    ma_sound_set_looping(&impl_->horn_sound, MA_TRUE);
+    ma_sound_set_doppler_factor(&impl_->horn_sound, 1.0f);
+    ma_sound_set_volume(&impl_->horn_sound, 0.0f);
+    ma_sound_start(&impl_->horn_sound);
+
     ma_engine_listener_set_world_up(&impl_->engine, 0, 0.0f, 1.0f, 0.0f);
 
     impl_->sounds_ok = true;
@@ -224,11 +259,13 @@ void AudioEngine::shutdown() {
         }
         ma_sound_uninit(&impl_->squeal_sound);
         ma_sound_uninit(&impl_->rumble_sound);
+        ma_sound_uninit(&impl_->horn_sound);
         for (ma_audio_buffer& b : impl_->clack_bufs) {
             ma_audio_buffer_uninit(&b);
         }
         ma_audio_buffer_uninit(&impl_->squeal_buf);
         ma_audio_buffer_uninit(&impl_->rumble_buf);
+        ma_audio_buffer_uninit(&impl_->horn_buf);
     }
     if (impl_->engine_ok) {
         ma_engine_uninit(&impl_->engine);
@@ -270,6 +307,16 @@ void AudioEngine::set_squeal(const WorldPosition& position, const glm::vec3& vel
     ma_sound_set_position(&impl_->squeal_sound, rel.x, rel.y, rel.z);
     ma_sound_set_velocity(&impl_->squeal_sound, velocity.x, velocity.y, velocity.z);
     ma_sound_set_volume(&impl_->squeal_sound, volume);
+}
+
+void AudioEngine::set_horn(const WorldPosition& position, const glm::vec3& velocity, float volume) {
+    if (!valid()) {
+        return;
+    }
+    const glm::vec3 rel = impl_->relative(position);
+    ma_sound_set_position(&impl_->horn_sound, rel.x, rel.y, rel.z);
+    ma_sound_set_velocity(&impl_->horn_sound, velocity.x, velocity.y, velocity.z);
+    ma_sound_set_volume(&impl_->horn_sound, volume);
 }
 
 void AudioEngine::play_rail_joint(const WorldPosition& position, const glm::vec3& velocity,

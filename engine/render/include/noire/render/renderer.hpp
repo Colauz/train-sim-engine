@@ -66,6 +66,15 @@ struct FrameUniforms {
     // sun_color, l'y laisser le compterait deux fois). Seul .rgb porte l'information.
     // Tout à zéro (défaut) = aucune ambiante image-based, ex. si le ciel est absent.
     std::array<glm::vec4, 9> sh{};
+
+    // Pluie (M14) — champs CPU UNIQUEMENT : ils ne partent PAS dans l'UBO std140 (le
+    // pipeline de pluie a son propre push constant), donc les ajouter ici ne touche pas
+    // au miroir GpuFrameUniforms / global_ubo.glsl. `intensity` = wetness (0 => aucune
+    // passe de pluie) ; `tilt` = cisaillement écran croissant avec la vitesse ; `time` =
+    // horloge de défilement des gouttes.
+    float rain_intensity = 0.0f;
+    float rain_tilt = 0.0f;
+    float rain_time = 0.0f;
 };
 
 // Description d'un matériau PBR metallic-roughness (convention glTF), fournie par
@@ -401,6 +410,10 @@ private:
     std::uint32_t upload_hud(const Hud& hud);
     void record_hud(VkCommandBuffer cmd, std::uint32_t glyph_count);
 
+    // Pluie (M14) : plein écran, un seul push constant, ni set ni UBO.
+    bool create_rain_pipeline();  // crée aussi son layout (push-constant-only)
+    void record_rain(VkCommandBuffer cmd, const FrameUniforms& uniforms);
+
     // Ombres (M8 étape 1) : passe depth-only du soleil, une par cascade.
     bool create_shadow_render_pass();
     bool create_shadow_resources();        // images + vues + framebuffers des cascades
@@ -424,7 +437,8 @@ private:
                                       VkPipelineLayout layout);
     VkShaderModule create_shader_module(const unsigned char* code, std::size_t size);
     void record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
-                         const std::vector<DrawItem>& items, std::uint32_t glyph_count);
+                         const std::vector<DrawItem>& items, std::uint32_t glyph_count,
+                         const FrameUniforms& uniforms);
     void recreate_swapchain();
     void destroy_depth_resources();
     void process_deferred_deletes();
@@ -472,6 +486,10 @@ private:
     // 512 glyphes = ~8 lignes de 60 caractères, très au-delà d'un HUD de cabine. À
     // 40 octets l'instance, les deux tampons pèsent 40 Ko.
     static constexpr std::uint32_t kMaxGlyphs = 512;
+
+    // --- Pluie (M14) : effet plein écran, push-constant-only --------------------
+    VkPipelineLayout rain_pipeline_layout_ = VK_NULL_HANDLE;  // 0 set, 1 push constant
+    VkPipeline rain_pipeline_ = VK_NULL_HANDLE;
 
     std::unordered_map<InstanceBufferId, GpuBuffer> instance_buffers_;
     InstanceBufferId next_instance_id_ = 1;

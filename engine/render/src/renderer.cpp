@@ -20,6 +20,8 @@
 #include "shaders/foliage.frag.spv.h"
 #include "shaders/hud.frag.spv.h"
 #include "shaders/hud.vert.spv.h"
+#include "shaders/rain.frag.spv.h"
+#include "shaders/rain.vert.spv.h"
 #include "shaders/mesh_instanced.vert.spv.h"
 #include "shaders/mesh_textured.vert.spv.h"
 #include "shaders/prefilter_env.comp.spv.h"
@@ -79,6 +81,15 @@ struct GlyphInstance {
     glm::vec4 color;     // LINÉAIRE
 };
 static_assert(sizeof(GlyphInstance) == 40, "stride décrit à la main dans create_hud_pipeline");
+
+// Push constant de la pluie (M14) : miroir exact du bloc Push de rain.frag. 16 octets.
+struct RainPush {
+    float intensity;
+    float tilt;
+    float time;
+    float aspect;
+};
+static_assert(sizeof(RainPush) == 16, "miroir du push constant de rain.frag");
 
 // Push constants du pipeline texturé : miroir exact du bloc du même nom dans
 // mesh_textured.vert/.frag. Le modèle est lu au vertex, les facteurs au fragment.
@@ -209,6 +220,11 @@ bool Renderer::initialize(const RendererCreateInfo& info) {
     // matériau, ni texture, ni environnement. Sa police est embarquée en dur, donc il est
     // dessinable dès la toute première frame.
     if (!create_hud_pipeline_layout() || !create_hud_buffers() || !create_hud_pipeline()) {
+        return false;
+    }
+
+    // Pluie (M14) : plein écran, ne dépend que de render_pass_.
+    if (!create_rain_pipeline()) {
         return false;
     }
 
@@ -2191,6 +2207,145 @@ void Renderer::record_hud(VkCommandBuffer cmd, std::uint32_t glyph_count) {
     vkCmdDraw(cmd, 6, glyph_count, 0, 0);
 }
 
+// --- Pluie (M14) -------------------------------------------------------------------
+// Effet plein écran dessiné après le ciel, avant le HUD : sur le monde, sous le pupitre.
+// Push-constant-only : AUCUN descriptor set (donc aucun bind de set), le fragment ne lit
+// que ses 16 octets de push. Triangle plein écran depuis gl_VertexIndex, blend alpha,
+// sans profondeur.
+bool Renderer::create_rain_pipeline() {
+    // Layout : zéro set, un seul push constant fragment. Précédent du push-only : aucun,
+    // mais c'est le pendant naturel du set-only de la skybox.
+    VkPushConstantRange push{};
+    push.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    push.offset = 0;
+    push.size = sizeof(RainPush);
+    VkPipelineLayoutCreateInfo layout_info{};
+    layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    layout_info.pushConstantRangeCount = 1;
+    layout_info.pPushConstantRanges = &push;
+    if (vkCreatePipelineLayout(context_.device(), &layout_info, nullptr, &rain_pipeline_layout_) !=
+        VK_SUCCESS) {
+        log::error("Renderer : création du pipeline layout de la pluie échouée");
+        return false;
+    }
+
+    VkShaderModule vert = create_shader_module(rain_vert_spv, rain_vert_spv_size);
+    VkShaderModule frag = create_shader_module(rain_frag_spv, rain_frag_spv_size);
+    if (vert == VK_NULL_HANDLE || frag == VK_NULL_HANDLE) {
+        return false;
+    }
+    VkPipelineShaderStageCreateInfo vs{};
+    vs.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    vs.stage = VK_SHADER_STAGE_VERTEX_BIT;
+    vs.module = vert;
+    vs.pName = "main";
+    VkPipelineShaderStageCreateInfo fs{};
+    fs.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    fs.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    fs.module = frag;
+    fs.pName = "main";
+    const std::array<VkPipelineShaderStageCreateInfo, 2> stages{vs, fs};
+
+    // Aucun tampon de sommets : la géométrie sort de gl_VertexIndex (comme la skybox).
+    VkPipelineVertexInputStateCreateInfo vi{};
+    vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+
+    VkPipelineInputAssemblyStateCreateInfo ia{};
+    ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkPipelineViewportStateCreateInfo vp{};
+    vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    vp.viewportCount = 1;
+    vp.scissorCount = 1;
+
+    VkPipelineRasterizationStateCreateInfo rs{};
+    rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo ms{};
+    ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    // Sans profondeur (effet écran), mais pDepthStencilState reste fourni (attachement
+    // de profondeur présent dans le subpass), sType renseigné.
+    VkPipelineDepthStencilStateCreateInfo ds{};
+    ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    ds.depthTestEnable = VK_FALSE;
+    ds.depthWriteEnable = VK_FALSE;
+
+    VkPipelineColorBlendAttachmentState ba{};
+    ba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                        VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    ba.blendEnable = VK_TRUE;
+    ba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+    ba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    ba.colorBlendOp = VK_BLEND_OP_ADD;
+    ba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    ba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    ba.alphaBlendOp = VK_BLEND_OP_ADD;
+    VkPipelineColorBlendStateCreateInfo cb{};
+    cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    cb.attachmentCount = 1;
+    cb.pAttachments = &ba;
+
+    const std::array<VkDynamicState, 2> dyn_states{VK_DYNAMIC_STATE_VIEWPORT,
+                                                   VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dyn{};
+    dyn.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dyn.dynamicStateCount = static_cast<std::uint32_t>(dyn_states.size());
+    dyn.pDynamicStates = dyn_states.data();
+
+    VkGraphicsPipelineCreateInfo pipe{};
+    pipe.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pipe.stageCount = static_cast<std::uint32_t>(stages.size());
+    pipe.pStages = stages.data();
+    pipe.pVertexInputState = &vi;
+    pipe.pInputAssemblyState = &ia;
+    pipe.pViewportState = &vp;
+    pipe.pRasterizationState = &rs;
+    pipe.pMultisampleState = &ms;
+    pipe.pDepthStencilState = &ds;
+    pipe.pColorBlendState = &cb;
+    pipe.pDynamicState = &dyn;
+    pipe.layout = rain_pipeline_layout_;
+    pipe.renderPass = render_pass_;
+    pipe.subpass = 0;
+
+    const VkResult res = vkCreateGraphicsPipelines(context_.device(), VK_NULL_HANDLE, 1, &pipe,
+                                                   nullptr, &rain_pipeline_);
+    vkDestroyShaderModule(context_.device(), frag, nullptr);
+    vkDestroyShaderModule(context_.device(), vert, nullptr);
+    if (res != VK_SUCCESS) {
+        log::error("Vulkan : création du pipeline de la pluie échouée");
+        rain_pipeline_ = VK_NULL_HANDLE;
+        return false;
+    }
+    return true;
+}
+
+void Renderer::record_rain(VkCommandBuffer cmd, const FrameUniforms& uniforms) {
+    // Temps sec : on ne dessine RIEN (pas même le plein écran discardé).
+    if (uniforms.rain_intensity <= 0.001f || rain_pipeline_ == VK_NULL_HANDLE) {
+        return;
+    }
+    RainPush push{};
+    push.intensity = uniforms.rain_intensity;
+    push.tilt = uniforms.rain_tilt;
+    push.time = uniforms.rain_time;
+    const VkExtent2D extent = swapchain_.extent();
+    push.aspect = extent.height > 0 ? static_cast<float>(extent.width) /
+                                          static_cast<float>(extent.height)
+                                    : 1.0f;
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, rain_pipeline_);
+    vkCmdPushConstants(cmd, rain_pipeline_layout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                       sizeof(RainPush), &push);
+    vkCmdDraw(cmd, 3, 1, 0, 0);
+}
+
 VkPipeline Renderer::build_terrain_pipeline() {
     return build_surface_pipeline(terrain_frag_spv, terrain_frag_spv_size,
                                   terrain_pipeline_layout_);
@@ -3359,7 +3514,8 @@ void Renderer::destroy_texture(TextureId id) {
 }
 
 void Renderer::record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
-                               const std::vector<DrawItem>& items, std::uint32_t glyph_count) {
+                               const std::vector<DrawItem>& items, std::uint32_t glyph_count,
+                               const FrameUniforms& uniforms) {
     VkCommandBufferBeginInfo begin{};
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     vkBeginCommandBuffer(cmd, &begin);
@@ -3494,9 +3650,12 @@ void Renderer::record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
     // coûterait un fragment plein écran systématiquement.
     record_skybox(cmd);
 
-    // Le HUD APRÈS le ciel, donc en tout dernier : il est à l'écran, sans profondeur, et
-    // doit couvrir la scène entière. Toujours dans la MÊME passe : aucun attachement à
-    // retransitionner, aucune render pass de plus.
+    // La pluie APRÈS le ciel (elle voile le monde et le ciel), mais AVANT le HUD (qui doit
+    // rester net par-dessus). Toujours dans la même passe.
+    record_rain(cmd, uniforms);
+
+    // Le HUD en tout dernier : à l'écran, sans profondeur, il couvre tout le reste — y
+    // compris la pluie.
     record_hud(cmd, glyph_count);
 
     vkCmdEndRenderPass(cmd);
@@ -3586,7 +3745,7 @@ void Renderer::draw_frame(const FrameUniforms& uniforms, const std::vector<DrawI
 
     VkCommandBuffer cmd = command_buffers_[current_frame_];
     vkResetCommandBuffer(cmd, 0);
-    record_commands(cmd, image_index, items, glyph_count);
+    record_commands(cmd, image_index, items, glyph_count, uniforms);
 
     VkSemaphore wait_semaphores[] = {image_available_[current_frame_]};
     VkPipelineStageFlags wait_stages[] = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
@@ -3723,6 +3882,15 @@ void Renderer::shutdown() {
         context_.destroy_buffer(buffer);
     }
     hud_buffers_.clear();
+    // Pluie (M14).
+    if (rain_pipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(dev, rain_pipeline_, nullptr);
+        rain_pipeline_ = VK_NULL_HANDLE;
+    }
+    if (rain_pipeline_layout_ != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(dev, rain_pipeline_layout_, nullptr);
+        rain_pipeline_layout_ = VK_NULL_HANDLE;
+    }
     for (auto& [id, buffer] : instance_buffers_) {
         context_.destroy_buffer(buffer);
     }

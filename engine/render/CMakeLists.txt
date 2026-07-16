@@ -40,6 +40,8 @@ noire_add_shaders(noire_render
     shaders/foliage.frag
     shaders/hud.vert
     shaders/hud.frag
+    shaders/rain.vert
+    shaders/rain.frag
     shaders/shadow_instanced.vert
     shaders/shadow_foliage.frag
     shaders/prefilter_env.comp)

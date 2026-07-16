@@ -35,6 +35,11 @@ public:
     void set_rumble(const WorldPosition& position, const glm::vec3& velocity, float volume,
                     float pitch);
     void set_squeal(const WorldPosition& position, const glm::vec3& velocity, float volume);
+    // Sifflet du TGV (M14) : deux-tons continu, posé au NEZ du train. Comme les autres
+    // émetteurs, il porte sa `velocity` => le Doppler est calculé par miniaudio (rien à
+    // faire de plus). `volume` = 0 quand la touche H est relâchée (le son reste en boucle,
+    // simplement muet), ce qui donne l'attaque/détente sans réinitialiser la source.
+    void set_horn(const WorldPosition& position, const glm::vec3& velocity, float volume);
 
     // Joint de rail : « clac » one-shot spatialisé (pool interne round-robin).
     void play_rail_joint(const WorldPosition& position, const glm::vec3& velocity, float volume);
