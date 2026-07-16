@@ -23,6 +23,11 @@ CTestTestfile.cmake
 compile_commands.json
 _deps/
 
+# Rust / Cargo (PoC M13.5)
+/crates/*/target/
+# En-tête FFI généré par cbindgen (build.rs) — jamais versionné, toujours régénéré.
+/crates/*/generated/
+
 # IDE / éditeurs
 /.vs/
 /.vscode/

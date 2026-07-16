@@ -14,6 +14,10 @@ project(NoireEngine
 option(NOIRE_BUILD_TESTS        "Compiler les tests unitaires"          OFF)
 option(NOIRE_BUILD_TOOLS        "Compiler l'éditeur et les outils"      OFF)
 option(NOIRE_WARNINGS_AS_ERRORS "Traiter les warnings comme des erreurs" OFF)
+# PoC M13.5 : délègue la génération de maillage de voie à un crate Rust. OFF => aucune
+# trace de Rust dans le build (ni Corrosion, ni Cargo) : c'est le KILL SWITCH. Le
+# générateur C++ d'origine reste le chemin par défaut.
+option(NOIRE_USE_RUST           "PoC : générateur de voie en Rust (Corrosion)" OFF)
 
 # --- Réglages globaux ---------------------------------------------------------
 set(CMAKE_CXX_STANDARD 20)
@@ -34,6 +38,10 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_SOURCE_DIR}/cmake)
 include(CompilerWarnings)   # définit noire_set_warnings()
 include(Dependencies)       # récupère spdlog, glm, ...
+
+if(NOIRE_USE_RUST)
+    include(Rust)           # Corrosion + import du crate noire_procgen (PoC M13.5)
+endif()
 
 # --- Modules du moteur --------------------------------------------------------
 add_subdirectory(engine)    # la bibliothèque « noire::engine »

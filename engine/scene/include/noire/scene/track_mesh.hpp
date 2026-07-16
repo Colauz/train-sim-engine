@@ -87,4 +87,15 @@ struct TrackMeshData {
                                                 const RailProfile& profile = {},
                                                 TrackLod lod = TrackLod::Full);
 
+#if NOIRE_USE_RUST
+// PoC M13.5 — MÊME contrat que generate_track_mesh, mais le maillage est produit par le
+// crate Rust `noire_procgen`. Le C++ ne fait ici que pré-échantillonner la voie (en
+// double, avec l'origine flottante) et copier le résultat ; Rust fait tout le travail de
+// géométrie. Déclaration visible du seul noire_scene (NOIRE_USE_RUST est PRIVATE).
+[[nodiscard]] TrackMeshData generate_track_mesh_rust(const TrackSource& track, double x_start,
+                                                     double x_end, const WorldPosition& origin,
+                                                     const RailProfile& profile = {},
+                                                     TrackLod lod = TrackLod::Full);
+#endif
+
 }  // namespace noire::scene

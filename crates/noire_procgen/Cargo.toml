@@ -1,0 +1,20 @@
+[package]
+name = "noire_procgen"
+version = "0.1.0"
+edition = "2021"
+description = "Génération procédurale de géométrie de voie (PoC Rust, jalon M13.5 du moteur Noire)"
+license = "MIT"
+
+[lib]
+# staticlib : archive .a liée directement dans le binaire C++ via Corrosion. Pas de
+# .so à embarquer, pas de dépendance runtime — le PoC reste self-contained.
+crate-type = ["staticlib"]
+
+[build-dependencies]
+# cbindgen en build-dependency (et non en outil système) : `cargo build` régénère
+# l'en-tête C tout seul, sans `cargo install` global. Zéro outillage à provisionner.
+cbindgen = "0.27"
+
+[profile.release]
+# La génération de maillage est du calcul flottant serré : on veut l'optimiseur à fond.
+opt-level = 3

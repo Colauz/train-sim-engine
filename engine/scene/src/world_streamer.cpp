@@ -27,7 +27,14 @@ void WorldStreamer::generate_async(Chunk& chunk, TrackLod lod) {
     const WorldPosition origin = chunk.origin;
     const RailProfile profile = config_.rail_profile;
     jobs_.submit([this, raw, x0, x1, origin, profile, lod] {
+#if NOIRE_USE_RUST
+        // Kill switch (M13.5) : la génération part dans le crate Rust. Même signature,
+        // même sortie ; seul le producteur change. -DNOIRE_USE_RUST=OFF ramène la ligne
+        // C++ ci-dessous, sans que rien d'autre ne bouge.
+        raw->cpu_mesh = generate_track_mesh_rust(track_, x0, x1, origin, profile, lod);
+#else
         raw->cpu_mesh = generate_track_mesh(track_, x0, x1, origin, profile, lod);
+#endif
         // Barrière release : rend visibles les écritures ci-dessus au thread principal.
         raw->state.store(State::CpuReady, std::memory_order_release);
     });

@@ -1,0 +1,15 @@
+# Configuration cbindgen — génère generated/noire_procgen.h depuis src/lib.rs.
+language = "C"
+include_guard = "NOIRE_PROCGEN_H"
+# extern "C" { } automatique quand l'en-tête est inclus depuis du C++ : c'est notre cas.
+cpp_compat = true
+autogen_warning = "/* GÉNÉRÉ PAR CBINDGEN — NE PAS ÉDITER. Source : crates/noire_procgen/src/lib.rs */"
+documentation = true
+documentation_style = "c99"
+
+[export]
+# On n'exporte que ce qui est marqué #[repr(C)] / #[no_mangle] : pas de fuite d'internes.
+prefix = ""
+
+[parse]
+parse_deps = false
