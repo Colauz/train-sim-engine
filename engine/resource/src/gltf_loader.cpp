@@ -18,6 +18,24 @@ namespace noire::resource {
 
 namespace {
 
+// Traduit un code de retour cgltf en clair — pour que les logs disent POURQUOI, pas juste
+// « échoué ».
+const char* cgltf_result_string(cgltf_result r) {
+    switch (r) {
+        case cgltf_result_success: return "succès";
+        case cgltf_result_data_too_short: return "données tronquées (fichier corrompu ou incomplet)";
+        case cgltf_result_unknown_format: return "format inconnu (n'est pas un glTF/GLB ?)";
+        case cgltf_result_invalid_json: return "JSON invalide";
+        case cgltf_result_invalid_gltf: return "structure glTF invalide";
+        case cgltf_result_invalid_options: return "options invalides";
+        case cgltf_result_file_not_found: return "fichier introuvable";
+        case cgltf_result_io_error: return "erreur d'entrée/sortie";
+        case cgltf_result_out_of_memory: return "mémoire insuffisante";
+        case cgltf_result_legacy_gltf: return "glTF 1.0 (version obsolète non gérée)";
+        default: return "erreur inconnue";
+    }
+}
+
 // Une image glTF peut servir plusieurs rôles (rare mais légal) ; or le rôle décide de
 // l'espace colorimétrique. La clé de cache est donc (image, espace) et non l'image seule.
 using ImageCache = std::map<std::pair<const cgltf_image*, int>, int>;
@@ -177,12 +195,37 @@ void generate_tangents(PrimitiveData& prim) {
 bool load_gltf(const std::string& path, ModelData& out) {
     cgltf_options options{};
     cgltf_data* data = nullptr;
-    if (cgltf_parse_file(&options, path.c_str(), &data) != cgltf_result_success) {
-        log::warn("glTF : parsing de '{}' échoué", path);
+    const cgltf_result parse = cgltf_parse_file(&options, path.c_str(), &data);
+    if (parse != cgltf_result_success) {
+        log::error("glTF : parsing de '{}' ÉCHOUÉ — {}", path, cgltf_result_string(parse));
         return false;
     }
-    if (cgltf_load_buffers(&options, data, path.c_str()) != cgltf_result_success) {
-        log::warn("glTF : chargement des buffers de '{}' échoué", path);
+
+    // Extensions REQUISES par le fichier : s'il en EXIGE une qu'on ne sait pas honorer, le
+    // modèle ne peut PAS être lu tel quel. C'est le piège nº1 des modèles téléchargés.
+    bool draco = false;
+    for (cgltf_size i = 0; i < data->extensions_required_count; ++i) {
+        const char* ext = data->extensions_required[i];
+        if (std::strcmp(ext, "KHR_draco_mesh_compression") == 0) {
+            draco = true;
+        } else {
+            log::error("glTF : '{}' EXIGE l'extension '{}', non gérée par le moteur", path, ext);
+        }
+    }
+    if (draco) {
+        log::error("glTF : '{}' est COMPRESSÉ EN DRACO (KHR_draco_mesh_compression) — le moteur "
+                   "ne décompresse pas le Draco. RÉ-EXPORTE le modèle SANS Draco : dans Blender "
+                   "décoche « Draco mesh compression » à l'export glTF, ou en ligne de commande "
+                   "« gltf-transform draco --help » / « gltf-transform cp in.glb out.glb ».", path);
+        cgltf_free(data);
+        return false;
+    }
+
+    const cgltf_result bufs = cgltf_load_buffers(&options, data, path.c_str());
+    if (bufs != cgltf_result_success) {
+        log::error("glTF : chargement des buffers de '{}' ÉCHOUÉ — {} (un .glb doit être "
+                   "AUTONOME ; un .gltf a besoin de ses .bin/textures à côté)",
+                   path, cgltf_result_string(bufs));
         cgltf_free(data);
         return false;
     }
@@ -192,15 +235,36 @@ bool load_gltf(const std::string& path, ModelData& out) {
     MaterialCache material_cache;
     int generated_tangents = 0;
 
+    int skipped = 0;
     for (cgltf_size m = 0; m < data->meshes_count; ++m) {
         const cgltf_mesh& mesh = data->meshes[m];
         for (cgltf_size p = 0; p < mesh.primitives_count; ++p) {
             const cgltf_primitive& prim = mesh.primitives[p];
             if (prim.type != cgltf_primitive_type_triangles) {
-                continue;  // on ne gère que les triangles au M7
+                log::warn("glTF : '{}' primitive {}/{} non triangulée (points/lignes) — ignorée",
+                          path, m, p);
+                ++skipped;
+                continue;
+            }
+            // Draco par primitive : cgltf a lu la métadonnée mais PAS décompressé la géométrie ;
+            // ses accessors sont donc illisibles (bufferView nul). On le dit clairement.
+            if (prim.has_draco_mesh_compression) {
+                log::error("glTF : '{}' primitive {}/{} compressée en Draco — illisible (cf. "
+                           "ci-dessus, ré-exporter sans Draco)", path, m, p);
+                ++skipped;
+                continue;
             }
             const cgltf_accessor* pos = find_accessor(prim, cgltf_attribute_type_position, 0);
             if (pos == nullptr) {
+                log::error("glTF : '{}' primitive {}/{} sans attribut POSITION — ignorée", path,
+                           m, p);
+                ++skipped;
+                continue;
+            }
+            if (pos->buffer_view == nullptr) {
+                log::error("glTF : '{}' primitive {}/{} : POSITION sans bufferView (compression "
+                           "non décompressée, ou accessor 'sparse') — illisible", path, m, p);
+                ++skipped;
                 continue;
             }
             const cgltf_accessor* nrm = find_accessor(prim, cgltf_attribute_type_normal, 0);
@@ -264,7 +328,8 @@ bool load_gltf(const std::string& path, ModelData& out) {
     cgltf_free(data);
 
     if (!out.valid()) {
-        log::warn("glTF : '{}' sans primitive triangulée exploitable", path);
+        log::error("glTF : '{}' — AUCUNE primitive triangulée exploitable ({} ignorée(s)). "
+                   "Le modèle n'a pas pu être chargé.", path, skipped);
         return false;
     }
     log::info("glTF : '{}' chargé — {} primitive(s), {} matériau(x), {} image(s), {} tangente(s) générée(s)",

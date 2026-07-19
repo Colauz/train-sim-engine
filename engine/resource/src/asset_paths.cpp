@@ -1,5 +1,6 @@
 #include "noire/resource/asset_paths.hpp"
 
+#include <cstdlib>
 #include <filesystem>
 #include <utility>
 
@@ -13,6 +14,17 @@ AssetPaths::AssetPaths(std::string root) : root_(std::move(root)) {}
 
 AssetPaths AssetPaths::discover(std::string_view folder_name, int max_levels) {
     std::error_code ec;
+
+    // Échappatoire manuel : NOIRE_ASSETS force la racine des assets, quel que soit le
+    // répertoire de lancement. Indispensable quand la remontée automatique échoue.
+    if (const char* forced = std::getenv("NOIRE_ASSETS")) {
+        if (fs::is_directory(forced, ec)) {
+            log::info("AssetPaths : racine forcée par NOIRE_ASSETS = {}", forced);
+            return AssetPaths{forced};
+        }
+        log::warn("AssetPaths : NOIRE_ASSETS='{}' n'est pas un dossier — ignoré", forced);
+    }
+
     fs::path dir = fs::current_path(ec);
     if (ec) {
         log::warn("AssetPaths : lecture du répertoire courant impossible — assets désactivés");

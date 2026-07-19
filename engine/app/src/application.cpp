@@ -427,6 +427,9 @@ struct Application::Impl {
     bool model_ready_reported = false;
     bool sky_ready_reported = false;
     bool loading_done_reported = false;
+    // M19.5 : verdict du modèle externe journalisé UNE fois (succès OU échec), pour que
+    // le swap (ou le fallback procédural) ne soit jamais silencieux.
+    bool realiste_reported = false;
     // Fondu d'ouverture : armé DÈS le départ (M17 — démarrage instantané), il ramène un
     // voile noir de 1 à 0 sur kFadeDuration secondes, juste pour éviter le flash sec de la
     // première frame. Il ne bloque RIEN : la scène se charge dessous en même temps.
@@ -1079,6 +1082,22 @@ struct Application::Impl {
             renderer.set_environment(sky->id);
             log::info("M8 étape 6a : skybox HDR liée (environnement {})", sky->id);
             sky_ready_reported = true;
+        }
+
+        // M19.5 : verdict explicite et unique sur le modèle externe. Sans ce log, un
+        // échec de chargement ne se voyait qu'au fallback visuel (caisse procédurale
+        // qui reste à l'écran) — indistinguable d'un chargement encore en cours.
+        if (!realiste_reported && realiste_model) {
+            if (realiste_model->ready && !realiste_model->empty()) {
+                log::info("M19 : modèle externe 'train_realiste.glb' ACTIF — {} primitive(s) "
+                          "remplacent la caisse procédurale de la motrice",
+                          realiste_model->primitives.size());
+                realiste_reported = true;
+            } else if (realiste_model->failed) {
+                log::error("M19 : 'train_realiste.glb' NON utilisé (cf. erreur glTF/asset "
+                           "ci-dessus) — caisse procédurale conservée");
+                realiste_reported = true;
+            }
         }
 
         // Ballast texturé : dès que les 3 cartes sont sur le GPU, on bascule le matériau.

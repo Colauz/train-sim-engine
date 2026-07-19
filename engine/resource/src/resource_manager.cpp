@@ -123,8 +123,13 @@ ModelHandle ResourceManager::load_model(const std::string& relative_path) {
     loading_models_.push_back(slot);
 
     if (!paths_.exists(relative_path)) {
-        log::warn("Asset introuvable : '{}' — modèle vide (l'app appliquera son fallback)",
-                  relative_path);
+        // On dit OÙ on a cherché : le fichier posé au mauvais endroit (ou la racine assets/
+        // non trouvée depuis le répertoire de lancement) est la cause nº1 d'un « fallback ».
+        log::warn("Asset introuvable : '{}' — cherché à '{}'{}", relative_path, slot->full_path,
+                  paths_.valid()
+                      ? ""
+                      : " [racine 'assets/' NON trouvée depuis le répertoire courant — "
+                        "définis NOIRE_ASSETS=/chemin/vers/assets]");
         slot->state.store(ResourceState::Failed, std::memory_order_relaxed);
         return model;
     }
@@ -347,6 +352,9 @@ void ResourceManager::pump_models(int& budget) {
         const ResourceState state = slot.state.load(std::memory_order_acquire);
 
         if (state == ResourceState::Failed) {
+            // L'échec est DÉJÀ journalisé à la source (load_model / load_gltf) ; on le
+            // propage au handle pour que l'app puisse, elle aussi, arrêter d'attendre.
+            slot.handle->failed = true;
             it = loading_models_.erase(it);  // model->primitives vide => fallback app
             continue;
         }

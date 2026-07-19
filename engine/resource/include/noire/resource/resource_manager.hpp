@@ -48,6 +48,9 @@ struct Model {
     };
     std::vector<Primitive> primitives;
     bool ready = false;
+    // Posé par le pump quand le chargement a ÉCHOUÉ (fichier absent, glTF illisible).
+    // Permet à l'app de distinguer « en cours de chargement » de « n'arrivera jamais ».
+    bool failed = false;
     [[nodiscard]] bool empty() const { return primitives.empty(); }
 };
 
