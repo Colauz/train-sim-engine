@@ -198,16 +198,6 @@ constexpr ModelTransform kLocoTransform{1.0f, 0.0f, 0.0f};
 constexpr ModelTransform kCarTransform{1.0f, 0.0f, 0.0f};
 constexpr ModelTransform kBogieTransform{1.0f, 0.0f, 0.0f};
 
-// MODÈLE EXTERNE (M19) — assets/models/train_realiste.glb, à télécharger. Un modèle du
-// commerce n'a JAMAIS la bonne échelle ni la bonne origine ; ces 4 champs alignent SA
-// carrosserie par-dessus les bogies physiques (qui, eux, ne bougent PAS). Réglables SANS
-// recompiler via les variables d'environnement :
-//   NOIRE_MODEL_SCALE  — échelle (ex. 0.01 si le modèle est en cm)
-//   NOIRE_MODEL_OFFY   — hauteur (m) : monte/descend la caisse pour poser sur les bogies
-//   NOIRE_MODEL_OFFZ   — position (m) le long de la voie : recentre le modèle sur ses bogies
-//   NOIRE_MODEL_YAW    — lacet (radians) : ~3.14159 si le modèle regarde dans l'autre sens
-constexpr ModelTransform kRealisteTransform{1.0f, 0.0f, 0.0f, 0.0f};
-
 std::uint32_t hash_u32(std::uint32_t x) {
     x ^= x >> 16;
     x *= 0x7feb352dU;
@@ -339,8 +329,6 @@ struct Application::Impl {
     resource::ModelHandle voiture_model;       // voiture voyageurs (M16)
     resource::ModelHandle jacobs_bogie_model;  // bogie Jacobs partagé (M16)
     resource::ModelHandle station_model;       // module de gare répétable (M18)
-    resource::ModelHandle realiste_model;      // caisse externe photoréaliste (M19), optionnelle
-    ModelTransform realiste_transform = kRealisteTransform;  // ajustable par env (M19)
     resource::AudioHandle rumble_clip;
     resource::EnvironmentHandle sky;
     // Textures PBR du ballast (Poly Haven, CC0). Maintenues vivantes par ces handles :
@@ -427,9 +415,6 @@ struct Application::Impl {
     bool model_ready_reported = false;
     bool sky_ready_reported = false;
     bool loading_done_reported = false;
-    // M19.5 : verdict du modèle externe journalisé UNE fois (succès OU échec), pour que
-    // le swap (ou le fallback procédural) ne soit jamais silencieux.
-    bool realiste_reported = false;
     // Fondu d'ouverture : armé DÈS le départ (M17 — démarrage instantané), il ramène un
     // voile noir de 1 à 0 sur kFadeDuration secondes, juste pour éviter le flash sec de la
     // première frame. Il ne bloque RIEN : la scène se charge dessous en même temps.
@@ -630,27 +615,16 @@ struct Application::Impl {
         // est absent, synthèse M6 si le .wav est absent — le moteur ne crashe jamais.
         asset_paths = resource::AssetPaths::discover();
         resources.set_upload_budget(2);
-        // Motrice TGV procédurale (M10) : carrosserie loftée (superellipse + Béziers),
-        // nez plongeant, vraies roues cylindriques. Remplace le gabarit-boîtes du M9.
+        // Motrice TGV procédurale V2 (M20) : carrosserie loftée (superellipse + Béziers)
+        // à toit bombé, nez plongeant de 8 m, vitrages creusés dans la tôle, jupe et
+        // carénages de toit — générée par tools/gen_tgv_procedural.py.
         train_model = resources.load_model("models/tgv_procedural.glb");
-        // Rame articulée (M16) : voiture voyageurs (caisse-tube + vitres) et bogie Jacobs
-        // partagé, générés par tools/gen_tgv_voiture.py.
+        // Rame articulée (M16/M20) : voiture voyageurs (caisse-tube, bandeau creusé,
+        // soufflets) et bogie Jacobs partagé, générés par tools/gen_tgv_voiture.py.
         voiture_model = resources.load_model("models/tgv_voiture.glb");
         jacobs_bogie_model = resources.load_model("models/tgv_bogie.glb");
         // Gare de départ (M18) : un module répété le long de la voie sur 0-400 m.
         station_model = resources.load_model("models/station.glb");
-        // Modèle externe photoréaliste (M19), OPTIONNEL : s'il est présent et valide, il
-        // remplace la caisse procédurale de la motrice. Absent => on garde le procédural, sans
-        // la moindre erreur. On lit ses réglages d'alignement depuis l'environnement.
-        realiste_model = resources.load_model("models/train_realiste.glb");
-        auto env_float = [](const char* name, float fallback) {
-            const char* v = std::getenv(name);
-            return v != nullptr ? static_cast<float>(std::atof(v)) : fallback;
-        };
-        realiste_transform.scale = env_float("NOIRE_MODEL_SCALE", kRealisteTransform.scale);
-        realiste_transform.offset_y = env_float("NOIRE_MODEL_OFFY", kRealisteTransform.offset_y);
-        realiste_transform.offset_z = env_float("NOIRE_MODEL_OFFZ", kRealisteTransform.offset_z);
-        realiste_transform.rotation_y = env_float("NOIRE_MODEL_YAW", kRealisteTransform.rotation_y);
         tree_model = resources.load_model("models/tree.glb");
         rumble_clip = resources.load_audio("audio/roulement.wav");
 
@@ -1084,22 +1058,6 @@ struct Application::Impl {
             sky_ready_reported = true;
         }
 
-        // M19.5 : verdict explicite et unique sur le modèle externe. Sans ce log, un
-        // échec de chargement ne se voyait qu'au fallback visuel (caisse procédurale
-        // qui reste à l'écran) — indistinguable d'un chargement encore en cours.
-        if (!realiste_reported && realiste_model) {
-            if (realiste_model->ready && !realiste_model->empty()) {
-                log::info("M19 : modèle externe 'train_realiste.glb' ACTIF — {} primitive(s) "
-                          "remplacent la caisse procédurale de la motrice",
-                          realiste_model->primitives.size());
-                realiste_reported = true;
-            } else if (realiste_model->failed) {
-                log::error("M19 : 'train_realiste.glb' NON utilisé (cf. erreur glTF/asset "
-                           "ci-dessus) — caisse procédurale conservée");
-                realiste_reported = true;
-            }
-        }
-
         // Ballast texturé : dès que les 3 cartes sont sur le GPU, on bascule le matériau.
         // Un matériau ne se réécrit JAMAIS (son set serait en vol) : on en crée un neuf et
         // on change la référence. L'ancien meurt avec l'app — il est unique et minuscule.
@@ -1401,20 +1359,10 @@ struct Application::Impl {
         // physique multi-corps), mais SES BOGIES sont dessinés SÉPARÉMENT — plaqués sur la
         // voie, sans le moindre tangage de caisse. C'est la HIÉRARCHIE ferroviaire correcte :
         // le bogie roule sur le rail, la caisse flotte au-dessus sur ses ressorts.
-        //
-        // M19 : si le modèle externe photoréaliste est présent et valide, il remplace la
-        // caisse procédurale (aligné par realiste_transform). Sinon on garde le procédural.
-        // Dans les DEUX cas, la caisse est posée au MÊME endroit — les bogies ne bougent pas.
-        const bool realiste_ok =
-            realiste_model && realiste_model->ready && !realiste_model->empty();
-        const bool caisse_ok = realiste_ok || (train_model && train_model->ready);
-        if (caisse_ok) {
-            const glm::mat4 caisse_base =
-                camera.relative_model(wagon.body_position()) * wagon.body_orientation();
-            const resource::Model& caisse = realiste_ok ? *realiste_model : *train_model;
-            const glm::mat4 caisse_m =
-                caisse_base * (realiste_ok ? realiste_transform.matrix() : kLocoTransform.matrix());
-            for (const resource::Model::Primitive& prim : caisse.primitives) {
+        if (train_model && train_model->ready) {
+            const glm::mat4 caisse_m = camera.relative_model(wagon.body_position()) *
+                                       wagon.body_orientation() * kLocoTransform.matrix();
+            for (const resource::Model::Primitive& prim : train_model->primitives) {
                 const render::MaterialId mat = prim.material ? prim.material->id : 0;
                 items.push_back(render::DrawItem{caisse_m, prim.mesh, mat});
             }
@@ -1565,7 +1513,6 @@ struct Application::Impl {
         voiture_model.reset();
         jacobs_bogie_model.reset();
         station_model.reset();
-        realiste_model.reset();
         audio.shutdown();
         renderer.wait_idle();
         renderer.shutdown();
