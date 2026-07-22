@@ -24,4 +24,14 @@ void Bogie::follow(const TrackSource& track, double x) {
     orientation_ = rotation;
 }
 
+void Bogie::update_wheels(double linear_speed, double dt) {
+    // Kinematics: v = ω * r => ω = v / r
+    const double omega = linear_speed / kWheelRadius;
+    wheel_angle_ += static_cast<float>(omega * dt);
+    constexpr double kTwoPi = 6.28318530717958647692;
+    if (wheel_angle_ > static_cast<float>(kTwoPi) || wheel_angle_ < static_cast<float>(-kTwoPi)) {
+        wheel_angle_ = static_cast<float>(std::fmod(static_cast<double>(wheel_angle_), kTwoPi));
+    }
+}
+
 }  // namespace noire::physics

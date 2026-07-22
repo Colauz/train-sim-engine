@@ -135,6 +135,8 @@ void Wagon::update(double dt) {
     const double half = (config_.wheelbase * 0.5) / rate;
     front_.follow(*track_, chainage_ + half);
     rear_.follow(*track_, chainage_ - half);
+    front_.update_wheels(velocity_, dt);
+    rear_.update_wheels(velocity_, dt);
 
     // Caisse : cinématique inverse entre les deux bogies + suspension (M16 : logique
     // extraite dans CarBody, partagée avec les voitures). Le roll vient de l'accélération

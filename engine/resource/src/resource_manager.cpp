@@ -391,6 +391,9 @@ void ResourceManager::pump_models(int& budget) {
                 desc.normal_scale = mat.normal_scale;
                 // alphaMode MASK => feuillage : discard ET éclairage traversant.
                 desc.foliage = mat.alpha_mask;
+                // alphaMode BLEND => transparence (vitrage) : pipeline alpha-blendé, sans
+                // écriture de profondeur, trié de loin vers la caméra.
+                desc.transparent = mat.alpha_blend;
                 for (auto [image_index, out_id] :
                      {std::pair{mat.base_color_image, &desc.base_color},
                       std::pair{mat.metallic_roughness_image, &desc.metallic_roughness},

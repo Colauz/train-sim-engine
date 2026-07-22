@@ -37,6 +37,9 @@ struct MaterialData {
     // jusqu'ici ignoré par le loader, et le feuillage se déduisait de « l'item est
     // instancié » — ce qui aurait donné de la transmission à un poteau d'acier (M12).
     bool alpha_mask = false;
+    // glTF alphaMode == BLEND. Le matériau est semi-transparent (verre, vitrage...) :
+    // il sera dessiné APRÈS les opaques, avec blending alpha et sans écriture de profondeur.
+    bool alpha_blend = false;
 };
 
 // Cubemap d'environnement décodée (CPU), produite par le loader HDR sur un worker.

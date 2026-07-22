@@ -27,6 +27,17 @@ M21 : la caisse est désormais HABITABLE —
     que l'app utilise pour leur appliquer leur propre matrice d'animation (porte
     coulissante à bouchon : sortie latérale puis glissement le long de la caisse).
 
+M22 : l'habitacle devient HABITÉ et le vitrage transparent —
+  * vitrage en alphaMode BLEND (verre teinté, alpha 0.35) : on voit l'intérieur ;
+  * SIÈGES procéduraux en L, rangées de 4 (2+2 de part et d'autre d'une allée centrale) ;
+  * COULOIR D'INTERCIRCULATION : les fonds de caisson sont percés d'une porte et un
+    tunnel (plancher/murs/plafond) court sous les anneaux du soufflet — l'illusion du
+    passage d'une voiture à l'autre, sans voir le vide ni les rails ;
+  * battants de porte AFFLEURANTS : patchs de la surface de coque exacte (plus des
+    panneaux plats), rentrés de 4 mm — l'emboîtement fermé est au millimètre ;
+  * bogie : VRAIS ESSIEUX (roues Ø920 mm, voie 1435 mm, boudins) émis en 2 primitives
+    séparées centrées sur leur axe — l'app leur applique la rotation de roulement.
+
 Repère caisse : x = droite, y = haut, z = arrière ; rail à y = -body_height = -2.20.
 Aucune dépendance externe (stdlib seule). Sortie : deux .glb."""
 import struct, json, math, sys
@@ -55,24 +66,35 @@ CHANNELS = [
 # --- Matériaux PBR (identiques à la motrice, + roue/bogie pour le Jacobs) -------
 MATERIALS = [
     {"name": "peinture", "factor": [0.82, 0.83, 0.86, 1.0], "metallic": 0.55, "roughness": 0.24},
-    {"name": "vitrage", "factor": [0.015, 0.020, 0.028, 1.0], "metallic": 0.0, "roughness": 0.05},
+    # Vitrage (M22) : VERRE, plus du noir opaque. alphaMode BLEND (clé "blend" =>
+    # write_glb émet alphaMode/doubleSided) : le moteur le trie avec les autres
+    # transparents, de loin vers la caméra, SANS écriture de profondeur. Teinte très
+    # sombre + alpha 0.35 : on voit les sièges en transparence, le reflet du ciel
+    # (roughness 0.05) reste dominant, comme sur le vrai bandeau.
+    {"name": "vitrage", "factor": [0.06, 0.08, 0.11, 0.35], "metallic": 0.0,
+     "roughness": 0.05, "blend": True},
     {"name": "accent", "factor": [0.045, 0.075, 0.16, 1.0], "metallic": 0.35, "roughness": 0.32},
     {"name": "jupe", "factor": [0.24, 0.25, 0.27, 1.0], "metallic": 0.0, "roughness": 0.72},
     {"name": "soufflet", "factor": [0.05, 0.05, 0.055, 1.0], "metallic": 0.0, "roughness": 0.85},
-    # Roues : acier NU, poli par le roulement — plus clair et plus lisse que le châssis,
-    # sinon la roue disparaît dans le bogie (même teinte => aucune silhouette).
-    {"name": "roue", "factor": [0.55, 0.55, 0.56, 1.0], "metallic": 1.0, "roughness": 0.30},
     {"name": "bogie", "factor": [0.09, 0.09, 0.10, 1.0], "metallic": 0.0, "roughness": 0.65},
     # Habitacle (M21) : gris clair MAT (mélaminé), éclairé par la seule ambiante.
     {"name": "interieur", "factor": [0.42, 0.43, 0.46, 1.0], "metallic": 0.0, "roughness": 0.85},
+    # Sièges (M22) : velours bleu nuit inOui, très rugueux (tissu).
+    {"name": "siege", "factor": [0.070, 0.090, 0.24, 1.0], "metallic": 0.0, "roughness": 0.95},
     # Battants de porte (M21), en DEUX exemplaires du MÊME matériau : chaque battant est
     # une part séparée (cf. write_glb : une part = une primitive = un slot matériau), et
     # l'app anime les 2 dernières primitives indépendamment de la caisse.
     {"name": "porte", "factor": [0.82, 0.83, 0.86, 1.0], "metallic": 0.55, "roughness": 0.24},
     {"name": "porte", "factor": [0.82, 0.83, 0.86, 1.0], "metallic": 0.55, "roughness": 0.24},
+    # Essieux (M22), en DEUX exemplaires : chaque essieu (2 roues Ø920 + arbre) est une
+    # part séparée CENTRÉE SUR SON AXE, et les 2 dernières primitives du GLB bogie —
+    # l'app leur applique la rotation de roulement (v = omega * r) via Bogie::wheel_angle.
+    # Acier NU, poli par le roulement : plus clair et plus lisse que le châssis.
+    {"name": "essieu", "factor": [0.55, 0.55, 0.56, 1.0], "metallic": 1.0, "roughness": 0.30},
+    {"name": "essieu", "factor": [0.55, 0.55, 0.56, 1.0], "metallic": 1.0, "roughness": 0.30},
 ]
-(MAT_PAINT, MAT_GLASS, MAT_ACCENT, MAT_SKIRT, MAT_BELLOWS, MAT_WHEEL, MAT_BOGIE,
- MAT_INTERIOR, MAT_DOOR_R, MAT_DOOR_L) = range(10)
+(MAT_PAINT, MAT_GLASS, MAT_ACCENT, MAT_SKIRT, MAT_BELLOWS, MAT_BOGIE,
+ MAT_INTERIOR, MAT_SEAT, MAT_DOOR_R, MAT_DOOR_L, MAT_AXLE_A, MAT_AXLE_B) = range(12)
 
 # --- Portes voyageurs (M21) : trous dans la tôle + battants séparés --------------
 # Une porte par flanc, près du bout AVANT. Le rectangle [z0,z1]x[t0,t1] est calé pour
@@ -91,6 +113,20 @@ DOORS = [
 IN_HALF_W = 1.32        # murs intérieurs : 13 cm de tôle + isolation derrière le flanc
 IN_FLOOR = RAIL + 1.20  # plancher voyageurs, juste SOUS le seuil de porte (~1,26 m)
 IN_CEIL = RAIL + 3.25   # plafond, juste AU-DESSUS du linteau (~3,00 m)
+
+# --- Couloir d'intercirculation (M22) ---------------------------------------------
+# Les fonds de caisson ET les bouts de caisse sont percés d'une porte, et un tunnel
+# (plancher/murs/plafond) DÉPASSE le bout de caisse sous les anneaux du soufflet (qui
+# couvrent [zend-0.85, zend-0.02]). Deux voitures attelées voient leurs couloirs se
+# rejoindre : plus de vide ni de rails visibles entre les caisses.
+CORR_HALF_W = 0.58            # demi-largeur du passage
+CORR_CEIL = IN_FLOOR + 2.05   # plafond du couloir (~2,05 m de hauteur libre)
+CORR_LEN = 0.92               # dépassement au-delà du bout de caisse
+
+# --- Sièges (M22) -----------------------------------------------------------------
+SEAT_W, SEAT_D = 0.46, 0.48   # assise : largeur x profondeur
+SEAT_H = 0.45                 # hauteur de l'assise au-dessus du plancher
+AISLE_HALF = 0.30             # allée centrale de 60 cm
 
 
 # --- Algèbre ------------------------------------------------------------------
@@ -263,26 +299,44 @@ def build_body(part):
 
 
 def build_cap(part, z, normal_z):
-    center = (0.0, (ROOF + FLOOR) * 0.5, z)
+    """Obture un bout de caisse, PERCÉ de la porte d'intercirculation (M22) : au lieu
+    d'un éventail plein, un ANNEAU plat entre le contour superellipse et le rectangle
+    du passage. Tout est dans le même plan => les quads sont parfaitement plats, et le
+    raccord angulaire contour/rectangle ne peut pas se plier."""
+    yc = (IN_FLOOR + CORR_CEIL) * 0.5
+    hx, hy = CORR_HALF_W, (CORR_CEIL - IN_FLOOR) * 0.5
+
+    def hole_point(t):
+        """Point du rectangle de passage dans la direction t (rayon depuis le centre
+        du rectangle) : le bord intérieur de l'anneau suit le contour, quad par quad."""
+        ct, st = math.cos(t), math.sin(t)
+        d = min(hx / max(abs(ct), 1e-9), hy / max(abs(st), 1e-9))
+        return (d * ct, yc + d * st, z)
+
     n = (0.0, 0.0, normal_z)
     tg = (1.0, 0.0, 0.0, 1.0)
     for j in range(T_SEGMENTS):
         t0 = 2.0 * math.pi * j / T_SEGMENTS
         t1 = 2.0 * math.pi * (j + 1) / T_SEGMENTS
-        a, b = surf(z, t0), surf(z, t1)
-        if normal_z < 0.0:
-            a, b = b, a
+        o0, o1 = surf(z, t0), surf(z, t1)
+        r0, r1 = hole_point(t0), hole_point(t1)
+        quad = [o0, o1, r1, r0]
+        # Winding forcé du côté de la normale voulue (l'anneau est plan : le test est fiable).
+        if cross(sub(o1, o0), sub(r1, o0))[2] * normal_z < 0.0:
+            quad.reverse()
         base = len(part.positions)
-        for p in (center, a, b):
+        for p in quad:
             part.positions.append(p); part.normals.append(n)
             part.uvs.append((0.5 + p[0] / (4.0 * HALF_W), 0.5 + p[1] / (4.0 * HALF_W)))
             part.tangents.append(tg)
-        part.indices.extend([base, base + 1, base + 2])
+        part.indices.extend([base, base + 1, base + 2, base, base + 2, base + 3])
 
 
-def build_band(part, z0, z1, t0, t1, nz, nt, offset):
+def build_band(part, z0, z1, t0, t1, nz, nt, offset, flip=False):
     """Bandeau plaqué sur la surface FINALE, décalé de `offset` le long de la normale
-    (anti z-fighting). Posé sur un canal de vitrage, il épouse le creusement."""
+    (anti z-fighting). Posé sur un canal de vitrage, il épouse le creusement.
+    flip=True inverse winding et normales : peau INTÉRIEURE d'un panneau (M22, battants
+    de porte lus depuis l'habitacle)."""
     grid = []
     for i in range(nz + 1):
         z = z0 + (z1 - z0) * i / nz
@@ -295,7 +349,11 @@ def build_band(part, z0, z1, t0, t1, nz, nt, offset):
         grid.append(row)
     for i in range(nz):
         for j in range(nt):
-            part.add_quad([grid[i][j], grid[i + 1][j], grid[i + 1][j + 1], grid[i][j + 1]])
+            quad = [grid[i][j], grid[i + 1][j], grid[i + 1][j + 1], grid[i][j + 1]]
+            if flip:
+                quad = [(p, mul(n, -1.0), uv, (-tg[0], -tg[1], -tg[2], tg[3]))
+                        for p, n, uv, tg in reversed(quad)]
+            part.add_quad(quad)
 
 
 def build_blister(part, z0, z1, t0, t1, height, nz=16, nt=8):
@@ -385,11 +443,14 @@ def build_interior(part):
                 (w, IN_FLOOR, zB), (w, IN_FLOOR, zA), (0.0, 1.0, 0.0))
     quad_orient(part, (-w, IN_CEIL, zA), (w, IN_CEIL, zA),
                 (w, IN_CEIL, zB), (-w, IN_CEIL, zB), (0.0, -1.0, 0.0))
-    # Fonds aux deux bouts.
-    quad_orient(part, (-w, IN_FLOOR, zA), (w, IN_FLOOR, zA),
-                (w, IN_CEIL, zA), (-w, IN_CEIL, zA), (0.0, 0.0, 1.0))
-    quad_orient(part, (-w, IN_FLOOR, zB), (w, IN_FLOOR, zB),
-                (w, IN_CEIL, zB), (-w, IN_CEIL, zB), (0.0, 0.0, -1.0))
+    # Fonds aux deux bouts, PERCÉS de la porte d'intercirculation (M22) : deux segments
+    # pleine hauteur + un linteau au-dessus du passage, alignés pile sur le trou du cap.
+    for ze, want in ((zA, (0.0, 0.0, 1.0)), (zB, (0.0, 0.0, -1.0))):
+        for xa, xb in ((-w, -CORR_HALF_W), (CORR_HALF_W, w)):
+            quad_orient(part, (xa, IN_FLOOR, ze), (xb, IN_FLOOR, ze),
+                        (xb, IN_CEIL, ze), (xa, IN_CEIL, ze), want)
+        quad_orient(part, (-CORR_HALF_W, CORR_CEIL, ze), (CORR_HALF_W, CORR_CEIL, ze),
+                    (CORR_HALF_W, IN_CEIL, ze), (-CORR_HALF_W, IN_CEIL, ze), want)
     # Murs latéraux percés au droit des portes.
     for sx, want in ((1.0, (-1.0, 0.0, 0.0)), (-1.0, (1.0, 0.0, 0.0))):
         x = sx * w
@@ -404,32 +465,18 @@ def build_interior(part):
 
 
 def build_door(part, side):
-    """Battant coulissant (M21) : un panneau plat posé DANS l'embrasure, légèrement
-    rentré sous la surface de coque (−5 mm) pour ne pas z-fighter avec les bords du trou.
-    side = +1 (flanc droit, normale vers intérieur = -x) ou −1 (flanc gauche, normale +x).
-    En position FERMÉE : il bouche exactement le trou ; l'app l'anime par translation
-    latérale (bouchon) + longitudinale (coulissement) via sa propre matrice de DrawItem."""
-    seuil, linteau = door_heights()
-    z0, z1 = DOOR_Z0, DOOR_Z1
-    # Légèrement sous la surface extérieure de la coque : pas de z-fight avec les bords.
-    x = side * (HALF_W - 0.005)
-    n = (-side, 0.0, 0.0)       # normale vers l'intérieur de la voiture
-    tg = (0.0, 0.0, -1.0, 1.0)  # tangente longitudinale (sens −z = vers l'avant)
-    # 4 coins du battant, sens horaire vu de la normale (winding front-face)
-    corners = [
-        (x, seuil,   z0),
-        (x, seuil,   z1),
-        (x, linteau, z1),
-        (x, linteau, z0),
-    ]
-    uvs = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
-    base = len(part.positions)
-    for p, uv in zip(corners, uvs):
-        part.positions.append(p)
-        part.normals.append(n)
-        part.uvs.append(uv)
-        part.tangents.append(tg)
-    part.indices.extend([base, base + 1, base + 2, base, base + 2, base + 3])
+    """Battant AFFLEURANT (M22) : un patch de la surface de coque EXACTE, échantillonné
+    pile sur le rectangle de l'embrasure (même superellipse, même cambrage) et rentré de
+    4 mm sous la tôle pour ne pas z-fighter avec les bords du trou. Fermé, l'emboîtement
+    est au millimètre — aucun jour visible ; ouvert, l'app translate le battant (bouchon
+    puis coulissement) et, la section étant CONSTANTE sur toute la longueur, le patch
+    reste affleurant sur toute la course. Une peau intérieure à -20 mm (winding inversé)
+    habille le battant vu de l'habitacle.
+    side = +1 (flanc droit) ou -1 (flanc gauche)."""
+    t0, t1 = ((DOOR_T_LO, DOOR_T_HI) if side > 0.0
+              else (math.pi - DOOR_T_HI, math.pi - DOOR_T_LO))
+    build_band(part, DOOR_Z0, DOOR_Z1, t0, t1, 10, 12, -0.004)
+    build_band(part, DOOR_Z0, DOOR_Z1, t0, t1, 10, 12, -0.020, flip=True)
 
 
 def build_jambs(part):
@@ -454,33 +501,134 @@ def build_jambs(part):
                     (xw, linteau, z1), (xw, seuil, z1), (0.0, 0.0, -1.0))
 
 
-def build_wheel(part, cx, z, radius, half_width, segments):
-    """Disque plein de rayon `radius`, axe transversal (x), centré à (cx, radius, z) :
-    le bas de la roue affleure y = 0 (le rail)."""
-    cy = radius
+def build_corridor(part):
+    """Couloir d'intercirculation (M22) : un tunnel à normales RENTRANTES à chaque bout,
+    du fond de caisson (rentré de 5 cm) jusqu'à CORR_LEN AU-DELÀ du bout de caisse, sous
+    les anneaux du soufflet. Vu de l'intérieur, on enchaîne sur la voiture suivante sans
+    jamais voir le vide ; vu de l'extérieur, le tunnel est masqué par les anneaux."""
+    w = CORR_HALF_W
+    for zend, sgn in ((Z_TAIL, 1.0), (Z_HEAD, -1.0)):
+        z0 = zend - sgn * 0.05            # fond de caisson (zA / zB)
+        z1 = zend + sgn * CORR_LEN        # ras de l'anneau extérieur du soufflet
+        # Plancher (normale vers le haut) et plafond (vers le bas).
+        quad_orient(part, (-w, IN_FLOOR, z0), (-w, IN_FLOOR, z1),
+                    (w, IN_FLOOR, z1), (w, IN_FLOOR, z0), (0.0, 1.0, 0.0))
+        quad_orient(part, (-w, CORR_CEIL, z0), (w, CORR_CEIL, z0),
+                    (w, CORR_CEIL, z1), (-w, CORR_CEIL, z1), (0.0, -1.0, 0.0))
+        # Murs (normales vers l'axe du couloir).
+        quad_orient(part, (w, IN_FLOOR, z0), (w, IN_FLOOR, z1),
+                    (w, CORR_CEIL, z1), (w, CORR_CEIL, z0), (-1.0, 0.0, 0.0))
+        quad_orient(part, (-w, IN_FLOOR, z0), (-w, IN_FLOOR, z1),
+                    (-w, CORR_CEIL, z1), (-w, CORR_CEIL, z0), (1.0, 0.0, 0.0))
+
+
+def build_seat(part, xc, zc, facing):
+    """Un siège en L (M22) : pied central, assise, dossier. facing = -1 => le voyageur
+    regarde vers l'avant (-z) et le dossier est du côté +z ; +1 => l'inverse."""
+    build_box(part, xc - 0.05, IN_FLOOR, zc - 0.05,
+              xc + 0.05, IN_FLOOR + SEAT_H - 0.09, zc + 0.05)
+    y = IN_FLOOR + SEAT_H
+    build_box(part, xc - SEAT_W / 2.0, y - 0.09, zc - SEAT_D / 2.0,
+              xc + SEAT_W / 2.0, y, zc + SEAT_D / 2.0)
+    # Dossier (9 cm d'épaisseur), plaqué du côté ARRIÈRE de l'assise.
+    z_back = zc - facing * (SEAT_D / 2.0)
+    z0, z1 = sorted((z_back, z_back + facing * 0.09))
+    build_box(part, xc - SEAT_W / 2.0, y, z0, xc + SEAT_W / 2.0, y + 0.62, z1)
+
+
+def build_seats(part):
+    """Rangées de 4 sièges (2+2 de part et d'autre de l'allée centrale), pas de 95 cm.
+    La moitié avant de la voiture regarde vers l'avant, la moitié arrière vers l'arrière
+    — disposition réelle, les voyageurs se font face au milieu. Les rangées commencent
+    APRÈS la plateforme des portes et s'arrêtent avant les fonds d'intercirculation."""
+    pitch = 0.95
+    x_in = AISLE_HALF + SEAT_W / 2.0                      # siège côté allée
+    x_out = AISLE_HALF + SEAT_W + 0.04 + SEAT_W / 2.0     # siège côté fenêtre
+    z = Z_HEAD + 2.70
+    while z <= Z_TAIL - 1.60:
+        facing = -1.0 if z < 0.0 else 1.0
+        for sx in (1.0, -1.0):
+            for xoff in (x_in, x_out):
+                build_seat(part, sx * xoff, z, facing)
+        z += pitch
+
+
+# --- Bogie Jacobs (organe partagé) --------------------------------------------
+# Cotes RÉELLES SNCF (M22) : roues de 920 mm de diamètre, voie normale de 1435 mm.
+WHEEL_R = 0.46          # Ø 920 mm
+GAUGE_HALF = 0.7175     # 1435 mm entre les faces internes des rails
+FLANGE_R = 0.505        # boudin : il plonge SOUS le niveau du champignon, entre les rails
+AXLE_Z = (-1.5, 1.5)    # empattement 3 m (convention partagée avec l'app C++)
+
+
+def build_wheel(part, cx, segments=24):
+    """Roue réelle centrée sur l'AXE de l'essieu (moyeu à l'ORIGINE locale, axe = x) :
+    bande de roulement à WHEEL_R, flancs en éventail, et boudin (FLANGE_R) du côté
+    INTÉRIEUR (vers le milieu de la voie). Centrée à l'origine pour que l'app puisse
+    appliquer la rotation de roulement autour de X sans translation parasite."""
+    inner = -1.0 if cx > 0.0 else 1.0   # sens x de la face INTÉRIEURE de la roue
+    xo = cx + inner * 0.0675            # face extérieure (bande de roulement de 135 mm)
+    xi = cx - inner * 0.0675            # face intérieure
+    xf = xi - inner * 0.025             # boudin : 25 mm au-delà de la face intérieure
+
+    def pt(x, r, a):
+        return (x, r * math.sin(a), r * math.cos(a))
+
     for j in range(segments):
         a0 = 2.0 * math.pi * j / segments
         a1 = 2.0 * math.pi * (j + 1) / segments
-        p0 = (cx - half_width, cy + radius * math.sin(a0), z + radius * math.cos(a0))
-        p1 = (cx - half_width, cy + radius * math.sin(a1), z + radius * math.cos(a1))
-        q0 = (cx + half_width, cy + radius * math.sin(a0), z + radius * math.cos(a0))
-        q1 = (cx + half_width, cy + radius * math.sin(a1), z + radius * math.cos(a1))
-        # bande de roulement
-        part.add_quad([(p0, (0, math.sin(a0), math.cos(a0)), (0, 0), (1, 0, 0, 1)),
-                       (q0, (0, math.sin(a0), math.cos(a0)), (1, 0), (1, 0, 0, 1)),
-                       (q1, (0, math.sin(a1), math.cos(a1)), (1, 1), (1, 0, 0, 1)),
-                       (p1, (0, math.sin(a1), math.cos(a1)), (0, 1), (1, 0, 0, 1))])
-        # flancs (2 triangles vers le centre de chaque face)
-        for cxx, nx in ((cx - half_width, -1.0), (cx + half_width, 1.0)):
-            cen = (cxx, cy, z)
-            e0 = (cxx, cy + radius * math.sin(a0), z + radius * math.cos(a0))
-            e1 = (cxx, cy + radius * math.sin(a1), z + radius * math.cos(a1))
+        n0 = (0.0, math.sin(a0), math.cos(a0))
+        n1 = (0.0, math.sin(a1), math.cos(a1))
+        # Bande de roulement (rayon WHEEL_R, de la face ext. à la face int.).
+        part.add_quad([(pt(xo, WHEEL_R, a0), n0, (0, 0), (1, 0, 0, 1)),
+                       (pt(xi, WHEEL_R, a0), n0, (1, 0), (1, 0, 0, 1)),
+                       (pt(xi, WHEEL_R, a1), n1, (1, 1), (1, 0, 0, 1)),
+                       (pt(xo, WHEEL_R, a1), n1, (0, 1), (1, 0, 0, 1))])
+        # Boudin (rayon FLANGE_R, de la face int. vers l'intérieur).
+        part.add_quad([(pt(xi, FLANGE_R, a0), n0, (0, 0), (1, 0, 0, 1)),
+                       (pt(xf, FLANGE_R, a0), n0, (1, 0), (1, 0, 0, 1)),
+                       (pt(xf, FLANGE_R, a1), n1, (1, 1), (1, 0, 0, 1)),
+                       (pt(xi, FLANGE_R, a1), n1, (0, 1), (1, 0, 0, 1))])
+        # Raccord bande -> boudin : anneau sur la face intérieure (normale vers -inner).
+        na = (-inner, 0.0, 0.0)
+        quad = [(pt(xi, WHEEL_R, a0), na, (0, 0), (0, 0, 1, 1)),
+                (pt(xi, WHEEL_R, a1), na, (1, 0), (0, 0, 1, 1)),
+                (pt(xi, FLANGE_R, a1), na, (1, 1), (0, 0, 1, 1)),
+                (pt(xi, FLANGE_R, a0), na, (0, 1), (0, 0, 1, 1))]
+        if inner < 0.0:
+            quad.reverse()
+        part.add_quad(quad)
+        # Flancs : éventails vers le centre (extérieur à rayon WHEEL_R, intérieur à
+        # rayon FLANGE_R pour fermer le boudin).
+        for fx, fr, nx in ((xo, WHEEL_R, inner), (xf, FLANGE_R, -inner)):
+            cen = (fx, 0.0, 0.0)
+            e0 = pt(fx, fr, a0)
+            e1 = pt(fx, fr, a1)
             a, b = (e0, e1) if nx > 0 else (e1, e0)
             base = len(part.positions)
             for p in (cen, a, b):
                 part.positions.append(p); part.normals.append((nx, 0.0, 0.0))
                 part.uvs.append((0.0, 0.0)); part.tangents.append((0.0, 0.0, 1.0, 1.0))
             part.indices.extend([base, base + 1, base + 2])
+
+
+def build_axle(part, segments=12):
+    """Essieu complet, CENTRÉ À L'ORIGINE (axe = x local) : arbre + 2 roues Ø920 à
+    boudins. L'app place chaque essieu à (0, WHEEL_R, ±1.5) dans le repère bogie et lui
+    applique la rotation de roulement (v = omega * r, cf. Bogie::wheel_angle)."""
+    # Arbre : cylindre de 17 cm entre les deux roues.
+    shaft_r, shaft_x = 0.085, GAUGE_HALF - 0.07
+    for j in range(segments):
+        a0 = 2.0 * math.pi * j / segments
+        a1 = 2.0 * math.pi * (j + 1) / segments
+        n0 = (0.0, math.sin(a0), math.cos(a0))
+        n1 = (0.0, math.sin(a1), math.cos(a1))
+        part.add_quad([((-shaft_x, shaft_r * math.sin(a0), shaft_r * math.cos(a0)), n0, (0, 0), (1, 0, 0, 1)),
+                       ((shaft_x, shaft_r * math.sin(a0), shaft_r * math.cos(a0)), n0, (1, 0), (1, 0, 0, 1)),
+                       ((shaft_x, shaft_r * math.sin(a1), shaft_r * math.cos(a1)), n1, (1, 1), (1, 0, 0, 1)),
+                       ((-shaft_x, shaft_r * math.sin(a1), shaft_r * math.cos(a1)), n1, (0, 1), (1, 0, 0, 1))])
+    for cx in (-GAUGE_HALF, GAUGE_HALF):
+        build_wheel(part, cx)
 
 
 # --- Sérialisation glTF binaire (mutualisée) ----------------------------------
@@ -525,11 +673,17 @@ def write_glb(path, parts, node_name):
         primitives.append({"attributes": {"POSITION": base, "NORMAL": base + 1,
                                           "TEXCOORD_0": base + 2, "TANGENT": base + 3},
                            "indices": base + 4, "material": slot})
-    materials = [{"name": MATERIALS[mat_idx]["name"],
-                  "pbrMetallicRoughness": {"baseColorFactor": MATERIALS[mat_idx]["factor"],
-                                           "metallicFactor": MATERIALS[mat_idx]["metallic"],
-                                           "roughnessFactor": MATERIALS[mat_idx]["roughness"]}}
-                 for mat_idx, _ in used]
+    materials = []
+    for mat_idx, _ in used:
+        mat_def = MATERIALS[mat_idx]
+        m = {"name": mat_def["name"],
+             "pbrMetallicRoughness": {"baseColorFactor": mat_def["factor"],
+                                      "metallicFactor": mat_def["metallic"],
+                                      "roughnessFactor": mat_def["roughness"]}}
+        if mat_def.get("blend"):
+            m["alphaMode"] = "BLEND"
+            m["doubleSided"] = True
+        materials.append(m)
 
     gltf = {"asset": {"version": "2.0", "generator": "noire-tgv-voiture-v2 (CC0)"},
             "scene": 0, "scenes": [{"nodes": [0]}], "nodes": [{"mesh": 0, "name": node_name}],
@@ -584,6 +738,10 @@ def build_car(out):
     # 7) Habitacle rudimentaire (M21) : caisson intérieur à normales RENTRANTES (plancher,
     #    plafond, murs latéraux percés au droit des portes, fonds avant/arrière).
     build_interior(parts[MAT_INTERIOR])
+    # 7b) Sièges voyageurs (M22) : rangées de 4 (2+2) de part et d'autre de l'allée centrale.
+    build_seats(parts[MAT_SEAT])
+    # 7c) Couloirs d'intercirculation (M22) : tunnel sous les soufflets, à chaque bout.
+    build_corridor(parts[MAT_INTERIOR])
     # 8) Feuillures d'embrasure (M21) : relient le bord du trou de coque au mur intérieur.
     #    Matériau peinture (tôle emboutie, même teinte que la carrosserie).
     build_jambs(parts[MAT_PAINT])
@@ -598,18 +756,20 @@ def build_car(out):
 
 
 # --- Bogie Jacobs (organe partagé) --------------------------------------------
+# M22 : le châssis est une part, et les deux ESSIEUX sont des parts SÉPARÉES centrées
+# à l'ORIGINE locale (axe = x) — l'app C++ les place à (0, WHEEL_R, ±1.5) dans le
+# repère bogie et leur applique la rotation de roulement (v = omega * r, cf.
+# Bogie::wheel_angle). Les 2 dernières primitives du GLB sont les essieux, convention
+# identique aux battants de porte de la voiture.
 def build_bogie(out):
     parts = [Part() for _ in MATERIALS]
-    WHEEL_R, WHEEL_W, GAUGE_HALF = 0.46, 0.14, 0.7175
-    AXLES = (-1.5, 1.5)  # empattement 3 m
     # Châssis : au-dessus des roues, plus étroit que la voie (les roues doivent dépasser).
     build_box(parts[MAT_BOGIE], -0.45, WHEEL_R + 0.10, -1.9, 0.45, WHEEL_R + 0.85, 1.9)
-    for z in AXLES:
-        # essieu (barre transversale)
-        build_box(parts[MAT_BOGIE], -GAUGE_HALF, WHEEL_R - 0.05, z - 0.05,
-                  GAUGE_HALF, WHEEL_R + 0.05, z + 0.05)
-        for side in (-GAUGE_HALF, GAUGE_HALF):
-            build_wheel(parts[MAT_WHEEL], side, z, WHEEL_R, WHEEL_W / 2.0, 20)
+    # Essieu A (z = -1.5) et B (z = +1.5), chacun centré à l'origine : l'app le translate
+    # à (0, WHEEL_R, ±1.5) et applique la rotation. Convention : les 2 DERNIÈRES parts
+    # sérialisées sont les essieux.
+    build_axle(parts[MAT_AXLE_A])
+    build_axle(parts[MAT_AXLE_B])
     write_glb(out, parts, "TGV_bogie_jacobs")
 
 

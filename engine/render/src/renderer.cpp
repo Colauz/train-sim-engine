@@ -210,8 +210,10 @@ bool Renderer::initialize(const RendererCreateInfo& info) {
     pipeline_terrain_ = build_terrain_pipeline();
     pipeline_foliage_ = build_foliage_pipeline();
     pipeline_wire_ = build_wire_pipeline();
+    pipeline_transparent_ = build_transparent_pipeline();  // M22 : vitrage
     if (pipeline_textured_ == VK_NULL_HANDLE || pipeline_terrain_ == VK_NULL_HANDLE ||
-        pipeline_foliage_ == VK_NULL_HANDLE || pipeline_wire_ == VK_NULL_HANDLE) {
+        pipeline_foliage_ == VK_NULL_HANDLE || pipeline_wire_ == VK_NULL_HANDLE ||
+        pipeline_transparent_ == VK_NULL_HANDLE) {
         return false;
     }
     if (!create_default_textures() || !create_default_material() || !create_default_environment()) {
@@ -2386,16 +2388,23 @@ void Renderer::record_rain(VkCommandBuffer cmd, const FrameUniforms& uniforms) {
 
 VkPipeline Renderer::build_terrain_pipeline() {
     return build_surface_pipeline(terrain_frag_spv, terrain_frag_spv_size,
-                                  terrain_pipeline_layout_);
+                                  terrain_pipeline_layout_, false);
 }
 
 VkPipeline Renderer::build_textured_pipeline() {
     return build_surface_pipeline(mesh_textured_frag_spv, mesh_textured_frag_spv_size,
-                                  textured_pipeline_layout_);
+                                  textured_pipeline_layout_, false);
+}
+
+VkPipeline Renderer::build_transparent_pipeline() {
+    // M22 : même shaders que le pipeline texturé, mais avec blending alpha et sans écriture
+    // de profondeur — pour le vitrage semi-transparent (alphaMode BLEND).
+    return build_surface_pipeline(mesh_textured_frag_spv, mesh_textured_frag_spv_size,
+                                  textured_pipeline_layout_, true);
 }
 
 VkPipeline Renderer::build_surface_pipeline(const unsigned char* frag_spv, std::size_t frag_size,
-                                            VkPipelineLayout layout) {
+                                            VkPipelineLayout layout, bool transparent) {
     VkShaderModule vert = create_shader_module(mesh_textured_vert_spv, mesh_textured_vert_spv_size);
     VkShaderModule frag = create_shader_module(frag_spv, frag_size);
     if (vert == VK_NULL_HANDLE || frag == VK_NULL_HANDLE) {
@@ -2470,14 +2479,28 @@ VkPipeline Renderer::build_surface_pipeline(const unsigned char* frag_spv, std::
     VkPipelineDepthStencilStateCreateInfo depth_stencil{};
     depth_stencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
     depth_stencil.depthTestEnable = VK_TRUE;
-    depth_stencil.depthWriteEnable = VK_TRUE;
+    // M22 : les transparents LISENT le Z (pour être occultés par l'opaque devant) mais ne
+    // l'ÉCRIVENT PAS (sinon un fragment de verre empêcherait de dessiner un objet plus loin).
+    depth_stencil.depthWriteEnable = transparent ? VK_FALSE : VK_TRUE;
     // REVERSE-Z (M9) : le proche projette sur 1.0, le lointain sur 0.0 (cf. camera.cpp).
     depth_stencil.depthCompareOp = VK_COMPARE_OP_GREATER;
 
     VkPipelineColorBlendAttachmentState blend_attachment{};
     blend_attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                                       VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    blend_attachment.blendEnable = VK_FALSE;
+    if (transparent) {
+        // M22 : blending alpha standard (src alpha, one-minus-src-alpha). Le fragment shader
+        // écrit la couleur PBR en rgb et l'alpha du matériau dans .a.
+        blend_attachment.blendEnable = VK_TRUE;
+        blend_attachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+        blend_attachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        blend_attachment.colorBlendOp = VK_BLEND_OP_ADD;
+        blend_attachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        blend_attachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        blend_attachment.alphaBlendOp = VK_BLEND_OP_ADD;
+    } else {
+        blend_attachment.blendEnable = VK_FALSE;
+    }
 
     VkPipelineColorBlendStateCreateInfo blend{};
     blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
@@ -2678,6 +2701,7 @@ MaterialId Renderer::create_material(const MaterialDesc& desc) {
     // est ce qui permet à l'arbre et au poteau de partager le pipeline instancié.
     material.pbr_factors = glm::vec4(desc.metallic_factor, desc.roughness_factor,
                                      desc.normal_scale, desc.foliage ? 1.0f : 0.0f);
+    material.transparent = desc.transparent;
 
     VkDescriptorSetAllocateInfo alloc{};
     alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
@@ -3612,110 +3636,150 @@ void Renderer::record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
     // le slot n'est plus lu par le GPU — même garantie que l'UBO et le HUD.
     stream_cursor_bytes_ = 0;
 
+    // Curseur du tampon de streaming (M15) : remis à zéro à chaque frame, avancé au fil des
+    // DrawItem cullés. L'écriture se fait ICI, après le vkWaitForFences de draw_frame, donc
+    // le slot n'est plus lu par le GPU — même garantie que l'UBO et le HUD.
+    stream_cursor_bytes_ = 0;
+
+    // M22 : séparation opaques / transparents (vitrage) pour éviter de casser le Z-Buffer.
+    // Les opaques écrivent la profondeur ; les transparents sont triés du plus LOIN au plus
+    // PROCHE de la caméra, puis dessinés sans écriture Z (depth-write = false, depth-test = true).
+    std::vector<const DrawItem*> opaque_items;
+    std::vector<const DrawItem*> transparent_items;
+    opaque_items.reserve(items.size());
+
     for (const DrawItem& item : items) {
+        bool transparent = false;
         const auto mesh_it = meshes_.find(item.mesh);
-        if (mesh_it == meshes_.end()) {
-            continue;
+        if (mesh_it != meshes_.end() && mesh_it->second.indexed) {
+            const MaterialId mat_id = item.material != 0 ? item.material : default_material_;
+            const auto mat_it = materials_.find(mat_id);
+            if (mat_it != materials_.end() && mat_it->second.transparent) {
+                transparent = true;
+            }
         }
-        const Mesh& mesh = mesh_it->second;
-        if (!mesh.ready) {
-            continue;  // transfert GPU asynchrone pas encore terminé (chemin M7).
-        }
-
-        VkDeviceSize offset = 0;
-        if (mesh.indexed) {
-            // Modèle texturé : pipeline dédié + set 0 (UBO) + set 1 (matériau).
-            const MaterialId material_id = item.material != 0 ? item.material : default_material_;
-            const auto material_it = materials_.find(material_id);
-            if (material_it == materials_.end() || !material_it->second.written) {
-                continue;  // matériau inconnu, ou ses textures pas encore téléversées.
-            }
-            const Material& material = material_it->second;
-
-            TexturedPushConstants push{};
-            push.model = item.model;
-            push.base_color_factor = material.base_color_factor;
-            push.pbr_factors = material.pbr_factors;
-
-            // set 2 = la cubemap d'environnement (IBL). Résolue à chaque item mais
-            // constante sur la frame ; sans elle (même pas le secours téléversé, ce qui
-            // ne dure qu'une frame ou deux au démarrage) on ne peut pas dessiner.
-            const VkDescriptorSet env_set = resolve_environment_set();
-            if (env_set == VK_NULL_HANDLE) {
-                continue;
-            }
-            // Le terrain a son propre pipeline et son propre layout (set 1 à 6 bindings) ;
-            // tout le reste — vertex, sets 0 et 2, push constants — est commun.
-            //
-            // M15 : deux sources d'instances possibles. `cpu_instances` (culling CPU) =>
-            // sous-ensemble visible téléversé dans le tampon de streaming de la frame.
-            // Sinon => tampon d'instances persistant (comportement d'avant).
-            const bool has_cpu = item.cpu_instances != nullptr;
-            const bool instanced = has_cpu || (item.instances != 0 && item.instance_count > 0);
-            const auto inst_it = (instanced && !has_cpu) ? instance_buffers_.find(item.instances)
-                                                         : instance_buffers_.end();
-            if (instanced && !has_cpu && inst_it == instance_buffers_.end()) {
-                continue;  // tampon détruit entre-temps
-            }
-
-            VkBuffer instance_buffer = VK_NULL_HANDLE;
-            VkDeviceSize instance_offset = 0;
-            std::uint32_t instance_draw = 1;
-            if (has_cpu) {
-                const std::vector<InstanceData>& data = *item.cpu_instances;
-                const std::uint32_t used = stream_cursor_bytes_ / sizeof(InstanceData);
-                const std::uint32_t count =
-                    std::min(static_cast<std::uint32_t>(data.size()), kMaxStreamInstances - used);
-                if (count == 0) {
-                    continue;  // rien de visible après culling : aucun draw
-                }
-                std::memcpy(static_cast<char*>(stream_buffers_[current_frame_].mapped) +
-                                stream_cursor_bytes_,
-                            data.data(), static_cast<std::size_t>(count) * sizeof(InstanceData));
-                instance_buffer = stream_buffers_[current_frame_].buffer;
-                instance_offset = stream_cursor_bytes_;
-                instance_draw = count;
-                stream_cursor_bytes_ += count * static_cast<std::uint32_t>(sizeof(InstanceData));
-            } else if (instanced) {
-                instance_buffer = inst_it->second.buffer;
-                instance_draw = item.instance_count;
-            }
-
-            const bool terrain = material.shading == Shading::Terrain;
-            const VkPipeline pipeline =
-                material.shading == Shading::Wire ? pipeline_wire_
-                : terrain                         ? pipeline_terrain_
-                : instanced                       ? pipeline_foliage_
-                                                  : pipeline_textured_;
-            const VkPipelineLayout layout =
-                terrain ? terrain_pipeline_layout_ : textured_pipeline_layout_;
-            const std::array<VkDescriptorSet, 3> sets{frame_ubo, material.descriptor, env_set};
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0,
-                                    static_cast<std::uint32_t>(sets.size()), sets.data(), 0,
-                                    nullptr);
-            vkCmdPushConstants(cmd, layout,
-                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-                               sizeof(push), &push);
-            vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertex_buffer.buffer, &offset);
-            if (instanced) {
-                vkCmdBindVertexBuffers(cmd, 1, 1, &instance_buffer, &instance_offset);
-            }
-            vkCmdBindIndexBuffer(cmd, mesh.index_buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
-            vkCmdDrawIndexed(cmd, mesh.index_count, instanced ? instance_draw : 1, 0, 0, 0);
+        if (transparent) {
+            transparent_items.push_back(&item);
         } else {
-            // Géométrie debug (grille, rails, cubes de secours) : couleur par sommet.
-            VkPipeline pipeline =
-                mesh.topology == Topology::Lines ? pipeline_lines_ : pipeline_triangles_;
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_, 0, 1,
-                                    &frame_ubo, 0, nullptr);
-            vkCmdPushConstants(cmd, pipeline_layout_, VK_SHADER_STAGE_VERTEX_BIT, 0,
-                               sizeof(glm::mat4), &item.model);
-            vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertex_buffer.buffer, &offset);
-            vkCmdDraw(cmd, mesh.vertex_count, 1, 0, 0);
+            opaque_items.push_back(&item);
         }
     }
+
+    // Tri des objets transparents du plus loin au plus proche (back-to-front).
+    // Les matrices `model` sont relatives à la caméra (caméra en (0,0,0)), donc
+    // `glm::vec3(model[3])` est directement le vecteur position relatif à la caméra.
+    std::sort(transparent_items.begin(), transparent_items.end(),
+              [](const DrawItem* a, const DrawItem* b) {
+                  const glm::vec3 pos_a(a->model[3]);
+                  const glm::vec3 pos_b(b->model[3]);
+                  return glm::dot(pos_a, pos_a) > glm::dot(pos_b, pos_b);
+              });
+
+    auto draw_item_list = [&](const std::vector<const DrawItem*>& list) {
+        for (const DrawItem* item_ptr : list) {
+            const DrawItem& item = *item_ptr;
+            const auto mesh_it = meshes_.find(item.mesh);
+            if (mesh_it == meshes_.end()) {
+                continue;
+            }
+            const Mesh& mesh = mesh_it->second;
+            if (!mesh.ready) {
+                continue;  // transfert GPU asynchrone pas encore terminé (chemin M7).
+            }
+
+            VkDeviceSize offset = 0;
+            if (mesh.indexed) {
+                // Modèle texturé : pipeline dédié + set 0 (UBO) + set 1 (matériau).
+                const MaterialId material_id = item.material != 0 ? item.material : default_material_;
+                const auto material_it = materials_.find(material_id);
+                if (material_it == materials_.end() || !material_it->second.written) {
+                    continue;  // matériau inconnu, ou ses textures pas encore téléversées.
+                }
+                const Material& material = material_it->second;
+
+                TexturedPushConstants push{};
+                push.model = item.model;
+                push.base_color_factor = material.base_color_factor;
+                push.pbr_factors = material.pbr_factors;
+
+                const VkDescriptorSet env_set = resolve_environment_set();
+                if (env_set == VK_NULL_HANDLE) {
+                    continue;
+                }
+
+                const bool has_cpu = item.cpu_instances != nullptr;
+                const bool instanced = has_cpu || (item.instances != 0 && item.instance_count > 0);
+                const auto inst_it = (instanced && !has_cpu) ? instance_buffers_.find(item.instances)
+                                                             : instance_buffers_.end();
+                if (instanced && !has_cpu && inst_it == instance_buffers_.end()) {
+                    continue;  // tampon détruit entre-temps
+                }
+
+                VkBuffer instance_buffer = VK_NULL_HANDLE;
+                VkDeviceSize instance_offset = 0;
+                std::uint32_t instance_draw = 1;
+                if (has_cpu) {
+                    const std::vector<InstanceData>& data = *item.cpu_instances;
+                    const std::uint32_t used = stream_cursor_bytes_ / sizeof(InstanceData);
+                    const std::uint32_t count =
+                        std::min(static_cast<std::uint32_t>(data.size()), kMaxStreamInstances - used);
+                    if (count == 0) {
+                        continue;  // rien de visible après culling : aucun draw
+                    }
+                    std::memcpy(static_cast<char*>(stream_buffers_[current_frame_].mapped) +
+                                    stream_cursor_bytes_,
+                                data.data(), static_cast<std::size_t>(count) * sizeof(InstanceData));
+                    instance_buffer = stream_buffers_[current_frame_].buffer;
+                    instance_offset = stream_cursor_bytes_;
+                    instance_draw = count;
+                    stream_cursor_bytes_ += count * static_cast<std::uint32_t>(sizeof(InstanceData));
+                } else if (instanced) {
+                    instance_buffer = inst_it->second.buffer;
+                    instance_draw = item.instance_count;
+                }
+
+                const bool terrain = material.shading == Shading::Terrain;
+                const VkPipeline pipeline =
+                    material.shading == Shading::Wire ? pipeline_wire_
+                    : terrain                         ? pipeline_terrain_
+                    : instanced                       ? pipeline_foliage_
+                    : material.transparent            ? pipeline_transparent_
+                                                      : pipeline_textured_;
+                const VkPipelineLayout layout =
+                    terrain ? terrain_pipeline_layout_ : textured_pipeline_layout_;
+                const std::array<VkDescriptorSet, 3> sets{frame_ubo, material.descriptor, env_set};
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0,
+                                        static_cast<std::uint32_t>(sets.size()), sets.data(), 0,
+                                        nullptr);
+                vkCmdPushConstants(cmd, layout,
+                                   VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                                   sizeof(push), &push);
+                vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertex_buffer.buffer, &offset);
+                if (instanced) {
+                    vkCmdBindVertexBuffers(cmd, 1, 1, &instance_buffer, &instance_offset);
+                }
+                vkCmdBindIndexBuffer(cmd, mesh.index_buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
+                vkCmdDrawIndexed(cmd, mesh.index_count, instanced ? instance_draw : 1, 0, 0, 0);
+            } else {
+                // Géométrie debug (grille, rails, cubes de secours) : couleur par sommet.
+                VkPipeline pipeline =
+                    mesh.topology == Topology::Lines ? pipeline_lines_ : pipeline_triangles_;
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_, 0, 1,
+                                        &frame_ubo, 0, nullptr);
+                vkCmdPushConstants(cmd, pipeline_layout_, VK_SHADER_STAGE_VERTEX_BIT, 0,
+                                   sizeof(glm::mat4), &item.model);
+                vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertex_buffer.buffer, &offset);
+                vkCmdDraw(cmd, mesh.vertex_count, 1, 0, 0);
+            }
+        }
+    };
+
+    // Passe 1 : opaques
+    draw_item_list(opaque_items);
+    // Passe 2 : transparents (triés back-to-front)
+    draw_item_list(transparent_items);
 
     // Le ciel EN DERNIER, volontairement : toute la géométrie a déjà écrit sa profondeur,
     // donc l'early-z rejette le ciel partout où elle est passée. Le dessiner en premier
@@ -3949,6 +4013,10 @@ void Renderer::shutdown() {
     if (pipeline_wire_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(dev, pipeline_wire_, nullptr);
         pipeline_wire_ = VK_NULL_HANDLE;
+    }
+    if (pipeline_transparent_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(dev, pipeline_transparent_, nullptr);
+        pipeline_transparent_ = VK_NULL_HANDLE;
     }
     // HUD (M13) : pipeline avant son layout, comme partout ailleurs.
     if (hud_pipeline_ != VK_NULL_HANDLE) {

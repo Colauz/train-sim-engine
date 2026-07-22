@@ -739,11 +739,16 @@ struct Application::Impl {
         }
         prev_l_down = l_down;
 
-        // Portes (M21) : touche P, front montant = bascule ouverture/fermeture.
+        // Portes (M21 + M22) : touche P, front montant = bascule ouverture/fermeture.
+        // Sécurité M22 : interdiction d'ouvrir si |vitesse| > 0.01 m/s.
         const bool p_down = window.is_key_down(Key::P);
         if (p_down && !prev_p_down) {
-            doors_opening = !doors_opening;
-            log::info("Portes : {}", doors_opening ? "OUVERTURE" : "FERMETURE");
+            if (doors_opening || std::abs(wagon.speed()) <= 0.01) {
+                doors_opening = !doors_opening;
+                log::info("Portes : {}", doors_opening ? "OUVERTURE" : "FERMETURE");
+            } else {
+                log::info("Portes : VERROUILLÉES (vitesse {:.2f} m/s > 0.01 m/s)", std::abs(wagon.speed()));
+            }
         }
         prev_p_down = p_down;
 
@@ -1483,16 +1488,37 @@ struct Application::Impl {
                 const render::MaterialId mat = prim.material ? prim.material->id : 0;
                 items.push_back(render::DrawItem{caisse_m, prim.mesh, mat});
             }
+            // Helper pour dessiner un bogie (châssis + 2 essieux animés en rotation)
+            auto draw_bogie = [&](const physics::Bogie& b) {
+                const glm::mat4 m = camera.relative_model(b.position()) * b.orientation() *
+                                    kBogieTransform.matrix();
+                const auto& prims = jacobs_bogie_model->primitives;
+                const int n_prims = static_cast<int>(prims.size());
+                const int body_count = (n_prims >= 2) ? n_prims - 2 : n_prims;
+                for (int j = 0; j < body_count; ++j) {
+                    const render::MaterialId mat = prims[j].material ? prims[j].material->id : 0;
+                    items.push_back(render::DrawItem{m, prims[j].mesh, mat});
+                }
+                // Essieux animés en rotation Pitch (v = ω · r)
+                if (n_prims >= 2) {
+                    constexpr float kAxleZ[2] = {-1.5f, 1.5f};
+                    constexpr float kWheelR = 0.46f;
+                    for (int axle = 0; axle < 2; ++axle) {
+                        const auto prim_idx = static_cast<std::size_t>(n_prims - 2 + axle);
+                        const render::MaterialId mat = prims[prim_idx].material ? prims[prim_idx].material->id : 0;
+                        const glm::mat4 axle_local =
+                            glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, kWheelR, kAxleZ[axle])) *
+                            glm::rotate(glm::mat4(1.0f), b.wheel_angle(), glm::vec3(1.0f, 0.0f, 0.0f));
+                        items.push_back(render::DrawItem{m * axle_local, prims[prim_idx].mesh, mat});
+                    }
+                }
+            };
+
             // Les 2 bogies moteur, à l'orientation de la VOIE (jamais celle de la caisse).
             // Même modèle que les bogies Jacobs (empattement 3 m identique).
             if (jacobs_bogie_model && jacobs_bogie_model->ready) {
                 for (const physics::Bogie* b : {&wagon.front_bogie(), &wagon.rear_bogie()}) {
-                    const glm::mat4 m = camera.relative_model(b->position()) * b->orientation() *
-                                        kBogieTransform.matrix();
-                    for (const resource::Model::Primitive& prim : jacobs_bogie_model->primitives) {
-                        const render::MaterialId mat = prim.material ? prim.material->id : 0;
-                        items.push_back(render::DrawItem{m, prim.mesh, mat});
-                    }
+                    draw_bogie(*b);
                 }
             }
         } else {
@@ -1555,13 +1581,31 @@ struct Application::Impl {
         }
         // Bogies Jacobs (M16) : l'organe PARTAGÉ, dessiné une fois à chaque articulation.
         if (jacobs_bogie_model && jacobs_bogie_model->ready) {
-            for (const physics::Bogie& b : consist.jacobs_bogies()) {
+            auto draw_bogie = [&](const physics::Bogie& b) {
                 const glm::mat4 m = camera.relative_model(b.position()) * b.orientation() *
                                     kBogieTransform.matrix();
-                for (const resource::Model::Primitive& prim : jacobs_bogie_model->primitives) {
-                    const render::MaterialId mat = prim.material ? prim.material->id : 0;
-                    items.push_back(render::DrawItem{m, prim.mesh, mat});
+                const auto& prims = jacobs_bogie_model->primitives;
+                const int n_prims = static_cast<int>(prims.size());
+                const int body_count = (n_prims >= 2) ? n_prims - 2 : n_prims;
+                for (int j = 0; j < body_count; ++j) {
+                    const render::MaterialId mat = prims[j].material ? prims[j].material->id : 0;
+                    items.push_back(render::DrawItem{m, prims[j].mesh, mat});
                 }
+                if (n_prims >= 2) {
+                    constexpr float kAxleZ[2] = {-1.5f, 1.5f};
+                    constexpr float kWheelR = 0.46f;
+                    for (int axle = 0; axle < 2; ++axle) {
+                        const auto prim_idx = static_cast<std::size_t>(n_prims - 2 + axle);
+                        const render::MaterialId mat = prims[prim_idx].material ? prims[prim_idx].material->id : 0;
+                        const glm::mat4 axle_local =
+                            glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, kWheelR, kAxleZ[axle])) *
+                            glm::rotate(glm::mat4(1.0f), b.wheel_angle(), glm::vec3(1.0f, 0.0f, 0.0f));
+                        items.push_back(render::DrawItem{m * axle_local, prims[prim_idx].mesh, mat});
+                    }
+                }
+            };
+            for (const physics::Bogie& b : consist.jacobs_bogies()) {
+                draw_bogie(b);
             }
         }
 

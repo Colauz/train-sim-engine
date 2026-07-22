@@ -49,6 +49,11 @@ void Consist::update_running_gear(double dt, double longitudinal_accel) {
         jacobs_[k].follow(*track_, x);
     }
 
+    // M22 : mise à jour de la cinématique de rotation des roues (v = ω · r)
+    for (Bogie& b : jacobs_) {
+        b.update_wheels(loco_.speed(), dt);
+    }
+
     // Chaque caisse = cinématique inverse entre ses deux bogies porteurs. jacobs_[k] est
     // vers l'AVANT (chainage plus élevé, côté motrice), jacobs_[k+1] vers l'arrière.
     for (std::size_t k = 0; k < cars_.size(); ++k) {

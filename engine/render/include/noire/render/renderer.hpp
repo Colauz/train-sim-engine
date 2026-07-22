@@ -120,6 +120,9 @@ struct MaterialDesc {
     // MATÉRIAU et non par le pipeline, pour que le pipeline instancié serve aussi bien un
     // arbre qu'un poteau d'acier.
     bool foliage = false;
+    // Matériau semi-transparent (vitrage, verre) : alphaMode BLEND. Dessiné APRÈS les
+    // opaques, blending alpha src/one-minus-src, sans écriture de profondeur.
+    bool transparent = false;
 };
 
 // Matériau de terrain : deux jeux PBR complets (M11 phase 2). Chaque texture peut valoir
@@ -312,6 +315,8 @@ private:
         glm::vec4 base_color_factor{1.0f};
         glm::vec4 pbr_factors{1.0f, 1.0f, 1.0f, 0.0f};  // x=metallic, y=roughness, z=normal_scale
         bool written = false;
+        // M22 : matériau semi-transparent (vitrage). Dessiné par pipeline_transparent_.
+        bool transparent = false;
     };
 
     // Environnement GPU (M8 étape 6a) : la cubemap HDR du ciel + son descriptor set.
@@ -461,9 +466,11 @@ private:
 
     VkPipeline build_pipeline(Topology topology);
     VkPipeline build_textured_pipeline();
+    VkPipeline build_transparent_pipeline();  // M22 : vitrage alpha-blendé
     // Fabrique commune : même vertex (MeshVertex), fragment et layout paramétrés.
+    // transparent = true : blend alpha src/one-minus-src, depth-write off, double face.
     VkPipeline build_surface_pipeline(const unsigned char* frag_spv, std::size_t frag_size,
-                                      VkPipelineLayout layout);
+                                      VkPipelineLayout layout, bool transparent = false);
     VkShaderModule create_shader_module(const unsigned char* code, std::size_t size);
     void record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
                          const std::vector<DrawItem>& items, std::uint32_t glyph_count,
@@ -501,6 +508,9 @@ private:
     // l'instance (amplitude du vent), pas dans le pipeline.
     VkPipeline pipeline_foliage_ = VK_NULL_HANDLE;
     VkPipeline pipeline_wire_ = VK_NULL_HANDLE;  // câbles (M12) : ruban + fondu alpha
+    // M22 : vitrage semi-transparent (alphaMode BLEND). Identique au pipeline texturé,
+    // mais avec blending alpha activé, depth-write désactivé, et double face.
+    VkPipeline pipeline_transparent_ = VK_NULL_HANDLE;
 
     // --- HUD (M13) -----------------------------------------------------------
     // Dessiné en TOUT DERNIER dans la passe principale, après le ciel : sans profondeur
