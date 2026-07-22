@@ -470,6 +470,24 @@ struct Application::Impl {
     float wetness_target = 0.0f;
     bool prev_m_down = false;
 
+    // --- Cycle Jour/Nuit (M21) -----------------------------------------------
+    // Démarre à 8h du matin. day_cycle_speed = rapport de compression temporelle :
+    // 1 s réelle = 60 s simulées => une journée complète en ~24 min de jeu.
+    double day_time = 8.0 * 3600.0;
+    double day_cycle_speed = 60.0;
+
+    // --- Phares (M21) -------------------------------------------------------
+    bool headlights_on = false;
+    bool prev_l_down = false;
+
+    // --- Portes (M21) -------------------------------------------------------
+    // door_t : 0 = fermé, 1 = ouvert. Animation en 2 secondes (0.5/s).
+    // Phase 1 [0..0.3] : sortie latérale de 15 cm (bouchon).
+    // Phase 2 [0.3..1] : coulissement longitudinal de 90 cm.
+    float door_t = 0.0f;
+    bool doors_opening = false;
+    bool prev_p_down = false;
+
     WorldPosition prev_cam_world{};
     bool prev_cam_valid = false;
     std::chrono::steady_clock::time_point prev_render_time;
@@ -677,8 +695,9 @@ struct Application::Impl {
         hooks.render = [this](double /*interpolation*/) { render_frame(); };
         engine.set_hooks(std::move(hooks));
 
-        log::info("Commandes : Z/S (ou Flèches)=manipulateur de traction, Espace=frein, "
-                  "E=URGENCE, H=sifflet, P=pluie | souris=orbite, Ctrl/Maj=zoom, Échap=quitter");
+        log::info("Commandes : Z/S (ou Flèches)=traction/frein, Espace=frein service, "
+                  "E=URGENCE, H=sifflet | L=phares, P=portes, R=pluie | "
+                  "souris=orbite, Ctrl/Maj=zoom, Échap=quitter");
         return engine.initialize();
     }
 
@@ -699,15 +718,31 @@ struct Application::Impl {
             window.request_close();
         }
 
-        // Pluie : bascule sur front montant de P (M14 ; M reste synonyme), puis transition
-        // douce du wetness — qui pilote à la fois le brouillard, l'adhérence ET la pluie
-        // visible, d'un seul curseur.
-        const bool rain_down = window.is_key_down(Key::P) || window.is_key_down(Key::M);
+        // Pluie : bascule sur front montant de R (M21 : P libérée pour les portes).
+        // M reste synonyme pour la compatibilité. La transition douce pilote brouillard,
+        // adhérence ET pluie visible d'un seul curseur.
+        const bool rain_down = window.is_key_down(Key::R) || window.is_key_down(Key::M);
         if (rain_down && !prev_m_down) {
             wetness_target = (wetness_target > 0.5f) ? 0.0f : 1.0f;
             log::info("Météo : {}", wetness_target > 0.5f ? "PLUIE" : "temps sec");
         }
         prev_m_down = rain_down;
+
+        // Phares (M21) : touche L, front montant = bascule.
+        const bool l_down = window.is_key_down(Key::L);
+        if (l_down && !prev_l_down) {
+            headlights_on = !headlights_on;
+            log::info("Phares : {}", headlights_on ? "ON" : "OFF");
+        }
+        prev_l_down = l_down;
+
+        // Portes (M21) : touche P, front montant = bascule ouverture/fermeture.
+        const bool p_down = window.is_key_down(Key::P);
+        if (p_down && !prev_p_down) {
+            doors_opening = !doors_opening;
+            log::info("Portes : {}", doors_opening ? "OUVERTURE" : "FERMETURE");
+        }
+        prev_p_down = p_down;
         const float rate = static_cast<float>(dt) * 0.7f;
         wetness += glm::clamp(wetness_target - wetness, -rate, rate);
 
@@ -789,13 +824,25 @@ struct Application::Impl {
         audio.set_horn(nose, train_velocity, horn_level * 0.8f);
 
         sim_time += dt;
+        day_time += dt * day_cycle_speed;
+
+        // --- Portes : animation au pas fixe (déterministe) ---
+        // 2 secondes pour ouvrir ou fermer (0.5/s). Intégré ici comme le throttle :
+        // l'animation reste à la même vitesse quelle que soit la fréquence d'affichage.
+        const float door_speed = 0.5f;
+        const float door_dir = doors_opening ? 1.0f : -1.0f;
+        door_t = glm::clamp(door_t + static_cast<float>(dt) * door_speed * door_dir, 0.0f, 1.0f);
 
         if (++telemetry_ticks % 120 == 0) {
-            log::info("v={:6.1f} km/h | pente={:+5.1f}% | {} | chunks={} | pluie={:.0f}% | "
+            const int dh = static_cast<int>(day_time / 3600.0) % 24;
+            const int dm = static_cast<int>(day_time / 60.0) % 60;
+            log::info("v={:6.1f} km/h | pente={:+5.1f}% | {} | chunks={} | "
+                      "pluie={:.0f}% | phares={} | {:02d}:{:02d} | "
                       "{:.0f} fps (GPU {:.1f} ms) | arbres={}/{} vis",
                       wagon.speed() * 3.6, wagon.grade_percent(),
                       wagon.slipping() ? "PATINE   " : "adherent ", streamer.active_chunk_count(),
-                      wetness * 100.0f, perf_fps, perf_gpu_ms, visible_tree_count, tree_count);
+                      wetness * 100.0f, headlights_on ? "ON" : "OFF", dh, dm,
+                      perf_fps, perf_gpu_ms, visible_tree_count, tree_count);
         }
     }
 
@@ -820,24 +867,28 @@ struct Application::Impl {
 
         const auto& brake = wagon.air_brake();
         std::vector<std::pair<std::string, glm::vec4>> lines;
-        lines.emplace_back(std::format("VITESSE  {:>5.0f} KM/H", wagon.speed() * 3.6), value);
+        // Heure simulée (M21)
+        const int sim_hour   = static_cast<int>(day_time / 3600.0) % 24;
+        const int sim_minute = static_cast<int>(day_time / 60.0) % 60;
+        lines.emplace_back(std::format("HEURE    {:02d}:{:02d}", sim_hour, sim_minute), label);
+        lines.emplace_back(std::format("VITESSE  {: >5.0f} KM/H", wagon.speed() * 3.6), value);
         // Limite KVB (M17) : rouge dès qu'on la dépasse (avertissement avant l'urgence).
         const double limit = consist.current_limit_kmh();
         const bool over_limit = wagon.speed() * 3.6 > limit;
-        lines.emplace_back(std::format("LIMITE   {:>5.0f} KM/H", limit),
+        lines.emplace_back(std::format("LIMITE   {: >5.0f} KM/H", limit),
                            over_limit ? alert : glm::vec4{0.45f, 0.85f, 0.5f, 1.0f});
         // Position du MANIPULATEUR (la consigne du mécanicien), pas l'effort réellement
         // appliqué après la rampe de la chaîne de traction.
-        lines.emplace_back(std::format("TRACTION {:>5.0f} %", throttle_handle * 100.0), value);
+        lines.emplace_back(std::format("TRACTION {: >5.0f} %", throttle_handle * 100.0), value);
         // CG = conduite générale. Sa pression EST l'état du frein que lit le mécanicien :
         // 5 bar = desserré, elle chute quand on serre.
-        lines.emplace_back(std::format("CG      {:>5.1f} BAR", brake.pipe_pressure()),
+        lines.emplace_back(std::format("CG      {: >5.1f} BAR", brake.pipe_pressure()),
                            brake.emergency() ? alert : value);
-        lines.emplace_back(std::format("PENTE    {:>+5.1f} %", wagon.grade_percent()), label);
-        // Météo (M14) : mot d'état + intensité. Bleuté sous la pluie, gris au sec.
+        lines.emplace_back(std::format("PENTE    {: >+5.1f} %", wagon.grade_percent()), label);
+        // Météo (M14 → touche R) : mot d'état + intensité. Bleuté sous la pluie.
         const bool raining = wetness > 0.5f;
         const glm::vec4 meteo_color = raining ? glm::vec4{0.45f, 0.65f, 1.0f, 1.0f} : label;
-        lines.emplace_back(std::format("METEO {:>4} {:>3.0f}%", raining ? "PLUIE" : "SEC",
+        lines.emplace_back(std::format("METEO {: >4} {: >3.0f}%", raining ? "PLUIE" : "SEC",
                                        static_cast<double>(wetness) * 100.0),
                            meteo_color);
         lines.emplace_back(std::format("{:>3.0f} FPS  GPU {:.1f} MS", perf_fps, perf_gpu_ms), label);
@@ -1255,25 +1306,75 @@ struct Application::Impl {
         const glm::vec3 vel_view = glm::vec3(uniforms.view * glm::vec4(train_vel, 0.0f));
         uniforms.rain_tilt = glm::clamp(-vel_view.x / 30.0f, -2.5f, 2.5f);
 
-        // Soleil : direction VERS l'astre, source de vérité unique (elle éclaire les
-        // modèles ET cadre les cascades d'ombre). Depuis l'étape 6b elle est EXTRAITE du
-        // ciel HDR : c'est ce qui garantit que l'ombre portée pointe dans le sens du
-        // soleil qu'on voit réellement dans le ciel. Valeur en dur = secours tant que le
-        // HDR n'est pas chargé (~2,6 s au démarrage).
-        uniforms.sun_direction = glm::vec4(glm::normalize(glm::vec3(-0.18f, 0.77f, 0.61f)), 0.0f);
-        glm::vec3 sun_rgb(1.05f, 1.00f, 0.92f);
+        // --- Cycle Jour/Nuit (M21) -------------------------------------------
+        // L'élévation du soleil est gouvernée par day_time : 0° à midi, -90° à minuit.
+        // Azimut fixe : l'axe est calé pour que l'ombre pointe dans une direction naturelle.
+        // La direction HDR n'est PAS utilisée ici : elle est statique, contrairement au
+        // cycle. Les SH de l'IBL, eux, restent ceux du HDR (ambiante image-based).
+        const auto day_angle = static_cast<float>(
+            (day_time / 86400.0) * 2.0 * glm::pi<double>() - glm::half_pi<double>());
+        const glm::vec3 sun_dir_dyn =
+            glm::normalize(glm::vec3(0.3f, std::sin(day_angle), 0.4f));
+        uniforms.sun_direction = glm::vec4(sun_dir_dyn, 0.0f);
+
+        // Facteur nuit : 0 en plein jour, 1 quand le soleil est sous l'horizon.
+        // Le facteur 3 donne une transition crépuscule rapide mais douce (≈ 20 min sim).
+        const float night_factor =
+            glm::clamp(-std::sin(day_angle) * 3.0f, 0.0f, 1.0f);
+        // Couleur du soleil : blanche à midi, orange au crépuscule, éteinte la nuit.
+        const float dawn_factor =
+            1.0f - glm::clamp(std::abs(std::sin(day_angle)) * 2.0f, 0.0f, 1.0f);
+        const glm::vec3 sun_day(1.05f, 1.00f, 0.92f);
+        const glm::vec3 sun_dawn(1.40f, 0.70f, 0.30f);  // orange du coucher/lever
+        glm::vec3 sun_rgb =
+            glm::mix(glm::mix(sun_day, sun_dawn, dawn_factor),
+                     glm::vec3(0.0f), night_factor);
+        // La pluie écrase le soleil (couvert). Le ciel HDR reste ; un second HDRI
+        // nuageux serait nécessaire pour un vrai ciel de pluie.
+        sun_rgb *= glm::mix(1.0f, 0.30f, wetness);
+        uniforms.sun_color = glm::vec4(sun_rgb, 0.0f);
+
+        // sky_params : x = nuit, y = couverture nuageuse (pluie), z = horloge nuages.
+        uniforms.sky_params = glm::vec4(night_factor, wetness * 0.8f,
+                                        static_cast<float>(sim_time), 0.0f);
+
+        // SH du HDR (ambiante IBL) — inchangé
         if (sky && sky->ready) {
-            uniforms.sun_direction = glm::vec4(sky->sun_direction, 0.0f);
-            sun_rgb = sky->sun_color;
-            // Irradiance du ciel (soleil déjà retiré côté loader : le laisser dans les SH
-            // le compterait deux fois, une fois ici et une fois en directionnel).
             for (std::size_t i = 0; i < uniforms.sh.size(); ++i) {
                 uniforms.sh[i] = glm::vec4(sky->sh[i], 0.0f);
             }
         }
-        // La pluie écrase le soleil (couvert). Le ciel, lui, reste celui du HDR : un vrai
-        // ciel de pluie demandera un second HDRI en fondu.
-        uniforms.sun_color = glm::vec4(sun_rgb * glm::mix(1.0f, 0.30f, wetness), 0.0f);
+
+        // --- Phares du TGV (M21) : 2 spotlights coniques ---
+        // Positions en espace CAMÉRA-RELATIF (origin-floating) : même convention que
+        // tout le rendu. Direction en espace MONDE (invariant à la translation).
+        if (headlights_on && train_model && train_model->ready) {
+            const glm::dvec3 fwd = glm::normalize(wagon.front_bogie().tangent());
+            const glm::dvec3 world_up(0.0, 1.0, 0.0);
+            const glm::dvec3 right_w = glm::normalize(glm::cross(fwd, world_up));
+            // Le nez est à ~8 m devant le bogie avant, phares à 2.10 m de haut, ±0.60 m.
+            const WorldPosition nose_base = wagon.front_bogie().position() + fwd * 8.0;
+            const glm::dvec3 h_off = world_up * 2.10;
+            const glm::dvec3 lat = right_w * 0.60;
+            const WorldPosition spot_pos[2] = {
+                nose_base + h_off + lat,   // phare droit
+                nose_base + h_off - lat,   // phare gauche
+            };
+            const glm::vec3 spot_dir = -glm::vec3(fwd);  // direction monde
+            // Demi-angle interne 8° (faisceau de route), externe 15° (pénombre).
+            const float cos_inner = std::cos(glm::radians(8.0f));
+            const float cos_outer = std::cos(glm::radians(15.0f));
+            for (std::size_t i = 0; i < 2; ++i) {
+                const glm::vec3 rel = glm::vec3(spot_pos[i] - camera.position());
+                uniforms.spot_positions[i]  = glm::vec4(rel, cos_inner);
+                uniforms.spot_directions[i] = glm::vec4(spot_dir, cos_outer);
+            }
+            // rgb = couleur x intensité (blanc légèrement chaud), a = 1 → allumés.
+            uniforms.spot_color = glm::vec4(1.05f, 1.02f, 0.96f, 1.0f);
+        } else {
+            // .a = 0 : le shader ignore les spots éteints (court-circuit direct).
+            uniforms.spot_color = glm::vec4(0.0f);
+        }
 
         std::vector<render::DrawItem> items;
 
@@ -1394,17 +1495,45 @@ struct Application::Impl {
             items.push_back(render::DrawItem{body_model, body_mesh});
         }
 
-        // Voitures voyageurs (M16) : chaque caisse est posée par la CINÉMATIQUE INVERSE de
-        // ses deux bogies Jacobs (consist.car(i) donne position + orientation, yaw/pitch/roll
-        // compris). Même chemin de rendu que la motrice — seul le modèle change.
+        // Voitures voyageurs (M16 + M21) : chaque caisse est posée par la cinématique
+        // inverse de ses bogies Jacobs. M21 : les DEUX DERNIÈRES primitives sont les
+        // battants de porte — elles reçoivent une matrice propre (bouchon + coulissement)
+        // au lieu de la matrice caisse commune. L'intérieur (N-3 et avant) est dessiné
+        // comme la carrosserie.
         if (voiture_model && voiture_model->ready) {
+            const auto& prims = voiture_model->primitives;
+            const int n_prims = static_cast<int>(prims.size());
+            // Animation portes : deux phases.
+            // Phase 1 [door_t 0..0.3] : bouchon latéral de 15 cm (sortie de la coque).
+            // Phase 2 [door_t 0.3..1] : coulissement longitudinal de 90 cm.
+            const float t1 = glm::clamp(door_t / 0.3f, 0.0f, 1.0f);
+            const float t2 = glm::clamp((door_t - 0.3f) / 0.7f, 0.0f, 1.0f);
             for (int i = 0; i < consist.car_count(); ++i) {
                 const physics::CarBody& car = consist.car(i);
-                const glm::mat4 m = camera.relative_model(car.position()) * car.orientation() *
-                                    kCarTransform.matrix();
-                for (const resource::Model::Primitive& prim : voiture_model->primitives) {
-                    const render::MaterialId mat = prim.material ? prim.material->id : 0;
-                    items.push_back(render::DrawItem{m, prim.mesh, mat});
+                const glm::mat4 caisse_m = camera.relative_model(car.position()) *
+                                           car.orientation() * kCarTransform.matrix();
+                // Coque + intérieur : toutes les primitives sauf les 2 dernières (battants).
+                const auto body_count = static_cast<std::size_t>(
+                    (n_prims >= 2) ? n_prims - 2 : n_prims);
+                for (std::size_t j = 0; j < body_count; ++j) {
+                    const render::MaterialId mat =
+                        prims[j].material ? prims[j].material->id : 0;
+                    items.push_back(render::DrawItem{caisse_m, prims[j].mesh, mat});
+                }
+                // Battants de porte (seulement si le GLB en possède bien 2 dédiées).
+                if (n_prims >= 2) {
+                    for (int side = 0; side < 2; ++side) {
+                        const float sx = (side == 0) ? +1.0f : -1.0f;
+                        const float sz = (side == 0) ? -1.0f : +1.0f;
+                        const glm::mat4 door_local = glm::translate(
+                            glm::mat4(1.0f),
+                            glm::vec3(sx * 0.15f * t1, 0.0f, sz * 0.90f * t2));
+                        const auto prim_idx = static_cast<std::size_t>(n_prims - 2 + side);
+                        const render::MaterialId mat =
+                            prims[prim_idx].material ? prims[prim_idx].material->id : 0;
+                        items.push_back(
+                            render::DrawItem{caisse_m * door_local, prims[prim_idx].mesh, mat});
+                    }
                 }
             }
         }

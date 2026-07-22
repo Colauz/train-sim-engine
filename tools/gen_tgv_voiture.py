@@ -16,6 +16,17 @@ Le bogie Jacobs est généré à part : c'est l'organe PARTAGÉ entre deux caiss
 par le Consist à l'articulation. Son origine locale est au PLAN DE ROULEMENT (y = 0), ce
 qui colle à Bogie::position() (échantillon sur le rail).
 
+M21 : la caisse est désormais HABITABLE —
+  * une PORTE par flanc près du bout avant : trou rectangulaire dans le loft (les bords
+    sont injectés comme stations/colonnes de la grille, le trou tombe donc PILE sur les
+    quads — même mécanisme que les canaux de vitrage), feuillures d'embrasure entre la
+    coque et l'intérieur ;
+  * un CAISSON INTÉRIEUR rudimentaire (plancher, murs, plafond) à normales RENTRANTES ;
+  * les deux BATTANTS sont des patchs de surface émis comme parts SÉPARÉES, EN TOUT
+    DERNIER (droite puis gauche) : ce sont les 2 dernières primitives du GLB, convention
+    que l'app utilise pour leur appliquer leur propre matrice d'animation (porte
+    coulissante à bouchon : sortie latérale puis glissement le long de la caisse).
+
 Repère caisse : x = droite, y = haut, z = arrière ; rail à y = -body_height = -2.20.
 Aucune dépendance externe (stdlib seule). Sortie : deux .glb."""
 import struct, json, math, sys
@@ -52,8 +63,34 @@ MATERIALS = [
     # sinon la roue disparaît dans le bogie (même teinte => aucune silhouette).
     {"name": "roue", "factor": [0.55, 0.55, 0.56, 1.0], "metallic": 1.0, "roughness": 0.30},
     {"name": "bogie", "factor": [0.09, 0.09, 0.10, 1.0], "metallic": 0.0, "roughness": 0.65},
+    # Habitacle (M21) : gris clair MAT (mélaminé), éclairé par la seule ambiante.
+    {"name": "interieur", "factor": [0.42, 0.43, 0.46, 1.0], "metallic": 0.0, "roughness": 0.85},
+    # Battants de porte (M21), en DEUX exemplaires du MÊME matériau : chaque battant est
+    # une part séparée (cf. write_glb : une part = une primitive = un slot matériau), et
+    # l'app anime les 2 dernières primitives indépendamment de la caisse.
+    {"name": "porte", "factor": [0.82, 0.83, 0.86, 1.0], "metallic": 0.55, "roughness": 0.24},
+    {"name": "porte", "factor": [0.82, 0.83, 0.86, 1.0], "metallic": 0.55, "roughness": 0.24},
 ]
-MAT_PAINT, MAT_GLASS, MAT_ACCENT, MAT_SKIRT, MAT_BELLOWS, MAT_WHEEL, MAT_BOGIE = range(7)
+(MAT_PAINT, MAT_GLASS, MAT_ACCENT, MAT_SKIRT, MAT_BELLOWS, MAT_WHEEL, MAT_BOGIE,
+ MAT_INTERIOR, MAT_DOOR_R, MAT_DOOR_L) = range(10)
+
+# --- Portes voyageurs (M21) : trous dans la tôle + battants séparés --------------
+# Une porte par flanc, près du bout AVANT. Le rectangle [z0,z1]x[t0,t1] est calé pour
+# ne toucher ni les soufflets (qui finissent à Z_HEAD + 0.85) ni le bandeau vitré (qui
+# commence à Z_HEAD + 2.00) : un montant de tôle de 10 cm sépare porte et première baie.
+DOOR_Z0, DOOR_Z1 = Z_HEAD + 1.00, Z_HEAD + 1.90
+# t = 0 : flanc droit. -0.80 => seuil à ~1,26 m au-dessus du rail ; 0.17 => linteau à
+# ~3,00 m. Le flanc gauche est le miroir autour de pi.
+DOOR_T_LO, DOOR_T_HI = -0.80, 0.17
+DOORS = [
+    (DOOR_Z0, DOOR_Z1, DOOR_T_LO, DOOR_T_HI),                       # flanc droit
+    (DOOR_Z0, DOOR_Z1, math.pi - DOOR_T_HI, math.pi - DOOR_T_LO),   # flanc gauche
+]
+
+# --- Habitacle rudimentaire (M21) -----------------------------------------------
+IN_HALF_W = 1.32        # murs intérieurs : 13 cm de tôle + isolation derrière le flanc
+IN_FLOOR = RAIL + 1.20  # plancher voyageurs, juste SOUS le seuil de porte (~1,26 m)
+IN_CEIL = RAIL + 3.25   # plafond, juste AU-DESSUS du linteau (~3,00 m)
 
 
 # --- Algèbre ------------------------------------------------------------------
@@ -161,26 +198,49 @@ class Part:
 
 def stations():
     """Base uniforme + bords et pieds de rampe des canaux (sinon les baies seraient
-    échantillonnées au hasard de la grille et déchiquetées)."""
+    échantillonnées au hasard de la grille et déchiquetées) + bords des portes (M21 :
+    le trou doit tomber PILE sur des lignes de la grille)."""
     out = [Z_TAIL + (Z_HEAD - Z_TAIL) * i / BODY_STEPS for i in range(BODY_STEPS + 1)]
     for (z0, z1, _, _, _, rz, _) in CHANNELS:
         out += [z0, z0 + rz, (z0 + z1) / 2.0, z1 - rz, z1]
+    for (z0, z1, _, _) in DOORS:
+        out += [z0, z1]
     return sorted({round(z, 6) for z in out if Z_HEAD <= z <= Z_TAIL}, reverse=True)
 
 
 def t_columns():
-    """Colonnes angulaires : base uniforme + bords et pieds de rampe des canaux."""
+    """Colonnes angulaires : base uniforme + bords et pieds de rampe des canaux +
+    bords des portes."""
     cols = {round(2.0 * math.pi * j / T_SEGMENTS, 6) for j in range(T_SEGMENTS)}
     two_pi = 2.0 * math.pi
     for (_, _, t0, t1, _, _, rt) in CHANNELS:
         for tt in (t0, t0 + rt, (t0 + t1) / 2.0, t1 - rt, t1):
             cols.add(round(tt % two_pi, 6))
+    for (_, _, t0, t1) in DOORS:
+        cols.add(round(t0 % two_pi, 6))
+        cols.add(round(t1 % two_pi, 6))
     return sorted(cols)
+
+
+def in_door(z, t):
+    """Le centre (z, t) d'un quad tombe-t-il dans l'embrasure d'une porte ? La
+    périodicité en t est gérée comme pour les canaux (la porte droite chevauche t = 0).
+    Les bords de porte étant des lignes de la grille, un centre est TOUJOURS
+    strictement dedans ou strictement dehors : le trou est net."""
+    tm = t % (2.0 * math.pi)
+    for (z0, z1, t0, t1) in DOORS:
+        if z0 < z < z1:
+            for tt in (tm, tm - 2.0 * math.pi):
+                if t0 < tt < t1:
+                    return True
+    return False
 
 
 def build_body(part):
     """Grille INDEXÉE à normales partagées (éclairage continu). La dernière colonne
-    (t = 2pi) duplique la première GÉOMÉTRIQUEMENT mais porte u = 1 (couture UV)."""
+    (t = 2pi) duplique la première GÉOMÉTRIQUEMENT mais porte u = 1 (couture UV).
+    M21 : les quads dont le centre tombe dans une embrasure de porte sont SAUTÉS —
+    c'est le trou dans la tôle."""
     zs = stations()
     cols = t_columns()
     two_pi = 2.0 * math.pi
@@ -194,6 +254,11 @@ def build_body(part):
         grid.append(row)
     for i in range(len(zs) - 1):
         for j in range(len(cols)):
+            zc = (zs[i] + zs[i + 1]) * 0.5
+            t_hi = cols[j + 1] if j + 1 < len(cols) else two_pi
+            tc = (cols[j] + t_hi) * 0.5
+            if in_door(zc, tc):
+                continue
             part.add_quad([grid[i][j], grid[i + 1][j], grid[i + 1][j + 1], grid[i][j + 1]])
 
 
@@ -280,6 +345,113 @@ def build_box(part, x0, y0, z0, x1, y1, z1):
             part.positions.append(c[k]); part.normals.append(n)
             part.uvs.append((0.0, 0.0)); part.tangents.append(tg)
         part.indices.extend([base, base + 1, base + 2, base, base + 2, base + 3])
+
+
+# --- Habitacle et embrasures (M21) ----------------------------------------------
+def quad_orient(part, a, b, c, d, want):
+    """Un quad plan (a,b,c,d) dont on FORCE l'orientation : si la normale géométrique
+    ne pointe pas du côté de `want`, le winding est inversé. Sert au caisson intérieur
+    (normales RENTRANTES, visibles de l'intérieur) et aux feuillures (normales tournées
+    vers le passage de porte)."""
+    n = norm(cross(sub(b, a), sub(c, a)))
+    if dot(n, want) < 0.0:
+        b, d = d, b
+        n = mul(n, -1.0)
+    t3 = norm(sub(c, b))
+    tg = (t3[0], t3[1], t3[2], 1.0)
+    part.add_quad([(a, n, (0.0, 0.0), tg), (b, n, (1.0, 0.0), tg),
+                   (c, n, (1.0, 1.0), tg), (d, n, (0.0, 1.0), tg)])
+
+
+def door_heights():
+    """Hauteurs (seuil, linteau) de l'embrasure en mètres, évaluées sur la géométrie
+    RÉELLE de la section (surf_base) aux bords angulaires de la porte. Identiques sur
+    les deux flancs : sin(pi - t) = sin(t)."""
+    return surf_base(0.0, DOOR_T_LO)[1], surf_base(0.0, DOOR_T_HI)[1]
+
+
+def build_interior(part):
+    """Caisson intérieur rudimentaire à normales RENTRANTES : plancher, plafond, murs
+    latéraux, fonds aux deux bouts (rentrés de 5 cm pour ne pas z-fighter avec les
+    caps). Le long de chaque flanc, le mur est OUVERT au droit de la porte : deux
+    segments pleine hauteur (avant / après la porte) + deux bandeaux (sous le seuil,
+    au-dessus du linteau) laissent un passage rectangulaire aligné sur le trou de la
+    coque."""
+    seuil, linteau = door_heights()
+    zA, zB = Z_HEAD + 0.05, Z_TAIL - 0.05
+    w = IN_HALF_W
+    # Plancher et plafond (toute la longueur, toute la largeur).
+    quad_orient(part, (-w, IN_FLOOR, zA), (-w, IN_FLOOR, zB),
+                (w, IN_FLOOR, zB), (w, IN_FLOOR, zA), (0.0, 1.0, 0.0))
+    quad_orient(part, (-w, IN_CEIL, zA), (w, IN_CEIL, zA),
+                (w, IN_CEIL, zB), (-w, IN_CEIL, zB), (0.0, -1.0, 0.0))
+    # Fonds aux deux bouts.
+    quad_orient(part, (-w, IN_FLOOR, zA), (w, IN_FLOOR, zA),
+                (w, IN_CEIL, zA), (-w, IN_CEIL, zA), (0.0, 0.0, 1.0))
+    quad_orient(part, (-w, IN_FLOOR, zB), (w, IN_FLOOR, zB),
+                (w, IN_CEIL, zB), (-w, IN_CEIL, zB), (0.0, 0.0, -1.0))
+    # Murs latéraux percés au droit des portes.
+    for sx, want in ((1.0, (-1.0, 0.0, 0.0)), (-1.0, (1.0, 0.0, 0.0))):
+        x = sx * w
+        for za, zb in ((zA, DOOR_Z0), (DOOR_Z1, zB)):  # segments pleine hauteur
+            quad_orient(part, (x, IN_FLOOR, za), (x, IN_FLOOR, zb),
+                        (x, IN_CEIL, zb), (x, IN_CEIL, za), want)
+        # bandeaux sous le seuil et au-dessus du linteau
+        quad_orient(part, (x, IN_FLOOR, DOOR_Z0), (x, IN_FLOOR, DOOR_Z1),
+                    (x, seuil, DOOR_Z1), (x, seuil, DOOR_Z0), want)
+        quad_orient(part, (x, linteau, DOOR_Z0), (x, linteau, DOOR_Z1),
+                    (x, IN_CEIL, DOOR_Z1), (x, IN_CEIL, DOOR_Z0), want)
+
+
+def build_door(part, side):
+    """Battant coulissant (M21) : un panneau plat posé DANS l'embrasure, légèrement
+    rentré sous la surface de coque (−5 mm) pour ne pas z-fighter avec les bords du trou.
+    side = +1 (flanc droit, normale vers intérieur = -x) ou −1 (flanc gauche, normale +x).
+    En position FERMÉE : il bouche exactement le trou ; l'app l'anime par translation
+    latérale (bouchon) + longitudinale (coulissement) via sa propre matrice de DrawItem."""
+    seuil, linteau = door_heights()
+    z0, z1 = DOOR_Z0, DOOR_Z1
+    # Légèrement sous la surface extérieure de la coque : pas de z-fight avec les bords.
+    x = side * (HALF_W - 0.005)
+    n = (-side, 0.0, 0.0)       # normale vers l'intérieur de la voiture
+    tg = (0.0, 0.0, -1.0, 1.0)  # tangente longitudinale (sens −z = vers l'avant)
+    # 4 coins du battant, sens horaire vu de la normale (winding front-face)
+    corners = [
+        (x, seuil,   z0),
+        (x, seuil,   z1),
+        (x, linteau, z1),
+        (x, linteau, z0),
+    ]
+    uvs = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
+    base = len(part.positions)
+    for p, uv in zip(corners, uvs):
+        part.positions.append(p)
+        part.normals.append(n)
+        part.uvs.append(uv)
+        part.tangents.append(tg)
+    part.indices.extend([base, base + 1, base + 2, base, base + 2, base + 3])
+
+
+def build_jambs(part):
+    """Feuillures d'embrasure (M21) : 4 quads par porte reliant le bord du trou de la
+    coque (surface extérieure) au mur intérieur — sans elles on verrait le vide entre
+    coque et caisson quand la porte est ouverte. Matériau PEINTURE : l'embrasure est de
+    la tôle emboutie, peinte comme la caisse, et c'est elle qu'on voit de l'extérieur
+    quand le battant a coulissé."""
+    seuil, linteau = door_heights()
+    for (z0, z1, t0, t1) in DOORS:
+        side = 1.0 if math.cos((t0 + t1) * 0.5) > 0.0 else -1.0
+        xw = side * IN_HALF_W
+        # seuil (normale vers le haut) et linteau (vers le bas)
+        quad_orient(part, surf(z0, t0), surf(z1, t0),
+                    (xw, seuil, z1), (xw, seuil, z0), (0.0, 1.0, 0.0))
+        quad_orient(part, surf(z0, t1), surf(z1, t1),
+                    (xw, linteau, z1), (xw, linteau, z0), (0.0, -1.0, 0.0))
+        # montants avant / arrière (normales vers l'intérieur du passage, en z)
+        quad_orient(part, surf(z0, t0), surf(z0, t1),
+                    (xw, linteau, z0), (xw, seuil, z0), (0.0, 0.0, 1.0))
+        quad_orient(part, surf(z1, t0), surf(z1, t1),
+                    (xw, linteau, z1), (xw, seuil, z1), (0.0, 0.0, -1.0))
 
 
 def build_wheel(part, cx, z, radius, half_width, segments):
@@ -409,7 +581,20 @@ def build_car(out):
             zc = zend - sgn * (0.18 + k * 0.26)
             build_band(parts[MAT_BELLOWS], zc - 0.05, zc + 0.05,
                        0.0, 2.0 * math.pi, 1, 40, 0.035)
+    # 7) Habitacle rudimentaire (M21) : caisson intérieur à normales RENTRANTES (plancher,
+    #    plafond, murs latéraux percés au droit des portes, fonds avant/arrière).
+    build_interior(parts[MAT_INTERIOR])
+    # 8) Feuillures d'embrasure (M21) : relient le bord du trou de coque au mur intérieur.
+    #    Matériau peinture (tôle emboutie, même teinte que la carrosserie).
+    build_jambs(parts[MAT_PAINT])
+    # 9) Battants de porte SÉPARÉS (M21) — DOIVENT être les deux DERNIÈRES parts sérialisées.
+    #    L'app C++ anime `voiture_model->primitives[N-2]` (porte droite) et
+    #    `voiture_model->primitives[N-1]` (porte gauche) avec leur propre matrice de DrawItem
+    #    (translation bouchon + coulissement), indépendamment de la matrice caisse.
+    build_door(parts[MAT_DOOR_R], side=+1.0)   # flanc droit  (N-2)
+    build_door(parts[MAT_DOOR_L], side=-1.0)   # flanc gauche (N-1)
     write_glb(out, parts, "TGV_voiture")
+
 
 
 # --- Bogie Jacobs (organe partagé) --------------------------------------------

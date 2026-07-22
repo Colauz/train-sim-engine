@@ -24,6 +24,8 @@ int to_glfw_key(Key key) {
         case Key::M:            return GLFW_KEY_M;
         case Key::H:            return GLFW_KEY_H;
         case Key::P:            return GLFW_KEY_P;
+        case Key::R:            return GLFW_KEY_R;
+        case Key::L:            return GLFW_KEY_L;
         case Key::Escape:       return GLFW_KEY_ESCAPE;
         case Key::Up:           return GLFW_KEY_UP;
         case Key::Down:         return GLFW_KEY_DOWN;

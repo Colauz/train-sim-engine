@@ -32,7 +32,8 @@ enum class Key {
     W, A, S, D,      // QWERTY
     Z, Q,            // AZERTY (Z=avancer, Q=gauche)
     Space, LeftShift, LeftControl,
-    E, M, H, P,      // E=urgence, M/P=pluie, H=sifflet (M14)
+    E, M, H, P,      // E=urgence, M=pluie (M14), H=sifflet, P=portes (M21)
+    R, L,            // R=pluie (M21, P reprise par les portes), L=phares (M21)
     Escape,
     Up, Down, Left, Right,
 };

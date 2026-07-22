@@ -264,6 +264,49 @@ vec3 shadeSurfaceEx(vec3 albedo, float metallic, float roughness, vec3 N, vec3 c
 
     vec3 color = direct + ambientDiffuse + ambientSpecular;
 
+    // --- Phares du TGV (M21) : 2 spotlights coniques, SANS ombre portée --------
+    // u.spotColor.a = 0 → phares éteints, court-circuit. Contribution ajoutée EN HDR
+    // avant le tone-mapping : l'ACES gère l'éblouissement naturellement.
+    if (u.spotColor.a > 0.5) {
+        for (int si = 0; si < 2; ++si) {
+            // Vecteur fragment → source (espace caméra-relatif = espace monde flottant).
+            vec3 toLight = u.spotPositions[si].xyz - cameraRelPos;
+            float dist2 = dot(toLight, toLight);
+            float dist  = sqrt(dist2);
+            vec3 Ls = toLight / dist;
+
+            // Test de cône : dot(direction_vers_source, direction_faisceau_inversée).
+            // spotDirections[si].xyz = direction du faisceau (monde), on veut la source→frag.
+            float cosTheta = dot(-Ls, normalize(u.spotDirections[si].xyz));
+            float cosInner = u.spotPositions[si].w;   // cos(demi-angle interne)
+            float cosOuter = u.spotDirections[si].w;  // cos(demi-angle externe)
+
+            // Pénombre douce entre les deux cônes : smooth-step sur cosTheta.
+            float spot = smoothstep(cosOuter, cosInner, cosTheta);
+            if (spot <= 0.0) continue;
+
+            // Atténuation inverse-carré, plafonnée à 1 m pour éviter l'infini au contact.
+            float attn = spot / max(dist2, 1.0);
+
+            float NdotLs = max(dot(N, Ls), 0.0);
+            vec3 Hs = normalize(V + Ls);
+            float NdotHs = max(dot(N, Hs), 0.0);
+            float VdotHs = max(dot(V, Hs), 0.0);
+
+            float Ds = distributionGGX(NdotHs, roughness);
+            float Gs = geometrySmith(NdotV, NdotLs, roughness);
+            vec3  Fs = fresnelSchlick(VdotHs, F0);
+            vec3 spec_s = (Ds * Gs * Fs) / (4.0 * NdotV * NdotLs + 1e-4);
+            vec3 kDs = (vec3(1.0) - Fs) * (1.0 - metallic);
+
+            // Intensité calibrée : PI * spotColor annule le 1/PI du diffus lambertien,
+            // comme pour sunColor — une surface blanche face au phare lit ~spotColor.
+            vec3 radianceS = u.spotColor.rgb * kPi * attn;
+            color += (kDs * albedo / kPi + spec_s) * radianceS * NdotLs;
+        }
+    }
+
+
     // --- Brouillard, AVANT le tone mapping ---
     // La couleur du brouillard EST le ciel dans la direction du regard, lu à un mip flou :
     // la géométrie lointaine se fond dans le ciel réellement derrière elle. Le fond étant

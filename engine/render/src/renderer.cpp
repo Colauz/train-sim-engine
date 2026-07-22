@@ -67,6 +67,12 @@ struct GpuFrameUniforms {
     // de 16 octets de toute façon, et vec3[9] désaligne silencieusement (même piège que
     // cascade_splits, qui n'est pas un float[]). Seul .rgb porte l'information.
     glm::vec4 sh[9];
+    // M21 : phares (2 spots) + paramètres de ciel. Miroir de FrameUniforms, cf.
+    // global_ubo.glsl (source de vérité unique du layout std140).
+    glm::vec4 spot_positions[2];
+    glm::vec4 spot_directions[2];
+    glm::vec4 spot_color;
+    glm::vec4 sky_params;
 };
 static_assert(kShadowCascades <= 4, "cascade_splits (vec4) ne porte que 4 distances");
 
@@ -3802,7 +3808,16 @@ void Renderer::draw_frame(const FrameUniforms& uniforms, const std::vector<DrawI
         gpu.light_view_proj[i] = shadow_cascades_[i].light_view_proj;
         gpu.cascade_splits[static_cast<glm::length_t>(i)] = shadow_cascades_[i].split_depth;
     }
+    // M21 : phares (spots) et paramètres de ciel. Ces champs sont dans GpuFrameUniforms et
+    // global_ubo.glsl depuis la conception de M21, mais la copie vers le GPU manquait.
+    for (std::size_t i = 0; i < 2; ++i) {
+        gpu.spot_positions[i]  = uniforms.spot_positions[i];
+        gpu.spot_directions[i] = uniforms.spot_directions[i];
+    }
+    gpu.spot_color = uniforms.spot_color;
+    gpu.sky_params = uniforms.sky_params;
     std::memcpy(uniform_buffers_[current_frame_].mapped, &gpu, sizeof(GpuFrameUniforms));
+
 
     // Glyphes du HUD : même slot, même fence, donc même garantie que l'UBO ci-dessus.
     const std::uint32_t glyph_count = upload_hud(hud);

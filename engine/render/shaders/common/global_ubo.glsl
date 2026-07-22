@@ -20,6 +20,13 @@ layout(set = 0, binding = 0) uniform GlobalUBO {
     // std140 un tableau a un stride de 16 octets quoi qu'il arrive — déclarer vec3[9]
     // désaligne tout silencieusement. Seul .rgb porte l'information.
     vec4 sh[9];
+    // M21 : phares du TGV (2 spots sans ombre). xyz + cos(demi-angle) en .w — cf.
+    // FrameUniforms (renderer.hpp) pour la sémantique exacte.
+    vec4 spotPositions[2];  // xyz = position RELATIVE CAMÉRA, w = cos(angle interne)
+    vec4 spotDirections[2]; // xyz = direction monde,          w = cos(angle externe)
+    vec4 spotColor;         // rgb = couleur x intensité, a = 1 allumés / 0 éteints
+    // x = facteur nuit (0 jour .. 1 nuit), y = couverture nuageuse, z = horloge nuages.
+    vec4 skyParams;
 } u;
 
 #endif  // NOIRE_GLOBAL_UBO_GLSL

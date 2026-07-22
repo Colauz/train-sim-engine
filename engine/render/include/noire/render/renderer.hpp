@@ -67,6 +67,21 @@ struct FrameUniforms {
     // Tout à zéro (défaut) = aucune ambiante image-based, ex. si le ciel est absent.
     std::array<glm::vec4, 9> sh{};
 
+    // --- Phares du TGV (M21) : 2 spots coniques, SANS ombre portée ---------------
+    // xyz = position RELATIVE CAMÉRA (les shaders travaillent en origine flottante :
+    // une position monde double ne tiendrait pas en float) ; .w = cos(demi-angle INTERNE).
+    std::array<glm::vec4, 2> spot_positions{};
+    // xyz = direction du faisceau (monde — invariante à la translation de l'origine) ;
+    // .w = cos(demi-angle EXTERNE). Entre .w et spot_positions[i].w : pénombre douce.
+    std::array<glm::vec4, 2> spot_directions{};
+    // rgb = couleur x intensité (même calibration que sun_color : irradiance = PI * rgb) ;
+    // .a = 1 phares allumés, 0 éteints (la touche L).
+    glm::vec4 spot_color{0.0f};
+    // Ciel (M21) : x = facteur nuit (0 = plein jour, 1 = nuit noire), y = couverture
+    // nuageuse 0..1, z = horloge de dérive des nuages (s). Lu par skybox.frag et par
+    // pbr.glsl (assombrissement du brouillard et de l'IBL spéculaire la nuit).
+    glm::vec4 sky_params{0.0f};
+
     // Pluie (M14) — champs CPU UNIQUEMENT : ils ne partent PAS dans l'UBO std140 (le
     // pipeline de pluie a son propre push constant), donc les ajouter ici ne touche pas
     // au miroir GpuFrameUniforms / global_ubo.glsl. `intensity` = wetness (0 => aucune
