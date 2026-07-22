@@ -488,6 +488,9 @@ struct Application::Impl {
     bool doors_opening = false;
     bool prev_p_down = false;
 
+    // --- Isolation KVB (M21.5) -----------------------------------------------
+    bool prev_k_down = false;
+
     WorldPosition prev_cam_world{};
     bool prev_cam_valid = false;
     std::chrono::steady_clock::time_point prev_render_time;
@@ -696,7 +699,7 @@ struct Application::Impl {
         engine.set_hooks(std::move(hooks));
 
         log::info("Commandes : Z/S (ou Flèches)=traction/frein, Espace=frein service, "
-                  "E=URGENCE, H=sifflet | L=phares, P=portes, R=pluie | "
+                  "E=URGENCE, H=sifflet, K=KVB isolé | L=phares, P=portes, R=pluie | "
                   "souris=orbite, Ctrl/Maj=zoom, Échap=quitter");
         return engine.initialize();
     }
@@ -743,6 +746,15 @@ struct Application::Impl {
             log::info("Portes : {}", doors_opening ? "OUVERTURE" : "FERMETURE");
         }
         prev_p_down = p_down;
+
+        // KVB isolation (M21.5) : touche K, front montant = bascule.
+        const bool k_down = window.is_key_down(Key::K);
+        if (k_down && !prev_k_down) {
+            const bool now_isolated = !consist.kvb_isolated();
+            consist.set_kvb_isolated(now_isolated);
+            log::info("KVB : {}", now_isolated ? "ISOLÉ (mode Arcade)" : "ACTIF");
+        }
+        prev_k_down = k_down;
         const float rate = static_cast<float>(dt) * 0.7f;
         wetness += glm::clamp(wetness_target - wetness, -rate, rate);
 
@@ -892,14 +904,18 @@ struct Application::Impl {
                                        static_cast<double>(wetness) * 100.0),
                            meteo_color);
         lines.emplace_back(std::format("{:>3.0f} FPS  GPU {:.1f} MS", perf_fps, perf_gpu_ms), label);
-        // KVB (M17) : témoin prioritaire — c'est LUI qui a déclenché l'urgence si actif.
-        if (consist.kvb_active()) {
+        // KVB (M17 + M21.5) : témoin prioritaire.
+        if (consist.kvb_isolated()) {
+            // Clignotement : sin(t*4) > 0 => visible 50% du temps, ~2 Hz.
+            // L'alpha oscille entre 0.3 et 1.0 pour un effet voyant sans disparaître.
+            const float blink = 0.65f + 0.35f * std::sin(static_cast<float>(sim_time) * 8.0f);
+            const glm::vec4 warn_color{0.95f, 0.80f, 0.15f, blink};
+            lines.emplace_back("KVB ISOLE", warn_color);
+        } else if (consist.kvb_active()) {
             lines.emplace_back("KVB URGENCE", alert);
         } else if (brake.emergency()) {
             lines.emplace_back("URGENCE", alert);
         } else if (wagon.slipping()) {
-            // À sec, seul le patinage à la TRACTION lève ce témoin (le freinage n'atteint
-            // jamais l'adhérence). Sous la pluie, l'enrayage d'un freinage d'urgence aussi.
             lines.emplace_back("PATINAGE", alert);
         }
 

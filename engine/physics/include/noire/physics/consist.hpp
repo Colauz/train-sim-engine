@@ -64,12 +64,17 @@ public:
     // Bogies Jacobs (0..N), pour les dessiner.
     [[nodiscard]] const std::vector<Bogie>& jacobs_bogies() const { return jacobs_; }
 
-    // --- KVB (M17) ------------------------------------------------------------
+    // --- KVB (M17 + M21.5) ----------------------------------------------------
     [[nodiscard]] const SpeedLimits& speed_limits() const { return limits_; }
     // Limite applicable à la position actuelle du train (km/h).
     [[nodiscard]] double current_limit_kmh() const { return current_limit_kmh_; }
     // true tant que le KVB force le freinage d'urgence (dépassement > marge, non résorbé).
     [[nodiscard]] bool kvb_active() const { return kvb_active_; }
+    // M21.5 : isolation manuelle du KVB (mode Arcade). Quand isolé, le KVB continue de
+    // surveiller (kvb_active_ se lève), mais il ne court-circuite PLUS la traction et ne
+    // force PLUS l'urgence. Le HUD affiche toujours la limite : le pilote sait qu'il triche.
+    void set_kvb_isolated(bool isolated) { kvb_isolated_ = isolated; }
+    [[nodiscard]] bool kvb_isolated() const { return kvb_isolated_; }
 
 private:
     // Trouve l'abscisse x telle que la distance d'ARC de x_ref à x (vers l'arrière) vaut
@@ -88,7 +93,7 @@ private:
     std::vector<CarBody> cars_;   // N
     double prev_velocity_ = 0.0;  // pour l'accélération longitudinale (tangage des voitures)
 
-    // --- KVB (M17) ---
+    // --- KVB (M17 + M21.5) ---
     SpeedLimits limits_;
     // Consigne du conducteur, en attente d'application (cf. set_controls).
     double throttle_cmd_ = 0.0;
@@ -97,6 +102,7 @@ private:
     // État courant du contrôle de vitesse.
     double current_limit_kmh_ = 320.0;
     bool kvb_active_ = false;
+    bool kvb_isolated_ = false;  // M21.5 : mode Arcade (isolation manuelle)
 };
 
 }  // namespace noire::physics

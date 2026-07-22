@@ -68,7 +68,7 @@ void Consist::place_at(double chainage) {
 }
 
 void Consist::update(double dt) {
-    // --- KVB (M17) : appliqué AVANT la physique de tête -----------------------
+    // --- KVB (M17 + M21.5) : appliqué AVANT la physique de tête ----------------
     // La limite courante est celle du bloc où se trouve le train (= le dernier panneau
     // franchi). Hystérésis : on ARME l'urgence dès qu'on dépasse la limite de plus de la
     // marge, et on ne la RELÂCHE qu'une fois revenu AU niveau de la limite — le conducteur
@@ -81,8 +81,12 @@ void Consist::update(double dt) {
         kvb_active_ = false;
     }
     // KVB actif => traction coupée + freinage d'urgence, quelle que soit la consigne.
-    const double throttle = kvb_active_ ? 0.0 : throttle_cmd_;
-    const bool emergency = emergency_cmd_ || kvb_active_;
+    // M21.5 : si le KVB est ISOLÉ (mode Arcade), la surveillance reste active (kvb_active_
+    // se lève normalement, le HUD l'affiche) mais l'enforcement est désactivé — la
+    // consigne du conducteur passe telle quelle.
+    const bool kvb_enforcing = kvb_active_ && !kvb_isolated_;
+    const double throttle = kvb_enforcing ? 0.0 : throttle_cmd_;
+    const bool emergency = emergency_cmd_ || kvb_enforcing;
     loco_.set_controls(throttle, brake_cmd_, emergency);
 
     loco_.update(dt);
