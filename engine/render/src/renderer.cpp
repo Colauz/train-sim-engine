@@ -207,13 +207,14 @@ bool Renderer::initialize(const RendererCreateInfo& info) {
     }
 
     pipeline_textured_ = build_textured_pipeline();
+    pipeline_textured_double_sided_ = build_textured_double_sided_pipeline();
     pipeline_terrain_ = build_terrain_pipeline();
     pipeline_foliage_ = build_foliage_pipeline();
     pipeline_wire_ = build_wire_pipeline();
     pipeline_transparent_ = build_transparent_pipeline();  // M22 : vitrage
-    if (pipeline_textured_ == VK_NULL_HANDLE || pipeline_terrain_ == VK_NULL_HANDLE ||
-        pipeline_foliage_ == VK_NULL_HANDLE || pipeline_wire_ == VK_NULL_HANDLE ||
-        pipeline_transparent_ == VK_NULL_HANDLE) {
+    if (pipeline_textured_ == VK_NULL_HANDLE || pipeline_textured_double_sided_ == VK_NULL_HANDLE ||
+        pipeline_terrain_ == VK_NULL_HANDLE || pipeline_foliage_ == VK_NULL_HANDLE ||
+        pipeline_wire_ == VK_NULL_HANDLE || pipeline_transparent_ == VK_NULL_HANDLE) {
         return false;
     }
     if (!create_default_textures() || !create_default_material() || !create_default_environment()) {
@@ -606,7 +607,7 @@ VkPipeline Renderer::build_pipeline(Topology topology) {
     VkPipelineRasterizationStateCreateInfo raster{};
     raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
     raster.polygonMode = VK_POLYGON_MODE_FILL;
-    raster.cullMode = VK_CULL_MODE_NONE;  // pas de culling au M2 (grille + cubes simples)
+    raster.cullMode = (topology == Topology::Triangles) ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
     raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     raster.lineWidth = 1.0f;
 
@@ -2393,18 +2394,24 @@ VkPipeline Renderer::build_terrain_pipeline() {
 
 VkPipeline Renderer::build_textured_pipeline() {
     return build_surface_pipeline(mesh_textured_frag_spv, mesh_textured_frag_spv_size,
-                                  textured_pipeline_layout_, false);
+                                  textured_pipeline_layout_, false, false);
+}
+
+VkPipeline Renderer::build_textured_double_sided_pipeline() {
+    return build_surface_pipeline(mesh_textured_frag_spv, mesh_textured_frag_spv_size,
+                                  textured_pipeline_layout_, false, true);
 }
 
 VkPipeline Renderer::build_transparent_pipeline() {
     // M22 : même shaders que le pipeline texturé, mais avec blending alpha et sans écriture
     // de profondeur — pour le vitrage semi-transparent (alphaMode BLEND).
     return build_surface_pipeline(mesh_textured_frag_spv, mesh_textured_frag_spv_size,
-                                  textured_pipeline_layout_, true);
+                                  textured_pipeline_layout_, true, true);
 }
 
 VkPipeline Renderer::build_surface_pipeline(const unsigned char* frag_spv, std::size_t frag_size,
-                                            VkPipelineLayout layout, bool transparent) {
+                                            VkPipelineLayout layout, bool transparent,
+                                            bool double_sided) {
     VkShaderModule vert = create_shader_module(mesh_textured_vert_spv, mesh_textured_vert_spv_size);
     VkShaderModule frag = create_shader_module(frag_spv, frag_size);
     if (vert == VK_NULL_HANDLE || frag == VK_NULL_HANDLE) {
@@ -2468,7 +2475,7 @@ VkPipeline Renderer::build_surface_pipeline(const unsigned char* frag_spv, std::
     VkPipelineRasterizationStateCreateInfo raster{};
     raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
     raster.polygonMode = VK_POLYGON_MODE_FILL;
-    raster.cullMode = VK_CULL_MODE_NONE;  // winding des modèles non garanti au M7 => pas de culling
+    raster.cullMode = (transparent || double_sided) ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT;  // M25 : culling des faces arrière pour les matériaux monoface
     raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     raster.lineWidth = 1.0f;
 
@@ -2702,6 +2709,7 @@ MaterialId Renderer::create_material(const MaterialDesc& desc) {
     material.pbr_factors = glm::vec4(desc.metallic_factor, desc.roughness_factor,
                                      desc.normal_scale, desc.foliage ? 1.0f : 0.0f);
     material.transparent = desc.transparent;
+    material.double_sided = desc.double_sided;
 
     VkDescriptorSetAllocateInfo alloc{};
     alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
@@ -3744,6 +3752,7 @@ void Renderer::record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
                     : terrain                         ? pipeline_terrain_
                     : instanced                       ? pipeline_foliage_
                     : material.transparent            ? pipeline_transparent_
+                    : material.double_sided           ? pipeline_textured_double_sided_
                                                       : pipeline_textured_;
                 const VkPipelineLayout layout =
                     terrain ? terrain_pipeline_layout_ : textured_pipeline_layout_;
@@ -3778,13 +3787,16 @@ void Renderer::record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
 
     // Passe 1 : opaques
     draw_item_list(opaque_items);
-    // Passe 2 : transparents (triés back-to-front)
-    draw_item_list(transparent_items);
 
-    // Le ciel EN DERNIER, volontairement : toute la géométrie a déjà écrit sa profondeur,
+    // Le ciel APRÈS l'opaque : toute la géométrie opaque a déjà écrit sa profondeur,
     // donc l'early-z rejette le ciel partout où elle est passée. Le dessiner en premier
-    // coûterait un fragment plein écran systématiquement.
+    // coûterait un fragment plein écran systématique.
     record_skybox(cmd);
+
+    // Passe 2 : transparents (triés back-to-front) APRÈS LE CIEL (M24) : le verre
+    // n'écrit pas de profondeur, donc un ciel dessiné après lui le repeindrait partout
+    // où aucun opaque ne s'est interposé — c'était le « bloc blanc » du pare-brise.
+    draw_item_list(transparent_items);
 
     // La pluie APRÈS le ciel (elle voile le monde et le ciel), mais AVANT le HUD (qui doit
     // rester net par-dessus). Toujours dans la même passe.
@@ -4001,6 +4013,10 @@ void Renderer::shutdown() {
     if (pipeline_textured_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(dev, pipeline_textured_, nullptr);
         pipeline_textured_ = VK_NULL_HANDLE;
+    }
+    if (pipeline_textured_double_sided_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(dev, pipeline_textured_double_sided_, nullptr);
+        pipeline_textured_double_sided_ = VK_NULL_HANDLE;
     }
     if (pipeline_terrain_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(dev, pipeline_terrain_, nullptr);

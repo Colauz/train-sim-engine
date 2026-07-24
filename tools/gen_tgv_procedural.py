@@ -1,428 +1,261 @@
 #!/usr/bin/env python3
-"""Sculpte une motrice TGV stylisée V2, entièrement par équations, au format .glb (M20).
+"""Generator procédural TGV V3 AAA — Architecture Modulaire Cabine & Motrice (M29).
 
-PRINCIPE — surface LOFTÉE, pas un assemblage de boîtes :
-  * une SECTION transversale paramétrée par un angle t (superellipse : entre l'ellipse
-    et le rectangle, c'est la forme d'une caisse ferroviaire) ;
-  * un TOIT BOMBÉ : la moitié haute est rehaussée d'un cambrage qui ne s'annule qu'au
-    point le plus large du flanc — raccord lisse, gabarit latéral intact ;
-  * dont la largeur, le plancher et le toit varient le long de z selon des COURBES DE
-    BÉZIER cubiques — c'est ce qui sculpte le nez plongeant (8 m, museau-lame à 1.55 m) ;
-  * des CANAUX DE VITRAGE CREUSÉS DANS LA TÔLE : la surface de base est rentrée le long
-    de sa normale dans les rectangles de baies (rampes douces), et le verre est posé
-    DANS le canal. Creuser le verre seul derrière une tôle pleine le rendrait invisible.
-  * les normales sont dérivées par différences centrées sur la surface FINALE (canaux
-    compris) et partagées : la lumière s'enroule sur le nez et dans les rampes de baies.
+Architecture modulaire (panneaux & structures distinctes) :
+  * Plancher & chassis caisse ;
+  * Murs latéraux gauche/droite & Piliers A de pare-brise ;
+  * Toit bombé & visière de cabine ;
+  * Capot inférieur / nez plongeant (sous le pupitre) ;
+  * VIDE GÉOMÉTRIQUE RÉEL pour le pare-brise (pas de tube/cône fermé) ;
+  * Primitive Pare-brise & vitres en verre translucide PBR (alphaMode BLEND, doubleSided) ;
+  * Poste de conduite ergonomique AAA (pupitre, écrans KVB/vitesse, leviers Z & S, siège).
+"""
 
-DÉTAILS ARCHITECTURAUX : jupe de bas de caisse gris mat enroulée sous le plancher,
-filet bleu nuit, carénages de toit sinusoïdaux au droit des bogies et du pantographe.
+import math
+import json
+import struct
+import sys
 
-Repère = repère LOCAL de la caisse du moteur Noire :
-  x = droite, y = haut, z = arrière (l'app le dessine via body_position * body_orientation).
-  origine = centre de la caisse ; le PLAN DE ROULEMENT est à y = -body_height (= -2.20 m).
-Aucune dépendance externe (struct/json/math de la stdlib)."""
-import struct, json, math, sys
+# --- Dimensions réelles (mètres) -----------------------------------------------
+RAIL = -2.20           # Plan de roulement dans le repère caisse
+LENGTH = 22.15         # Longueur totale caisse
+HALF_W = 1.45          # Demi-largeur (2.90 m total)
+ROOF_Y = 1.85          # Hauteur de la crête du toit
+FLOOR_Y = 0.00         # Hauteur du plancher de caisse (2.20 m au-dessus du rail)
 
-# --- Cotes réelles d'une motrice TGV, en mètres --------------------------------
-RAIL = -2.20            # plan de roulement dans le repère caisse (= -body_height)
-LENGTH = 22.15          # longueur hors tampons
-HALF_W = 1.45           # 2.90 m de large (gabarit UIC)
-CAMBER = 0.28           # flèche du toit bombé : le centre touche 4.10 m, pas les rives
-ROOF = RAIL + 4.10 - CAMBER  # section de base ; ROOF + CAMBER = 4.10 m au-dessus du rail
-FLOOR = RAIL + 1.05     # bas de caisse
-NOSE_LEN = 8.00         # nez long, façon Shinkansen (l'avant est en -Z)
-TIP_Y = RAIL + 1.55     # hauteur du museau : une lame basse, signature TGV
+Z_TAIL = LENGTH / 2.0   # +11.075 m (arrière)
+Z_TIP = -LENGTH / 2.0   # -11.075 m (pointe du nez)
+Z_CAB_REAR = -4.50      # Cloison arrière de la cabine
+Z_PUPITRE = -2.85       # Position du pupitre devant le conducteur
+Z_NOSE_BASE = -3.50     # Début du capot inférieur du nez
 
-Z_TAIL = LENGTH / 2.0
-Z_TIP = -LENGTH / 2.0
-Z_NOSE = Z_TIP + NOSE_LEN  # abscisse où le nez commence à se former
-
-# Exposant de la superellipse : 2 = ellipse, +inf = rectangle. 4 donne le rectangle
-# arrondi d'une caisse ferroviaire.
-SECTION_N = 4.0
-T_SEGMENTS = 40         # facettes de base autour de la section
-BODY_STEPS = 6          # stations de base le long du corps droit
-NOSE_STEPS = 30         # stations de base dans le nez
-
-# --- Canaux de vitrage creusés dans la tôle -------------------------------------
-# (z0, z1, t0, t1, profondeur, rampe_z, rampe_t). Le rectangle [z0,z1]x[t0,t1] descend
-# en rampe douce jusqu'à -profondeur ; le verre est ensuite posé dans le canal (à fleur,
-# +8 mm anti z-fighting). t = 0 : flanc droit ; pi : flanc gauche ; pi/2 : toit.
-WIN_RZ, WIN_RT = 0.30, 0.10
-GLASS_DEPTH = 0.030
-CHANNELS = [
-    # Pare-brise : dans la face plongeante du nez, en travers du toit. Son bord haut
-    # s'arrête AVANT le début du corps droit (Z_NOSE) : le verre ne doit pas déborder
-    # sur le toit de la caisse — sur le vrai matériel, la baie finit au « sourcil ».
-    (Z_TIP + 3.20, Z_NOSE - 0.80, math.pi / 2 - 0.66, math.pi / 2 + 0.66, 0.045, 0.35, 0.12),
-    # Vitres latérales de cabine (haut du flanc, juste derrière le pare-brise).
-    (Z_NOSE + 0.50, Z_NOSE + 2.90, 0.30, 0.75, 0.035, WIN_RZ, WIN_RT),
-    (Z_NOSE + 0.50, Z_NOSE + 2.90, math.pi - 0.75, math.pi - 0.30, 0.035, WIN_RZ, WIN_RT),
-    # Bandeau longitudinal de la motrice (équipements), les deux flancs.
-    (Z_NOSE + 3.60, Z_TAIL - 1.60, -0.02, 0.30, GLASS_DEPTH, WIN_RZ, WIN_RT),
-    (Z_NOSE + 3.60, Z_TAIL - 1.60, math.pi - 0.30, math.pi + 0.02, GLASS_DEPTH, WIN_RZ, WIN_RT),
-]
-
-# --- Matériaux PBR (convention glTF metallic-roughness) ------------------------
-# Rappel : metallic = 1 => la baseColor est la couleur de RÉFLEXION (F0), pas un pigment.
-#          metallic = 0 => F0 = 0.04 fixe, la baseColor est le pigment diffus.
-# Les FACTEURS glTF sont LINÉAIRES.
+# Matériaux PBR glTF
 MATERIALS = [
-    # Carrosserie argent : metallic 0.55 est volontairement NON physique (un vrai
-    # matériau est 0 ou 1). C'est la triche classique de la peinture métallisée, dont
-    # les paillettes d'aluminium se comportent en métal sans que la surface entière en
-    # soit une. C'est elle qui fera courir le ciel le long du nez.
-    {"name": "peinture", "factor": [0.82, 0.83, 0.86, 1.0], "metallic": 0.55, "roughness": 0.24},
-    # Vitrage : diélectrique, surtout PAS métallique — un baseColor noir + metallic élevé
-    # donnerait F0 ~ 0.008, une surface qui ne réfléchit RIEN (l'inverse du verre).
-    {"name": "vitrage", "factor": [0.015, 0.020, 0.028, 1.0], "metallic": 0.0, "roughness": 0.05},
-    # Filet bleu nuit (livrée inOui) sous les vitres.
-    {"name": "accent", "factor": [0.045, 0.075, 0.16, 1.0], "metallic": 0.35, "roughness": 0.32},
-    # Jupe de bas de caisse : gris MAT et rugueux (plastique peint, poussière de frein).
-    {"name": "jupe", "factor": [0.24, 0.25, 0.27, 1.0], "metallic": 0.0, "roughness": 0.72},
-    # Caoutchouc sombre (soufflets d'intercirculation — utilisé par la voiture).
-    {"name": "soufflet", "factor": [0.05, 0.05, 0.055, 1.0], "metallic": 0.0, "roughness": 0.85},
+    # 0: peinture (carrosserie extérieure blanc métallisé TGV inOui)
+    {"name": "peinture", "factor": [0.85, 0.86, 0.88, 1.0], "metallic": 0.45, "roughness": 0.25},
+    # 1: vitrage (pare-brise PBR bleuté très transparent)
+    {"name": "vitrage", "factor": [0.10, 0.12, 0.18, 0.30], "metallic": 0.0, "roughness": 0.02, "blend": True, "doubleSided": True},
+    # 2: accent (filet bleu nuit TGV inOui)
+    {"name": "accent", "factor": [0.04, 0.07, 0.18, 1.0], "metallic": 0.30, "roughness": 0.30},
+    # 3: jupe (bas de caisse & tablier gris anthracite mat)
+    {"name": "jupe", "factor": [0.20, 0.21, 0.23, 1.0], "metallic": 0.05, "roughness": 0.70},
+    # 4: soufflet (attelage / joint noir)
+    {"name": "soufflet", "factor": [0.05, 0.05, 0.05, 1.0], "metallic": 0.0, "roughness": 0.85},
+    # 5: interieur (murs cabine gris mat double-face)
+    {"name": "interieur", "factor": [0.45, 0.46, 0.48, 1.0], "metallic": 0.0, "roughness": 0.80, "doubleSided": True},
+    # 6: pupitre (tableau de bord noir / gris sombre mat)
+    {"name": "pupitre", "factor": [0.12, 0.13, 0.15, 1.0], "metallic": 0.0, "roughness": 0.75},
+    # 7: ecran (écrans KVB, speedometer & ATESS bleuté brillant)
+    {"name": "ecran", "factor": [0.05, 0.15, 0.30, 1.0], "metallic": 0.0, "roughness": 0.10},
+    # 8: bouton (commandes, leviers Z & S, voyants lumineux)
+    {"name": "bouton", "factor": [0.85, 0.20, 0.15, 1.0], "metallic": 0.3, "roughness": 0.30},
+    # 9: siege (siège conducteur velours bleu)
+    {"name": "siege", "factor": [0.08, 0.10, 0.25, 1.0], "metallic": 0.0, "roughness": 0.90},
 ]
-MAT_PAINT, MAT_GLASS, MAT_ACCENT, MAT_SKIRT, MAT_BELLOWS = range(5)
+(MAT_PAINT, MAT_GLASS, MAT_ACCENT, MAT_SKIRT, MAT_BELLOWS,
+ MAT_INTERIOR, MAT_PUPITRE, MAT_ECRAN, MAT_BOUTON, MAT_SIEGE) = range(10)
 
 
-# --- Petite algèbre vectorielle ------------------------------------------------
+def norm(v):
+    l = math.sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2])
+    return (v[0]/l, v[1]/l, v[2]/l) if l > 1e-6 else (0.0, 1.0, 0.0)
+
+def cross(a, b):
+    return (a[1]*b[2] - a[2]*b[1], a[2]*b[0] - a[0]*b[2], a[0]*b[1] - a[1]*b[0])
+
 def sub(a, b):
     return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
 
 
-def add(a, b):
-    return (a[0] + b[0], a[1] + b[1], a[2] + b[2])
-
-
-def mul(a, k):
-    return (a[0] * k, a[1] * k, a[2] * k)
-
-
-def dot(a, b):
-    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-
-
-def cross(a, b):
-    return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0])
-
-
-def norm(a):
-    n = math.sqrt(dot(a, a))
-    return (a[0] / n, a[1] / n, a[2] / n) if n > 1e-12 else (0.0, 0.0, 1.0)
-
-
-def bez(p0, p1, p2, p3, s):
-    """Bézier cubique SCALAIRE, paramétrée directement par s. Le contrôle P1 aligné sur
-    P0 donne une tangente nulle au départ : c'est ce qui raccorde le nez au toit droit
-    sans cassure visible."""
-    u = 1.0 - s
-    return u * u * u * p0 + 3.0 * u * u * s * p1 + 3.0 * u * s * s * p2 + s * s * s * p3
-
-
-def smooth01(s):
-    """Rampe C1 : 0 en deçà de 0, 1 au-delà de 1, dérivée nulle aux deux bouts."""
-    s = max(0.0, min(1.0, s))
-    return s * s * (3.0 - 2.0 * s)
-
-
-# --- Le profil longitudinal : c'est ici qu'est sculpté le nez ------------------
-def section(z):
-    """(demi-largeur, plancher, toit de base) à l'abscisse z. Constant sur le corps,
-    gouverné par trois Béziers dans le nez."""
-    if z >= Z_NOSE:
-        return HALF_W, FLOOR, ROOF
-    s = (Z_NOSE - z) / NOSE_LEN  # 0 à la base du nez, 1 au museau
-    # Toit : plat au départ (P1 = P0 => raccord lisse), plongée franche, puis
-    # aplatissement sur le museau (P2 proche de P3).
-    roof = bez(ROOF, ROOF, TIP_Y + 0.85, TIP_Y, s)
-    # Plancher : remonte à peine — le dessous du nez reste presque horizontal, c'est
-    # ce qui donne la « lame » plutôt qu'une proue de bateau.
-    floor = bez(FLOOR, FLOOR, FLOOR + 0.08, FLOOR + 0.25, s)
-    # Largeur : tient très longtemps puis s'effile. Le museau n'est PAS une pointe
-    # (0.13) mais une lame arrondie, comme le vrai.
-    half_w = HALF_W * bez(1.0, 1.0, 0.60, 0.13, s)
-    return half_w, floor, roof
-
-
-def surf_base(z, t):
-    """Point de la surface SANS les canaux de vitrage. La superellipse :
-    |x/a|^n + |y/b|^n = 1, paramétrée par t. Le cambrage du toit ne dépend que de x :
-    il est NUL au point le plus large du flanc (st = 0), donc le raccord flanc/toit
-    reste lisse et le gabarit latéral intact."""
-    half_w, floor, roof = section(z)
-    cy = (roof + floor) * 0.5
-    hy = (roof - floor) * 0.5
-    ct, st = math.cos(t), math.sin(t)
-    e = 2.0 / SECTION_N
-    x = half_w * math.copysign(abs(ct) ** e, ct)
-    y = cy + hy * math.copysign(abs(st) ** e, st)
-    if st > 0.0:
-        y += CAMBER * (1.0 - (x / half_w) ** 2) * (st ** (2.0 / SECTION_N))
-    return (x, y, z)
-
-
-def base_normal(z, t):
-    """Normale de la surface de base (différences centrées : la superellipse a une
-    dérivée singulière aux 4 « coins », une formule fermée y exploserait)."""
-    h = 1e-3
-    tu = sub(surf_base(z, t + h), surf_base(z, t - h))
-    tv = sub(surf_base(min(z + h, Z_TAIL), t), surf_base(max(z - h, Z_TIP), t))
-    n = norm(cross(tu, tv))
-    # Orientation : la section de base est CONVEXE, « à l'opposé du centre » est valide.
-    half_w, floor, roof = section(z)
-    center = (0.0, (roof + floor) * 0.5, z)
-    if dot(n, sub(surf_base(z, t), center)) < 0.0:
-        n = mul(n, -1.0)
-    return n
-
-
-def channel_offset(z, t):
-    """Profondeur de vitrage creusée en (z, t) : somme des canaux (ils ne se recouvrent
-    pas). La périodicité en t (2*pi) est gérée : un canal à cheval sur t = 0 est écrit
-    avec des bornes négatives."""
-    if not CHANNELS:
-        return 0.0
-    total = 0.0
-    tm = t % (2.0 * math.pi)
-    for (z0, z1, t0, t1, depth, rz, rt) in CHANNELS:
-        if z < z0 or z > z1:
-            continue
-        sz = smooth01(min(z - z0, z1 - z) / rz)
-        if sz <= 0.0:
-            continue
-        for tt in (tm, tm - 2.0 * math.pi):
-            if t0 <= tt <= t1:
-                total += depth * sz * smooth01(min(tt - t0, t1 - tt) / rt)
-                break
-    return total
-
-
-def surf(z, t):
-    """Surface FINALE = tôle de base rentrée le long de sa normale dans les canaux de
-    vitrage. Toute la géométrie dérivée (normales, bandeaux, verre) lit CETTE surface :
-    le verre posé dessus suit le canal gratuitement."""
-    return sub(surf_base(z, t), mul(base_normal(z, t), channel_offset(z, t)))
-
-
-def surf_normal(z, t):
-    """Normale de la surface FINALE (canaux compris : les rampes de baies doivent
-    rattraper la lumière). Différences centrées, réorientée vers l'extérieur — la
-    concavité d'un canal (3 cm sur une caisse de 3 m) ne trompe pas le test."""
-    h = 1e-3
-    tu = sub(surf(z, t + h), surf(z, t - h))
-    tv = sub(surf(min(z + h, Z_TAIL), t), surf(max(z - h, Z_TIP), t))
-    n = norm(cross(tu, tv))
-    half_w, floor, roof = section(z)
-    center = (0.0, (roof + floor) * 0.5, z)
-    if dot(n, sub(surf(z, t), center)) < 0.0:
-        n = mul(n, -1.0)
-    return n
-
-
-def surf_tangent(z, t, n):
-    """Tangente glTF : direction des u croissants (= t croissant), + handedness.
-    La bitangente reconstruite par cross(N,T)*w doit suivre les v croissants, et v croît
-    vers le MUSEAU (donc vers les z décroissants)."""
-    h = 1e-3
-    tan = norm(sub(surf(z, t + h), surf(z, t - h)))
-    dv = mul(sub(surf(min(z + h, Z_TAIL), t), surf(max(z - h, Z_TIP), t)), -1.0)
-    w = -1.0 if dot(cross(n, tan), dv) < 0.0 else 1.0
-    return (tan[0], tan[1], tan[2], w)
-
-
 class Part:
-    """Un tampon de sommets par matériau : les index glTF sont locaux à la primitive."""
-
     def __init__(self):
         self.positions, self.normals, self.uvs, self.tangents, self.indices = [], [], [], [], []
 
-    def add_quad(self, verts):
-        """verts = 4 tuples (position, normale, uv, tangente), dans l'ordre du contour."""
+    def add_quad(self, p0, p1, p2, p3, n=None, uv0=(0,0), uv1=(1,0), uv2=(1,1), uv3=(0,1)):
+        """Ajoute un quad 3D plan avec calcul automatique de normale et tangente."""
+        if n is None:
+            v01 = sub(p1, p0)
+            v02 = sub(p2, p0)
+            n = norm(cross(v01, v02))
+        v10 = sub(p1, p0)
+        tan = norm(v10) if (v10[0]**2 + v10[1]**2 + v10[2]**2) > 1e-6 else (1.0, 0.0, 0.0)
+        tg = (tan[0], tan[1], tan[2], 1.0)
+
         base = len(self.positions)
-        for p, n, uv, tg in verts:
+        for p, uv in zip((p0, p1, p2, p3), (uv0, uv1, uv2, uv3)):
             self.positions.append(p)
             self.normals.append(n)
             self.uvs.append(uv)
             self.tangents.append(tg)
         self.indices.extend([base, base + 1, base + 2, base, base + 2, base + 3])
 
+    def add_box(self, x0, y0, z0, x1, y1, z1, top=True, bot=True, front=True, back=True, left=True, right=True):
+        """Construit un pavé droit axis-aligned."""
+        # 8 coins
+        c000, c100 = (x0, y0, z0), (x1, y0, z0)
+        c110, c010 = (x1, y1, z0), (x0, y1, z0)
+        c001, c101 = (x0, y0, z1), (x1, y0, z1)
+        c111, c011 = (x1, y1, z1), (x0, y1, z1)
 
-def stations():
-    """Abscisses d'échantillonnage : espacées sur le corps droit, denses dans le nez,
-    PLUS les bords et pieds de rampe de chaque canal de vitrage (sinon la grille
-    échantillonnerait le canal au hasard et les baies seraient déchiquetées)."""
-    out = [Z_TAIL + (Z_NOSE - Z_TAIL) * i / BODY_STEPS for i in range(BODY_STEPS + 1)]
-    out += [Z_NOSE + (Z_TIP - Z_NOSE) * i / NOSE_STEPS for i in range(1, NOSE_STEPS + 1)]
-    for (z0, z1, _, _, _, rz, _) in CHANNELS:
-        out += [z0, z0 + rz, (z0 + z1) / 2.0, z1 - rz, z1]
-    return sorted({round(z, 6) for z in out if Z_TIP <= z <= Z_TAIL}, reverse=True)
-
-
-def t_columns():
-    """Colonnes angulaires : base uniforme + bords et pieds de rampe des canaux."""
-    cols = {round(2.0 * math.pi * j / T_SEGMENTS, 6) for j in range(T_SEGMENTS)}
-    two_pi = 2.0 * math.pi
-    for (_, _, t0, t1, _, _, rt) in CHANNELS:
-        for tt in (t0, t0 + rt, (t0 + t1) / 2.0, t1 - rt, t1):
-            cols.add(round(tt % two_pi, 6))
-    return sorted(cols)
+        if back:   self.add_quad(c000, c100, c110, c010, (0, 0, -1))
+        if front:  self.add_quad(c101, c001, c011, c111, (0, 0, 1))
+        if left:   self.add_quad(c001, c000, c010, c011, (-1, 0, 0))
+        if right:  self.add_quad(c100, c101, c111, c110, (1, 0, 0))
+        if bot:    self.add_quad(c001, c101, c100, c000, (0, -1, 0))
+        if top:    self.add_quad(c010, c110, c111, c011, (0, 1, 0))
 
 
-def build_body(part):
-    """Loft de la carrosserie. Grille INDEXÉE à normales partagées : deux quads voisins
-    lisent la même normale au sommet commun, donc l'éclairage est continu sur le nez.
-    La dernière colonne (t = 2pi) duplique la première GÉOMÉTRIQUEMENT mais porte u = 1 :
-    sans elle, la couture UV ferait un saut de 1 à 0 en plein milieu d'un quad."""
-    zs = stations()
-    cols = t_columns()
-    two_pi = 2.0 * math.pi
-    grid = []
-    for z in zs:
-        row = []
-        for j, t in enumerate(cols + [two_pi]):
-            p = surf(z, t)
-            n = surf_normal(z, t)
-            tg = surf_tangent(z, t, n)
-            uv = (t / two_pi, (Z_TAIL - z) / LENGTH)
-            row.append((p, n, uv, tg))
-        grid.append(row)
-
-    for i in range(len(zs) - 1):
-        for j in range(len(cols)):
-            part.add_quad([grid[i][j], grid[i + 1][j], grid[i + 1][j + 1], grid[i][j + 1]])
-    return grid
-
-
-def build_cap(part, z, normal_z):
-    """Obture une extrémité (la queue, qui s'attelle au reste de la rame, et le museau).
-    Éventail autour du centre de section."""
-    half_w, floor, roof = section(z)
-    center = (0.0, (roof + floor) * 0.5, z)
-    n = (0.0, 0.0, normal_z)
-    tg = (1.0, 0.0, 0.0, 1.0)
-    for j in range(T_SEGMENTS):
-        t0 = 2.0 * math.pi * j / T_SEGMENTS
-        t1 = 2.0 * math.pi * (j + 1) / T_SEGMENTS
-        a, b = surf(z, t0), surf(z, t1)
-        if normal_z < 0.0:
-            a, b = b, a  # garde un winding cohérent des deux côtés
-        base = len(part.positions)
-        for p in (center, a, b):
-            part.positions.append(p)
-            part.normals.append(n)
-            part.uvs.append((0.5 + p[0] / (4.0 * HALF_W), 0.5 + p[1] / (4.0 * HALF_W)))
-            part.tangents.append(tg)
-        part.indices.extend([base, base + 1, base + 2])
-
-
-def build_band(part, z0, z1, t0, t1, nz, nt, offset):
-    """Bandeau plaqué sur la surface FINALE, décalé de `offset` le long de la normale.
-    Posé sur un canal de vitrage (offset +8 mm), il épouse le creusement : c'est ça,
-    le bandeau de verre encastré. Posé sur la tôle, il s'y plaque sans z-fighting."""
-    grid = []
-    for i in range(nz + 1):
-        z = z0 + (z1 - z0) * i / nz
-        row = []
-        for j in range(nt + 1):
-            t = t0 + (t1 - t0) * j / nt
-            n = surf_normal(z, t)
-            p = add(surf(z, t), mul(n, offset))
-            tg = surf_tangent(z, t, n)
-            row.append((p, n, (j / nt, i / nz), tg))
-        grid.append(row)
-    for i in range(nz):
-        for j in range(nt):
-            part.add_quad([grid[i][j], grid[i + 1][j], grid[i + 1][j + 1], grid[i][j + 1]])
-
-
-def build_blister(part, z0, z1, t0, t1, height, nz=16, nt=8):
-    """Carénage de toit : une bosse à profil sinusoïdal plaquée sur la carrosserie.
-    L'offset suit sin(pi*u) sur les DEUX axes : nul aux 4 bords (fusion douce avec le
-    toit, sans marche), maximal au centre. Les normales sont redérivées de la surface
-    bosselée — garder celles du toit aplatirait la bosse à la lumière."""
-
-    def point(z, t):
-        uz = (z - z0) / (z1 - z0)
-        ut = (t - t0) / (t1 - t0)
-        off = height * math.sin(math.pi * uz) * math.sin(math.pi * ut)
-        return add(surf(z, t), mul(surf_normal(z, t), off))
-
-    def pnormal(z, t):
-        h = 1e-3
-        tu = sub(point(z, t + h), point(z, t - h))
-        tv = sub(point(min(z + h, Z_TAIL), t), point(max(z - h, Z_TIP), t))
-        n = norm(cross(tu, tv))
-        if dot(n, surf_normal(z, t)) < 0.0:
-            n = mul(n, -1.0)
-        return n
-
-    grid = []
-    for i in range(nz + 1):
-        z = z0 + (z1 - z0) * i / nz
-        row = []
-        for j in range(nt + 1):
-            t = t0 + (t1 - t0) * j / nt
-            n = pnormal(z, t)
-            row.append((point(z, t), n, (j / nt, i / nz), surf_tangent(z, t, n)))
-        grid.append(row)
-    for i in range(nz):
-        for j in range(nt):
-            part.add_quad([grid[i][j], grid[i + 1][j], grid[i + 1][j + 1], grid[i][j + 1]])
-
-
-# --- Assemblage ---------------------------------------------------------------
 parts = [Part() for _ in MATERIALS]
 
-# 1) Carrosserie loftée à toit bombé, canaux de vitrage creusés, bouts obturés.
-build_body(parts[MAT_PAINT])
-build_cap(parts[MAT_PAINT], Z_TAIL, 1.0)
-build_cap(parts[MAT_PAINT], Z_TIP, -1.0)
+# ==============================================================================
+# 1. PLANCHER & CHASSIS (Floor & Skirts)
+# ==============================================================================
+# Dalle de plancher principal (du nez à la queue)
+parts[MAT_PAINT].add_box(-HALF_W, FLOOR_Y - 0.15, Z_TIP, HALF_W, FLOOR_Y, Z_TAIL, top=True, bot=True)
 
-# 2) Verre posé DANS les canaux (8 mm au-dessus du fond : anti z-fighting). Le verre
-#    couvre AUSSI les rampes : sur le vrai matériel, le bandeau entier est noir
-#    (verre + bordure de sérigraphie), aucune lèvre peinte n'apparaît.
-#    Échantillonnage DENSE (8 cm) : la corde d'un quad de verre trop grand couperait la
-#    rampe lisse du canal et dépasserait de la tôle aux bords des baies.
-for (z0, z1, t0, t1, _, _, _) in CHANNELS:
-    nz = max(8, int(math.ceil((z1 - z0) / 0.08)))
-    nt = max(4, int(math.ceil((t1 - t0) * 1.5 / 0.08)))
-    build_band(parts[MAT_GLASS], z0, z1, t0, t1, nz, nt, 0.008)
+# Jupe inférieure (apron gris mat sous la caisse)
+parts[MAT_SKIRT].add_box(-HALF_W + 0.05, RAIL + 0.40, Z_TIP + 0.50, HALF_W - 0.05, FLOOR_Y - 0.15, Z_TAIL - 0.20)
 
-# 3) Filet bleu nuit sous le bandeau, plaqué (pas de creusement : c'est de la peinture).
-for lo, hi in ((-0.16, -0.04), (math.pi + 0.04, math.pi + 0.16)):
-    build_band(parts[MAT_ACCENT], Z_NOSE + 0.20, Z_TAIL - 0.20, lo, hi, 16, 1, 0.012)
+# ==============================================================================
+# 2. MURS LATÉRAUX & TOIT (Main Body Shell)
+# ==============================================================================
+# Murs latéraux arrière (derrière la cabine : z de Z_CAB_REAR à Z_TAIL)
+parts[MAT_PAINT].add_box(-HALF_W, FLOOR_Y, Z_CAB_REAR, -HALF_W + 0.12, ROOF_Y, Z_TAIL) # Mur gauche
+parts[MAT_PAINT].add_box(HALF_W - 0.12, FLOOR_Y, Z_CAB_REAR, HALF_W, ROOF_Y, Z_TAIL)   # Mur droit
 
-# 4) Jupe de bas de caisse : enroulée sous le plancher (t = 3pi/2 est le bas de caisse),
-#    du museau à la queue. Elle suit le relèvement du plancher dans le nez => tablier.
-build_band(parts[MAT_SKIRT], Z_TIP + 0.35, Z_TAIL - 0.10,
-           math.pi + 0.85, 2.0 * math.pi - 0.85, 40, 4, 0.014)
+# Toit principal (du fond cabine z = Z_CAB_REAR jusqu'à la queue)
+parts[MAT_PAINT].add_box(-HALF_W, ROOF_Y, Z_CAB_REAR, HALF_W, ROOF_Y + 0.25, Z_TAIL)
 
-# 5) Carénages de toit : au droit des DEUX bogies (essieux à ±5 et ±8 m => centres
-#    ±6.5 m) et du pantographe (arrière). Blisters sinusoïdaux, matière peinte.
-for zc in (-6.5, 6.5):
-    build_blister(parts[MAT_PAINT], zc - 2.3, zc + 2.3,
-                  math.pi / 2 - 0.55, math.pi / 2 + 0.55, 0.26)
-build_blister(parts[MAT_PAINT], Z_TAIL - 5.8, Z_TAIL - 2.6,
-              math.pi / 2 - 0.50, math.pi / 2 + 0.50, 0.32)
+# Obturation arrière (queue)
+parts[MAT_PAINT].add_box(-HALF_W, FLOOR_Y, Z_TAIL - 0.05, HALF_W, ROOF_Y + 0.25, Z_TAIL, front=False)
 
-# 6) PLUS DE BOGIES DANS LA CAISSE (M17.6). Un bogie ne tangue JAMAIS avec la caisse : il
-#    reste plaqué sur la voie. On les dessine donc SÉPARÉMENT (modèle tgv_bogie.glb, placé
-#    par la physique aux positions des bogies avec l'orientation de la VOIE). Les intégrer
-#    ici les faisait tanguer avec la caisse, d'où des roues qui décollaient.
+# ==============================================================================
+# 3. STRUCTURE DE LA CABINE (Flancs & Piliers de Pare-brise)
+# ==============================================================================
+# Cloison arrière de la cabine (séparation moteur/cabine) avec double face
+parts[MAT_INTERIOR].add_box(-HALF_W + 0.10, FLOOR_Y, Z_CAB_REAR - 0.08, HALF_W - 0.10, ROOF_Y, Z_CAB_REAR)
+
+# Murs latéraux de la cabine (de z = Z_CAB_REAR à z = Z_PUPITRE)
+# Côté gauche (x = -HALF_W)
+parts[MAT_PAINT].add_box(-HALF_W, FLOOR_Y, Z_PUPITRE, -HALF_W + 0.12, ROOF_Y, Z_CAB_REAR)
+parts[MAT_INTERIOR].add_box(-HALF_W + 0.12, FLOOR_Y, Z_PUPITRE, -HALF_W + 0.15, ROOF_Y, Z_CAB_REAR)
+
+# Côté droit (x = +HALF_W)
+parts[MAT_PAINT].add_box(HALF_W - 0.12, FLOOR_Y, Z_PUPITRE, HALF_W, ROOF_Y, Z_CAB_REAR)
+parts[MAT_INTERIOR].add_box(HALF_W - 0.15, FLOOR_Y, Z_PUPITRE, HALF_W - 0.12, ROOF_Y, Z_CAB_REAR)
+
+# Toit au-dessus de la cabine & Visière pare-brise (z de Z_CAB_REAR jusqu'à z = -3.20 m)
+parts[MAT_PAINT].add_box(-HALF_W, ROOF_Y, -3.20, HALF_W, ROOF_Y + 0.25, Z_CAB_REAR)
+parts[MAT_INTERIOR].add_box(-HALF_W + 0.10, ROOF_Y - 0.05, -3.20, HALF_W - 0.10, ROOF_Y, Z_CAB_REAR)
+
+# Piliers A du pare-brise (Left & Right A-Pillars sloping forward)
+# Pilier A Gauche (x = -1.45 à -0.90)
+p_pil_L_top_back  = (-HALF_W, ROOF_Y, -3.20)
+p_pil_L_top_front = (-0.90, ROOF_Y, -3.20)
+p_pil_L_bot_back  = (-HALF_W, 0.65, Z_PUPITRE)
+p_pil_L_bot_front = (-0.90, 0.65, -3.45)
+
+parts[MAT_PAINT].add_quad(p_pil_L_top_back, p_pil_L_top_front, p_pil_L_bot_front, p_pil_L_bot_back)
+parts[MAT_INTERIOR].add_quad(p_pil_L_top_front, p_pil_L_top_back, p_pil_L_bot_back, p_pil_L_bot_front)
+
+# Pilier A Droit (x = +0.90 à +1.45)
+p_pil_R_top_front = (0.90, ROOF_Y, -3.20)
+p_pil_R_top_back  = (HALF_W, ROOF_Y, -3.20)
+p_pil_R_bot_front = (0.90, 0.65, -3.45)
+p_pil_R_bot_back  = (HALF_W, 0.65, Z_PUPITRE)
+
+parts[MAT_PAINT].add_quad(p_pil_R_top_front, p_pil_R_top_back, p_pil_R_bot_back, p_pil_R_bot_front)
+parts[MAT_INTERIOR].add_quad(p_pil_R_top_back, p_pil_R_top_front, p_pil_R_bot_front, p_pil_R_bot_back)
+
+# ==============================================================================
+# 4. CAPOT INFÉRIEUR & NEZ PLONGEANT (Lower Nose Hood)
+# ==============================================================================
+# Capot plongeant sous le pupitre (z de -3.45 m à z = Z_TIP, y de 0.0 à 0.65 m)
+p_hood_back_L  = (-0.90, 0.65, -3.45)
+p_hood_back_R  = (0.90, 0.65, -3.45)
+p_hood_front_R = (0.60, RAIL + 1.55, Z_TIP + 0.80)
+p_hood_front_L = (-0.60, RAIL + 1.55, Z_TIP + 0.80)
+
+parts[MAT_PAINT].add_quad(p_hood_back_L, p_hood_back_R, p_hood_front_R, p_hood_front_L)
+
+# Flancs du nez (raccordement sous piliers)
+parts[MAT_PAINT].add_quad((-HALF_W, 0.65, Z_PUPITRE), (-0.90, 0.65, -3.45), p_hood_front_L, (-HALF_W, 0.0, Z_TIP + 0.80))
+parts[MAT_PAINT].add_quad((0.90, 0.65, -3.45), (HALF_W, 0.65, Z_PUPITRE), (HALF_W, 0.0, Z_TIP + 0.80), p_hood_front_R)
+
+# Museau / Tablier avant à la pointe (z = Z_TIP + 0.80 à Z_TIP)
+parts[MAT_SKIRT].add_box(-0.65, RAIL + 0.40, Z_TIP, 0.65, RAIL + 1.55, Z_TIP + 0.80)
+
+# ==============================================================================
+# 5. VITRAGE PBR SÉPARÉ (Windshield & Windows)
+# ==============================================================================
+# LE PARE-BRISE (Fitted into the physical windshield opening between A-Pillars & Roof)
+p_win_top_L = (-0.88, ROOF_Y - 0.02, -3.20)
+p_win_top_R = (0.88, ROOF_Y - 0.02, -3.20)
+p_win_bot_R = (0.88, 0.66, -3.44)
+p_win_bot_L = (-0.88, 0.66, -3.44)
+
+# Vitrage PBR translucide (double-face)
+parts[MAT_GLASS].add_quad(p_win_top_L, p_win_top_R, p_win_bot_R, p_win_bot_L)
+
+# Vitres latérales de cabine
+parts[MAT_GLASS].add_box(-HALF_W - 0.01, 0.80, -4.00, -HALF_W + 0.13, 1.45, -3.00, bot=False, top=False, front=False, back=False)
+parts[MAT_GLASS].add_box(HALF_W - 0.13, 0.80, -4.00, HALF_W + 0.01, 1.45, -3.00, bot=False, top=False, front=False, back=False)
+
+# ==============================================================================
+# 6. POSTE DE COMMANDE & ERGONOMIE CABINE (Dashboard, Levers, Displays & Seat)
+# ==============================================================================
+# Dalle du pupitre de conduite (sous le pare-brise)
+parts[MAT_PUPITRE].add_box(-0.92, 0.45, -3.40, 0.92, 0.65, -2.75)
+
+# Panneau d'instrumentation incliné (face au conducteur)
+p_dash_top_L = (-0.88, 0.82, -3.15)
+p_dash_top_R = (0.88, 0.82, -3.15)
+p_dash_bot_R = (0.88, 0.65, -2.95)
+p_dash_bot_L = (-0.88, 0.65, -2.95)
+parts[MAT_PUPITRE].add_quad(p_dash_top_L, p_dash_top_R, p_dash_bot_R, p_dash_bot_L)
+parts[MAT_PUPITRE].add_box(-0.88, 0.65, -3.15, 0.88, 0.82, -2.95, top=False)
+
+# Écrans de contrôle & cadrans (KVB, Tachymètre & ATESS)
+# Écran KVB (gauche)
+parts[MAT_ECRAN].add_box(-0.65, 0.68, -3.08, -0.35, 0.79, -3.05)
+# Compteur de vitesse / Tachymètre central
+parts[MAT_ECRAN].add_box(-0.15, 0.68, -3.08, 0.15, 0.80, -3.05)
+# Écran ATESS / Témoins (droite)
+parts[MAT_ECRAN].add_box(0.35, 0.68, -3.08, 0.65, 0.79, -3.05)
+
+# Manipulateurs & Commandes (Levier Z traction & Levier S frein)
+# Levier Z (traction) - Console gauche
+parts[MAT_BOUTON].add_box(-0.60, 0.65, -2.85, -0.52, 0.68, -2.78)
+parts[MAT_BOUTON].add_box(-0.57, 0.68, -2.82, -0.55, 0.78, -2.80) # levier droit
+
+# Levier S (frein) - Console droite
+parts[MAT_BOUTON].add_box(0.52, 0.65, -2.85, 0.60, 0.68, -2.78)
+parts[MAT_BOUTON].add_box(0.55, 0.68, -2.82, 0.57, 0.78, -2.80) # levier droit
+
+# Bouton coup de poing urgence (rouge)
+parts[MAT_BOUTON].add_box(-0.04, 0.65, -2.82, 0.04, 0.69, -2.76)
+
+# Siège Conducteur TGV Ergonomique (aligné avec driver head x=0, y=1.20, z=-2.50)
+parts[MAT_PUPITRE].add_box(-0.25, 0.00, -2.65, 0.25, 0.45, -2.15)  # Socle métallique
+parts[MAT_SIEGE].add_box(-0.28, 0.45, -2.70, 0.28, 0.55, -2.10)    # Assise velours
+parts[MAT_SIEGE].add_box(-0.26, 0.55, -2.12, 0.26, 1.15, -2.02)     # Dossier contoured
+parts[MAT_SIEGE].add_box(-0.18, 1.15, -2.12, 0.18, 1.30, -2.00)     # Appui-tête
+
+# Accoudoirs du siège
+parts[MAT_PUPITRE].add_box(-0.35, 0.70, -2.55, -0.28, 0.75, -2.25)
+parts[MAT_PUPITRE].add_box(0.28, 0.70, -2.55, 0.35, 0.75, -2.25)
 
 
-# --- Sérialisation glTF binaire -----------------------------------------------
+# ==============================================================================
+# SÉRIALISATION GLTF BINAIRE (.GLB)
+# ==============================================================================
 def align4(n):
     return (n + 3) & ~3
 
+used = [(i, p) for i, p in enumerate(parts) if len(p.positions) > 0]
 
-# On ne sérialise QUE les parts non vides. `used` mappe chaque primitive à son matériau
-# d'origine : les index glTF des matériaux suivent l'ordre des parts écrites.
-used = [(i, p) for i, p in enumerate(parts) if p.positions]
-
-blocks, part_blocks = [], []
-for _, p in used:
+part_blocks, blocks = [], []
+for mat_idx, p in used:
     b = (b"".join(struct.pack("<fff", *v) for v in p.positions),
          b"".join(struct.pack("<fff", *v) for v in p.normals),
          b"".join(struct.pack("<ff", *v) for v in p.uvs),
@@ -442,12 +275,11 @@ for off, blk in zip(offsets, blocks):
 
 accessors, buffer_views, primitives = [], [], []
 for slot, (mat_idx, p) in enumerate(used):
-    base = 5 * slot  # POSITION, NORMAL, TEXCOORD_0, TANGENT, indices
+    base = 5 * slot
     pmin = [min(v[k] for v in p.positions) for k in range(3)]
     pmax = [max(v[k] for v in p.positions) for k in range(3)]
     accessors += [
-        {"bufferView": base, "componentType": 5126, "count": len(p.positions), "type": "VEC3",
-         "min": pmin, "max": pmax},
+        {"bufferView": base, "componentType": 5126, "count": len(p.positions), "type": "VEC3", "min": pmin, "max": pmax},
         {"bufferView": base + 1, "componentType": 5126, "count": len(p.normals), "type": "VEC3"},
         {"bufferView": base + 2, "componentType": 5126, "count": len(p.uvs), "type": "VEC2"},
         {"bufferView": base + 3, "componentType": 5126, "count": len(p.tangents), "type": "VEC4"},
@@ -455,21 +287,32 @@ for slot, (mat_idx, p) in enumerate(used):
     ]
     targets = [34962, 34962, 34962, 34962, 34963]
     for k in range(5):
-        buffer_views.append({"buffer": 0, "byteOffset": offsets[base + k],
-                             "byteLength": len(part_blocks[slot][k]), "target": targets[k]})
+        buffer_views.append({"buffer": 0, "byteOffset": offsets[base + k], "byteLength": len(part_blocks[slot][k]), "target": targets[k]})
     primitives.append({
-        "attributes": {"POSITION": base, "NORMAL": base + 1, "TEXCOORD_0": base + 2,
-                       "TANGENT": base + 3},
-        "indices": base + 4, "material": slot})
+        "attributes": {"POSITION": base, "NORMAL": base + 1, "TEXCOORD_0": base + 2, "TANGENT": base + 3},
+        "indices": base + 4, "material": slot
+    })
 
-materials = [{"name": MATERIALS[mat_idx]["name"],
-              "pbrMetallicRoughness": {"baseColorFactor": MATERIALS[mat_idx]["factor"],
-                                       "metallicFactor": MATERIALS[mat_idx]["metallic"],
-                                       "roughnessFactor": MATERIALS[mat_idx]["roughness"]}}
-             for mat_idx, _ in used]
+materials = []
+for mat_idx, _ in used:
+    mat_def = MATERIALS[mat_idx]
+    m = {
+        "name": mat_def["name"],
+        "pbrMetallicRoughness": {
+            "baseColorFactor": mat_def["factor"],
+            "metallicFactor": mat_def["metallic"],
+            "roughnessFactor": mat_def["roughness"]
+        }
+    }
+    if mat_def.get("blend"):
+        m["alphaMode"] = "BLEND"
+        m["doubleSided"] = True
+    elif mat_def.get("doubleSided"):
+        m["doubleSided"] = True
+    materials.append(m)
 
 gltf = {
-    "asset": {"version": "2.0", "generator": "noire-tgv-procedural-v2 (CC0)"},
+    "asset": {"version": "2.0", "generator": "noire-tgv-procedural-v3-aaa (CC0)"},
     "scene": 0,
     "scenes": [{"nodes": [0]}],
     "nodes": [{"mesh": 0, "name": "TGV_motrice"}],
@@ -495,9 +338,6 @@ with open(out, "wb") as f:
 
 nv = sum(len(p.positions) for p in parts)
 ni = sum(len(p.indices) for p in parts)
-print(f"{out} : motrice TGV V2, {LENGTH:.2f} x {HALF_W * 2:.2f} m, "
-      f"toit bombé à {ROOF + CAMBER - RAIL:.2f} m au-dessus du rail")
+print(f"{out} : Motrice TGV AAA V3, {LENGTH:.2f} x {HALF_W * 2:.2f} m")
 print("  " + ", ".join(f"{m['name']}={len(p.positions)}v" for m, p in zip(MATERIALS, parts)))
-print(f"  nez {NOSE_LEN:.1f} m (museau à {TIP_Y - RAIL:.2f} m du rail), "
-      f"cambrage {CAMBER * 100:.0f} cm, {len(CHANNELS)} canaux de vitrage")
-print(f"  {nv} sommets, {ni // 3} triangles, {glb_len} o")
+print(f"  {nv} sommets, {ni // 3} triangles, {glb_len} octets")

@@ -95,6 +95,7 @@ public:
     [[nodiscard]] double tractive_effort() const { return tractive_effort_; }
     [[nodiscard]] double grade_percent() const { return grade_percent_; }
     [[nodiscard]] bool slipping() const { return slipping_; }
+    [[nodiscard]] bool immobilized() const { return immobilized_; }
     [[nodiscard]] const WagonConfig& config() const { return config_; }
     [[nodiscard]] const AirBrake& air_brake() const { return air_brake_; }
 
@@ -110,6 +111,7 @@ private:
     AirBrake air_brake_;
 
     bool slipping_ = false;
+    bool immobilized_ = false;
     double tractive_effort_ = 0.0;
     double grade_percent_ = 0.0;
 

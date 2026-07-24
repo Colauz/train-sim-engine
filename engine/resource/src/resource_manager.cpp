@@ -394,6 +394,7 @@ void ResourceManager::pump_models(int& budget) {
                 // alphaMode BLEND => transparence (vitrage) : pipeline alpha-blendé, sans
                 // écriture de profondeur, trié de loin vers la caméra.
                 desc.transparent = mat.alpha_blend;
+                desc.double_sided = mat.double_sided;
                 for (auto [image_index, out_id] :
                      {std::pair{mat.base_color_image, &desc.base_color},
                       std::pair{mat.metallic_roughness_image, &desc.metallic_roughness},
@@ -411,6 +412,8 @@ void ResourceManager::pump_models(int& budget) {
             Model& model = *slot.handle;
             model.primitives.clear();
             model.primitives.reserve(slot.cpu.primitives.size());
+            model.bounds_min = slot.cpu.bounds_min;
+            model.bounds_max = slot.cpu.bounds_max;
             for (const PrimitiveData& prim : slot.cpu.primitives) {
                 Model::Primitive out_prim;
                 out_prim.mesh = renderer_.create_mesh_indexed(prim.vertices, prim.indices);

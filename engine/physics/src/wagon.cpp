@@ -125,11 +125,23 @@ void Wagon::update(double dt) {
         velocity_ = std::min(0.0, velocity_ + dv);
     }
 
+    // M23 : Zero-Speed Clamp (fix sécurité portes). Si le freinage est actif et que la
+    // vitesse passe sous 0.1 m/s (~0.36 km/h), forcer la vitesse exactement à 0.0 m/s.
+    const bool brake_active = (air_brake_.pipe_pressure() < 4.95) || air_brake_.emergency() || (brake_force > 0.0);
+    if (brake_active && std::abs(velocity_) < 0.1) {
+        velocity_ = 0.0;
+        immobilized_ = true;
+    } else if (velocity_ == 0.0 && brake_active) {
+        immobilized_ = true;
+    } else {
+        immobilized_ = false;
+    }
+
     // --- Avance du chainage : dx = (v · dt) / (ds/dx). Aucune borne : voie infinie. ---
     const double rate = track_->arc_rate(chainage_);
     chainage_ += (velocity_ * dt) / rate;
 
-    const double longitudinal_accel = (velocity_ - v_before) / dt;
+    const double longitudinal_accel = immobilized_ ? 0.0 : (velocity_ - v_before) / dt;
 
     // --- Bogies placés à ± empattement/2 (converti en x via le taux d'arc) ---
     const double half = (config_.wheelbase * 0.5) / rate;

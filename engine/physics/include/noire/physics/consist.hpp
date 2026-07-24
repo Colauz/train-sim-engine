@@ -58,6 +58,7 @@ public:
     // --- Accès pour le rendu / le reste de l'app ------------------------------
     [[nodiscard]] Wagon& loco() { return loco_; }
     [[nodiscard]] const Wagon& loco() const { return loco_; }
+    [[nodiscard]] bool immobilized() const { return loco_.immobilized(); }
     [[nodiscard]] int car_count() const { return config_.car_count; }
     // Caisse d'une voiture voyageurs (0..N-1).
     [[nodiscard]] const CarBody& car(int i) const { return cars_[static_cast<std::size_t>(i)]; }

@@ -40,6 +40,8 @@ struct MaterialData {
     // glTF alphaMode == BLEND. Le matériau est semi-transparent (verre, vitrage...) :
     // il sera dessiné APRÈS les opaques, avec blending alpha et sans écriture de profondeur.
     bool alpha_blend = false;
+    // glTF doubleSided. Quand false (défaut glTF), le moteur élimine les faces arrière (Backface Culling).
+    bool double_sided = false;
 };
 
 // Cubemap d'environnement décodée (CPU), produite par le loader HDR sur un worker.
@@ -77,6 +79,11 @@ struct ModelData {
     std::vector<PrimitiveData> primitives;
     std::vector<ImageData> images;
     std::vector<MaterialData> materials;
+    // Boîte englobante du modèle (repère LOCAL glTF), accumulée sur les POSITIONS au
+    // chargement. Sert à ancrer des éléments procéduraux au modèle (ex. la caméra de
+    // cabine du M24) sans aucune cote codée en dur dans l'app.
+    glm::vec3 bounds_min{0.0f};
+    glm::vec3 bounds_max{0.0f};
     [[nodiscard]] bool valid() const { return !primitives.empty(); }
 };
 

@@ -51,6 +51,10 @@ struct Model {
     // Posé par le pump quand le chargement a ÉCHOUÉ (fichier absent, glTF illisible).
     // Permet à l'app de distinguer « en cours de chargement » de « n'arrivera jamais ».
     bool failed = false;
+    // Boîte englobante en repère LOCAL du modèle (M24) : ancre la caméra de cabine sans
+    // aucune cote codée en dur. Valable dès que `ready` est vrai.
+    glm::vec3 bounds_min{0.0f};
+    glm::vec3 bounds_max{0.0f};
     [[nodiscard]] bool empty() const { return primitives.empty(); }
 };
 

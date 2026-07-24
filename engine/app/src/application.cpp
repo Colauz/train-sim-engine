@@ -456,6 +456,16 @@ struct Application::Impl {
     // d'affichage : le Wagon est déterministe, et y injecter un intégrateur cadencé sur
     // le temps réel casserait la reproductibilité (le motif même qui a imposé NOIRE_PIN_CAM).
     double throttle_handle = 0.0;
+    // Caméra (M23) : Orbite (externe) ou Cabine (FPS poste de conduite), bascule sur C.
+    enum class CameraMode {
+        Orbit,
+        Cab
+    };
+    CameraMode camera_mode = CameraMode::Orbit;
+    bool prev_c_down = false;
+    float cab_yaw = 0.0f;
+    float cab_pitch = -0.18f;
+
     // Consignes relevées par update_input (variable), consommées par update_physics (fixe).
     bool key_throttle_up = false;
     bool key_throttle_down = false;
@@ -688,6 +698,7 @@ struct Application::Impl {
         // (km/h) reste le levier de banc pour partir lancé.
         const char* speed_env = std::getenv("NOIRE_SPEED");
         consist.set_speed(speed_env != nullptr ? std::atof(speed_env) / 3.6 : 20.0 / 3.6);
+        log::info("Commandes : Z/S (ou Flèches)=traction/frein, Espace=frein service, E=URGENCE, H=sifflet, K=KVB isolé | L=phares, P=portes, R=pluie, C=caméra (Cabine/Orbite) | souris=orbite/cabine, Ctrl/Maj=zoom, Échap=quitter");
         window.set_cursor_captured(true);
 
         EngineHooks hooks;
@@ -739,15 +750,15 @@ struct Application::Impl {
         }
         prev_l_down = l_down;
 
-        // Portes (M21 + M22) : touche P, front montant = bascule ouverture/fermeture.
-        // Sécurité M22 : interdiction d'ouvrir si |vitesse| > 0.01 m/s.
+        // Portes (M21 + M22 + M23) : touche P, front montant = bascule ouverture/fermeture.
+        // Sécurité M23 : interdiction d'ouvrir si non immobilisé (vitesse > 0.01 m/s sans clamp).
         const bool p_down = window.is_key_down(Key::P);
         if (p_down && !prev_p_down) {
-            if (doors_opening || std::abs(wagon.speed()) <= 0.01) {
+            if (doors_opening || consist.immobilized() || std::abs(wagon.speed()) <= 0.01) {
                 doors_opening = !doors_opening;
                 log::info("Portes : {}", doors_opening ? "OUVERTURE" : "FERMETURE");
             } else {
-                log::info("Portes : VERROUILLÉES (vitesse {:.2f} m/s > 0.01 m/s)", std::abs(wagon.speed()));
+                log::info("Portes : VERROUILLÉES (train non immobilisé)");
             }
         }
         prev_p_down = p_down;
@@ -760,6 +771,15 @@ struct Application::Impl {
             log::info("KVB : {}", now_isolated ? "ISOLÉ (mode Arcade)" : "ACTIF");
         }
         prev_k_down = k_down;
+
+        // Caméra (M23) : touche C, front montant = bascule entre Orbite (externe) et Cabine (FPS).
+        const bool c_down = window.is_key_down(Key::C);
+        if (c_down && !prev_c_down) {
+            camera_mode = (camera_mode == CameraMode::Orbit) ? CameraMode::Cab : CameraMode::Orbit;
+            log::info("Caméra : {}", camera_mode == CameraMode::Cab ? "CABINE (FPS)" : "EXTERNE (Orbite)");
+        }
+        prev_c_down = c_down;
+
         const float rate = static_cast<float>(dt) * 0.7f;
         wetness += glm::clamp(wetness_target - wetness, -rate, rate);
 
@@ -777,12 +797,19 @@ struct Application::Impl {
             return;
         }
         const platform::CursorDelta d = window.consume_cursor_delta();
-        orbit_yaw += static_cast<float>(d.dx) * 0.005f;
-        orbit_pitch = glm::clamp(orbit_pitch - static_cast<float>(d.dy) * 0.005f, -1.30f, 1.30f);
-        // Zoom déplacé sur Ctrl/Maj gauche : Espace est désormais le frein de service.
-        if (window.is_key_down(Key::LeftControl)) orbit_distance += static_cast<float>(25.0 * dt);
-        if (window.is_key_down(Key::LeftShift)) orbit_distance -= static_cast<float>(25.0 * dt);
-        orbit_distance = glm::clamp(orbit_distance, 12.0f, 200.0f);
+        if (camera_mode == CameraMode::Orbit) {
+            orbit_yaw += static_cast<float>(d.dx) * 0.005f;
+            orbit_pitch = glm::clamp(orbit_pitch - static_cast<float>(d.dy) * 0.005f, -1.30f, 1.30f);
+            // Zoom déplacé sur Ctrl/Maj gauche : Espace est désormais le frein de service.
+            if (window.is_key_down(Key::LeftControl)) orbit_distance += static_cast<float>(25.0 * dt);
+            if (window.is_key_down(Key::LeftShift)) orbit_distance -= static_cast<float>(25.0 * dt);
+            orbit_distance = glm::clamp(orbit_distance, 12.0f, 200.0f);
+        } else {
+            // Caméra Cabine FPS (M23) : orientation relative au poste de conduite
+            cab_yaw += static_cast<float>(d.dx) * 0.003f;
+            cab_pitch = glm::clamp(cab_pitch - static_cast<float>(d.dy) * 0.003f, -0.75f, 0.75f);
+            cab_yaw = glm::clamp(cab_yaw, -1.50f, 1.50f);
+        }
     }
 
     void update_physics(double dt) {
@@ -909,6 +936,12 @@ struct Application::Impl {
                                        static_cast<double>(wetness) * 100.0),
                            meteo_color);
         lines.emplace_back(std::format("{:>3.0f} FPS  GPU {:.1f} MS", perf_fps, perf_gpu_ms), label);
+        // M23 : Témoin vert d'immobilisation complète (clamp zéro vitesse + frein actif)
+        const glm::vec4 green_notice{0.15f, 0.90f, 0.25f, 1.0f};
+        if (consist.immobilized()) {
+            lines.emplace_back("IMMOBILISE", green_notice);
+        }
+
         // KVB (M17 + M21.5) : témoin prioritaire.
         if (consist.kvb_isolated()) {
             // Clignotement : sin(t*4) > 0 => visible 50% du temps, ~2 Hz.
@@ -1268,21 +1301,52 @@ struct Application::Impl {
             }
         }
 
-        // Caméra orbitale qui suit le wagon.
-        const WorldPosition target = wagon.body_position();
-        const glm::vec3 dir(std::cos(orbit_yaw) * std::cos(orbit_pitch), std::sin(orbit_pitch),
-                            std::sin(orbit_yaw) * std::cos(orbit_pitch));
-        WorldPosition cam_world = target + WorldPosition(dir) * static_cast<double>(orbit_distance);
-        // NOIRE_CREEP : la caméra avance d'un pas fixe PAR PRÉSENTATION. Couplé à
-        // NOIRE_STILL, la scène à la frame N est rigoureusement la même d'un lancement à
-        // l'autre (vérifié : 0.0000/255 d'écart sur le sol). Sans ça, deux runs aux réglages
-        // IDENTIQUES donnaient 10,10 % et 19,43 % — le bruit dépassait le signal.
-        static const char* creep = std::getenv("NOIRE_CREEP");
-        if (creep != nullptr) {
-            cam_world.x += std::atof(creep) * static_cast<double>(present_index);
+        WorldPosition cam_world{0.0, 0.0, 0.0};
+        glm::mat4 view_mat{1.0f};
+
+        if (camera_mode == CameraMode::Orbit) {
+            camera.near_plane = 0.1f;
+            // Caméra orbitale qui suit le wagon.
+            const WorldPosition target = wagon.body_position();
+            const glm::vec3 dir(std::cos(orbit_yaw) * std::cos(orbit_pitch), std::sin(orbit_pitch),
+                                std::sin(orbit_yaw) * std::cos(orbit_pitch));
+            cam_world = target + WorldPosition(dir) * static_cast<double>(orbit_distance);
+            static const char* creep = std::getenv("NOIRE_CREEP");
+            if (creep != nullptr) {
+                cam_world.x += std::atof(creep) * static_cast<double>(present_index);
+            }
+            camera.set_position(cam_world);
+            camera.look_at(target);
+            view_mat = camera.view_matrix();
+        } else {
+            // Caméra Cabine FPS (M29 - Reboot TGV AAA) : vue dégagée à travers le pare-brise PBR.
+            // near_plane réglé à 0.10 m par défaut (surchargeable via NOIRE_CAM_NEAR ou NOIRE_CAB_ZNEAR).
+            static const char* env_near1 = std::getenv("NOIRE_CAM_NEAR");
+            static const char* env_near2 = std::getenv("NOIRE_CAB_ZNEAR");
+            const char* env_znear = (env_near1 != nullptr) ? env_near1 : env_near2;
+            camera.near_plane = (env_znear != nullptr) ? static_cast<float>(std::atof(env_znear)) : 0.10f;
+
+            static const char* env_x = std::getenv("NOIRE_CAM_X");
+            static const char* env_y = std::getenv("NOIRE_CAM_Y");
+            static const char* env_z = std::getenv("NOIRE_CAM_Z");
+
+            const float cam_x = (env_x != nullptr) ? static_cast<float>(std::atof(env_x)) : 0.0f;
+            const float cam_y = (env_y != nullptr) ? static_cast<float>(std::atof(env_y)) : 1.20f;
+            const float cam_z = (env_z != nullptr) ? static_cast<float>(std::atof(env_z)) : -2.50f;
+            const glm::vec3 driver_head_local{cam_x, cam_y, cam_z};
+
+            const glm::mat4 loco_ori = wagon.body_orientation();
+            const glm::vec3 head_world_offset = glm::vec3(loco_ori * glm::vec4(driver_head_local, 1.0f));
+            cam_world = wagon.body_position() + WorldPosition(head_world_offset);
+            camera.set_position(cam_world);
+
+            const float cos_p = std::cos(cab_pitch);
+            const glm::vec3 local_dir(std::sin(cab_yaw) * cos_p, std::sin(cab_pitch), -std::cos(cab_yaw) * cos_p);
+            const glm::vec3 world_dir = glm::vec3(loco_ori * glm::vec4(local_dir, 0.0f));
+            const glm::vec3 world_up  = glm::vec3(loco_ori * glm::vec4(0.0f, 1.0f, 0.0f, 0.0f));
+            view_mat = glm::lookAt(glm::vec3(0.0f), world_dir, world_up);
+            camera.look_at(cam_world + WorldPosition(world_dir));
         }
-        camera.set_position(cam_world);
-        camera.look_at(target);
 
         // Listener audio = caméra ; vitesse par différence finie (pour le Doppler).
         glm::vec3 cam_velocity(0.0f);
@@ -1296,7 +1360,7 @@ struct Application::Impl {
         // Uniforms globaux : caméra + météo.
         const float aspect = static_cast<float>(size.width) / static_cast<float>(size.height);
         render::FrameUniforms uniforms;
-        uniforms.view = camera.view_matrix();
+        uniforms.view = view_mat;
         // Ancre le snap des cascades sur le monde (cf. update_shadow_cascades).
         uniforms.camera_world_position = camera.position();
         uniforms.proj = camera.projection_matrix(aspect);
@@ -1494,8 +1558,8 @@ struct Application::Impl {
                                     kBogieTransform.matrix();
                 const auto& prims = jacobs_bogie_model->primitives;
                 const int n_prims = static_cast<int>(prims.size());
-                const int body_count = (n_prims >= 2) ? n_prims - 2 : n_prims;
-                for (int j = 0; j < body_count; ++j) {
+                const auto body_count = static_cast<std::size_t>((n_prims >= 2) ? n_prims - 2 : n_prims);
+                for (std::size_t j = 0; j < body_count; ++j) {
                     const render::MaterialId mat = prims[j].material ? prims[j].material->id : 0;
                     items.push_back(render::DrawItem{m, prims[j].mesh, mat});
                 }
@@ -1586,8 +1650,8 @@ struct Application::Impl {
                                     kBogieTransform.matrix();
                 const auto& prims = jacobs_bogie_model->primitives;
                 const int n_prims = static_cast<int>(prims.size());
-                const int body_count = (n_prims >= 2) ? n_prims - 2 : n_prims;
-                for (int j = 0; j < body_count; ++j) {
+                const auto body_count = static_cast<std::size_t>((n_prims >= 2) ? n_prims - 2 : n_prims);
+                for (std::size_t j = 0; j < body_count; ++j) {
                     const render::MaterialId mat = prims[j].material ? prims[j].material->id : 0;
                     items.push_back(render::DrawItem{m, prims[j].mesh, mat});
                 }

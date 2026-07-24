@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <map>
 #include <string>
 #include <unordered_map>
@@ -107,6 +108,7 @@ int resolve_material(const cgltf_material* material, const std::string& gltf_dir
     MaterialData data;
     data.alpha_mask = material->alpha_mode == cgltf_alpha_mode_mask;
     data.alpha_blend = material->alpha_mode == cgltf_alpha_mode_blend;
+    data.double_sided = material->double_sided != 0;
     if (material->has_pbr_metallic_roughness) {
         const cgltf_pbr_metallic_roughness& pbr = material->pbr_metallic_roughness;
         data.base_color_factor =
@@ -236,6 +238,10 @@ bool load_gltf(const std::string& path, ModelData& out) {
     MaterialCache material_cache;
     int generated_tangents = 0;
 
+    // Boîte englobante (M24) : initialisée à l'infini, resserrée par chaque POSITION.
+    out.bounds_min = glm::vec3(std::numeric_limits<float>::max());
+    out.bounds_max = glm::vec3(std::numeric_limits<float>::lowest());
+
     int skipped = 0;
     for (cgltf_size m = 0; m < data->meshes_count; ++m) {
         const cgltf_mesh& mesh = data->meshes[m];
@@ -280,6 +286,9 @@ bool load_gltf(const std::string& path, ModelData& out) {
                 cgltf_float tmp[4] = {0.0f, 0.0f, 0.0f, 0.0f};
                 cgltf_accessor_read_float(pos, i, tmp, 3);
                 vertex.position = glm::vec3(tmp[0], tmp[1], tmp[2]);
+                // Boîte englobante du modèle (M24) : accumulée sur chaque POSITION lue.
+                out.bounds_min = glm::min(out.bounds_min, vertex.position);
+                out.bounds_max = glm::max(out.bounds_max, vertex.position);
                 if (nrm != nullptr) {
                     cgltf_accessor_read_float(nrm, i, tmp, 3);
                     vertex.normal = glm::vec3(tmp[0], tmp[1], tmp[2]);

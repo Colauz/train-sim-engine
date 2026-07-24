@@ -26,8 +26,10 @@ layout(location = 0) out vec4 outColor;
 
 void main() {
     // Convention glTF : facteur * texture. Sans texture, le secours 1x1 laisse le facteur
-    // seul décider (ex. le gris acier des rails).
-    vec3 albedo = texture(baseColorMap, fragUV).rgb * object.baseColorFactor.rgb;
+    // seul décider (ex. le gris acier des rails, ou l'alpha 0.35 du verre PBR).
+    vec4 baseColor = texture(baseColorMap, fragUV) * object.baseColorFactor;
+    vec3 albedo = baseColor.rgb;
+    float alpha = baseColor.a;
     vec3 mr = texture(metallicRoughnessMap, fragUV).rgb;  // G = roughness, B = metallic
     float metallic = clamp(mr.b * object.pbrFactors.x, 0.0, 1.0);
     float roughness = clamp(mr.g * object.pbrFactors.y, kMinRoughness, 1.0);
@@ -35,5 +37,5 @@ void main() {
     vec3 N = shadingNormal(fragNormal, fragTangent, texture(normalMap, fragUV).rgb,
                            object.pbrFactors.z);
 
-    outColor = vec4(shadeSurface(albedo, metallic, roughness, N, cameraRelPos), 1.0);
+    outColor = vec4(shadeSurface(albedo, metallic, roughness, N, cameraRelPos), alpha);
 }

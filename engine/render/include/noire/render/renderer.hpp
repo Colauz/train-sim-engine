@@ -123,6 +123,8 @@ struct MaterialDesc {
     // Matériau semi-transparent (vitrage, verre) : alphaMode BLEND. Dessiné APRÈS les
     // opaques, blending alpha src/one-minus-src, sans écriture de profondeur.
     bool transparent = false;
+    // glTF doubleSided. Quand false, culling des faces arrière (VK_CULL_MODE_BACK_BIT).
+    bool double_sided = false;
 };
 
 // Matériau de terrain : deux jeux PBR complets (M11 phase 2). Chaque texture peut valoir
@@ -317,6 +319,7 @@ private:
         bool written = false;
         // M22 : matériau semi-transparent (vitrage). Dessiné par pipeline_transparent_.
         bool transparent = false;
+        bool double_sided = false;
     };
 
     // Environnement GPU (M8 étape 6a) : la cubemap HDR du ciel + son descriptor set.
@@ -466,11 +469,13 @@ private:
 
     VkPipeline build_pipeline(Topology topology);
     VkPipeline build_textured_pipeline();
+    VkPipeline build_textured_double_sided_pipeline();
     VkPipeline build_transparent_pipeline();  // M22 : vitrage alpha-blendé
     // Fabrique commune : même vertex (MeshVertex), fragment et layout paramétrés.
     // transparent = true : blend alpha src/one-minus-src, depth-write off, double face.
     VkPipeline build_surface_pipeline(const unsigned char* frag_spv, std::size_t frag_size,
-                                      VkPipelineLayout layout, bool transparent = false);
+                                      VkPipelineLayout layout, bool transparent = false,
+                                      bool double_sided = false);
     VkShaderModule create_shader_module(const unsigned char* code, std::size_t size);
     void record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
                          const std::vector<DrawItem>& items, std::uint32_t glyph_count,
@@ -498,6 +503,7 @@ private:
     VkDescriptorPool material_pool_ = VK_NULL_HANDLE;
     VkPipelineLayout textured_pipeline_layout_ = VK_NULL_HANDLE;  // set0 + set1
     VkPipeline pipeline_textured_ = VK_NULL_HANDLE;               // MeshVertex + matériau
+    VkPipeline pipeline_textured_double_sided_ = VK_NULL_HANDLE;  // double face opaque
     VkDescriptorSetLayout terrain_set_layout_ = VK_NULL_HANDLE;   // set=1 (6 bindings)
     VkPipelineLayout terrain_pipeline_layout_ = VK_NULL_HANDLE;
     VkPipeline pipeline_terrain_ = VK_NULL_HANDLE;

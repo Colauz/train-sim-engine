@@ -66,13 +66,12 @@ CHANNELS = [
 # --- Matériaux PBR (identiques à la motrice, + roue/bogie pour le Jacobs) -------
 MATERIALS = [
     {"name": "peinture", "factor": [0.82, 0.83, 0.86, 1.0], "metallic": 0.55, "roughness": 0.24},
-    # Vitrage (M22) : VERRE, plus du noir opaque. alphaMode BLEND (clé "blend" =>
-    # write_glb émet alphaMode/doubleSided) : le moteur le trie avec les autres
-    # transparents, de loin vers la caméra, SANS écriture de profondeur. Teinte très
-    # sombre + alpha 0.35 : on voit les sièges en transparence, le reflet du ciel
-    # (roughness 0.05) reste dominant, comme sur le vrai bandeau.
-    {"name": "vitrage", "factor": [0.06, 0.08, 0.11, 0.35], "metallic": 0.0,
-     "roughness": 0.05, "blend": True},
+    # Vitrage (M24) : VERRE PBR strict — baseColor [0.05,0.05,0.05], alpha 0.2, lisse
+    # (roughness 0.02), diélectrique (metallic 0). alphaMode BLEND + doubleSided (clé
+    # "blend" => write_glb les émet) : le moteur le dessine APRÈS les opaques et le ciel,
+    # trié back-to-front, sans écriture de profondeur.
+    {"name": "vitrage", "factor": [0.05, 0.05, 0.05, 0.20], "metallic": 0.0,
+     "roughness": 0.02, "blend": True},
     {"name": "accent", "factor": [0.045, 0.075, 0.16, 1.0], "metallic": 0.35, "roughness": 0.32},
     {"name": "jupe", "factor": [0.24, 0.25, 0.27, 1.0], "metallic": 0.0, "roughness": 0.72},
     {"name": "soufflet", "factor": [0.05, 0.05, 0.055, 1.0], "metallic": 0.0, "roughness": 0.85},
