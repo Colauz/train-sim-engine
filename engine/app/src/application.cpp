@@ -38,34 +38,25 @@ namespace {
 
 constexpr WorldPosition kTrackOrigin{1000000.0, 0.0, 1000000.0};
 
-// Rame TGV (M13). Chiffres calés sur un TGV Duplex, et cohérents entre eux — c'est cette
-// cohérence, pas chaque valeur prise isolément, qui fait la conduite.
-//
-// DEUX ÉCHELLES, UN SEUL CORPS — à savoir avant de toucher à quoi que ce soit ici : le
-// maillage visible est UNE motrice (d'où wheelbase = 14 m), mais la physique simule la
-// RAME ENTIÈRE (400 t, 200 m). `wheelbase` sert donc la géométrie visible, et
-// `train_length` (frein pneumatique) la longueur réelle. Les deux ne se contredisent pas,
-// elles ne parlent simplement pas du même objet.
-physics::WagonConfig make_tgv_config() {
+// Rame de métro japonais (M30 — pivot E235). Chiffres calés sur une rame de
+// banlieue de Tokyo (type E235, 3 voitures simulées ici), et cohérents entre eux.
+physics::WagonConfig make_metro_config() {
     physics::WagonConfig c;
-    c.mass = 400000.0;  // rame complète en charge
-    // 2 motrices x 68 t. Le reste de la rame est REMORQUÉ : ces 136 t sont tout ce qui
-    // tient le rail en traction. Voir WagonConfig::adhesive_mass.
-    c.adhesive_mass = 136000.0;
+    c.mass = 96000.0;  // 3 voitures x ~32 t en charge
+    // Rame de métro : la grande majorité des essieux est moteur => la masse
+    // adhérente vaut la masse totale (0 = défaut, tous essieux moteurs).
+    c.adhesive_mass = 0.0;
     c.wheelbase = 14.0;
-    c.max_tractive_effort = 220000.0;  // effort au démarrage
-    // 8800 kW à la jante => vitesse de base = 8.8e6 / 220e3 = 40 m/s = 144 km/h. Au-delà,
-    // l'effort s'effondre en P/v : à 320 km/h il ne reste que 99 kN.
-    c.max_power = 8800000.0;
-    c.max_brake_force = 300000.0;  // service maximal => 0,75 m/s²
-    // Davis calé pour que R(320 km/h) = 74 kN, soit 6,6 MW en croisière sur les 8,8
-    // disponibles : la réserve de puissance est réaliste, et l'équilibre P/v = R tombe
-    // vers 98 m/s (354 km/h). 320 est donc atteignable, mais pas gratuit.
-    c.davis_a = 3000.0;
-    c.davis_b = 90.0;
-    c.davis_c = 8.0;  // traînée aéro : 63 kN des 74 kN à 320 km/h
-    // Le tangage n'est plus réglé ici (M17.6) : il naît du transfert de charge entre les deux
-    // appuis (CarBodyConfig::pitch_transfer), ce qui interdit à la caisse de quitter ses bogies.
+    // Accélération de service ~0,9 m/s² au démarrage (E235 : 3,0 km/h/s).
+    c.max_tractive_effort = 90000.0;
+    // 1900 kW à la jante => vitesse de base = 1.9e6 / 9e4 = 21 m/s = 76 km/h.
+    // Au-delà, l'effort s'effondre en P/v — à 110 km/h il ne reste que 62 kN.
+    c.max_power = 1900000.0;
+    c.max_brake_force = 100000.0;  // service maximal => ~1,0 m/s²
+    // Davis d'une boîte à roulettes : traînée modeste à 110 km/h, roulage dominant.
+    c.davis_a = 600.0;
+    c.davis_b = 20.0;
+    c.davis_c = 2.5;
     return c;
 }
 
@@ -95,7 +86,7 @@ std::vector<render::Vertex> make_box_vertices(const glm::vec3& base_color) {
 }
 
 // Ajoute une boîte orientée-axes (24 sommets, 6 faces à normales propres) au format
-// MeshVertex — pour la géométrie PBR construite en code (les panneaux KVB du M17). Chaque
+// MeshVertex — pour la géométrie PBR construite en code (les signaux ATS du M30). Chaque
 // face porte sa propre normale et une tangente dans son plan : arêtes franches, éclairage
 // correct.
 void append_box(std::vector<render::MeshVertex>& verts, std::vector<std::uint32_t>& indices,
@@ -187,7 +178,7 @@ struct ModelTransform {
     }
 };
 
-// Calibrage de la motrice (tools/gen_tgv_procedural.py). Le modèle est généré DANS le
+// Calibrage de la motrice (tools/gen_metro.py). Le modèle est généré DANS le
 // repère caisse et en mètres : échelle 1, rotation nulle.
 // offset_y = 0 : le script pose le bas des roues exactement sur y = -2.20 = -body_height,
 // c'est-à-dire sur le plan de roulement (vérifié : bbox acier y[-2.20, -1.15]). Un modèle
@@ -266,14 +257,18 @@ struct Application::Impl {
           engine(EngineConfig{config.simulation_hz, 0}),
           track(kTrackOrigin),
           terrain(track),
-          consist(make_tgv_config(), make_consist_config()),
+          consist(make_metro_config(), make_consist_config()),
           streamer(track, jobs, make_streamer_config()),
           clipmap(terrain, jobs, make_clipmap_config()),
           resources(renderer, jobs, asset_paths) {}
 
     static physics::ConsistConfig make_consist_config() {
         physics::ConsistConfig cc;
-        cc.car_count = 2;  // N=2 voitures pour valider la cinématique (le jalon le demande)
+        cc.car_count = 2;              // motrice + 2 voitures (rame de 3)
+        cc.loco_half_length = 10.0;    // voiture de 20 m
+        cc.car_spacing = 20.5;         // 20 m de caisse + 0,5 m d'intercirculation
+        cc.head_to_first_jacobs = 0.6;
+        cc.ats_margin_kmh = 5.0;       // ATS : tolérance avant l'urgence (métro = strict)
         return cc;
     }
 
@@ -405,7 +400,7 @@ struct Application::Impl {
     render::MeshId bogie_mesh = 0;
     render::MeshId body_mesh = 0;
 
-    // Signalisation KVB (M17) : un mât (gris) + un panneau (teinté par palier de vitesse),
+    // Signalisation ATS (M30) : un mât (gris) + un panneau (teinté par aspect),
     // dessinés à chaque début de bloc. 5 matériaux, un par palier (vert → rouge).
     render::MeshId sign_mast_mesh = 0;
     render::MeshId sign_panel_mesh = 0;
@@ -451,11 +446,15 @@ struct Application::Impl {
     float orbit_pitch = 0.30f;
     float orbit_distance = 42.0f;
 
-    // Manipulateur de traction : position PERSISTANTE 0..1, poussée à ~0,5/s (course
-    // complète en 2 s). Intégrée au pas FIXE dans update_physics, jamais à la fréquence
-    // d'affichage : le Wagon est déterministe, et y injecter un intégrateur cadencé sur
-    // le temps réel casserait la reproductibilité (le motif même qui a imposé NOIRE_PIN_CAM).
+    // Manipulateur japonais (M30) : traction À RAPPEL — la consigne retombe à 0 %
+    // dès que la touche est lâchée (poignée à ressort / deadman). Le FREIN, lui,
+    // est à CRANS persistants (0..7) : un cran engagé reste serré tant qu'on ne le
+    // desserre pas (ou qu'on ne tractionne pas). Intégré au pas FIXE dans
+    // update_physics, jamais à la fréquence d'affichage : le Wagon est déterministe.
     double throttle_handle = 0.0;
+    int brake_notch = 0;             // crans de frein engagés (0..7)
+    bool prev_throttle_down = false; // détection de front pour les crans
+    bool prev_notch_release = false;
     // Caméra (M23) : Orbite (externe) ou Cabine (FPS poste de conduite), bascule sur C.
     enum class CameraMode {
         Orbit,
@@ -468,7 +467,6 @@ struct Application::Impl {
 
     // Consignes relevées par update_input (variable), consommées par update_physics (fixe).
     bool key_throttle_up = false;
-    bool key_throttle_down = false;
     bool key_brake = false;
     bool key_emergency = false;
     bool key_horn = false;         // sifflet (H) — maintenu
@@ -498,7 +496,7 @@ struct Application::Impl {
     bool doors_opening = false;
     bool prev_p_down = false;
 
-    // --- Isolation KVB (M21.5) -----------------------------------------------
+    // --- Isolation ATS (M30) -----------------------------------------------
     bool prev_k_down = false;
 
     WorldPosition prev_cam_world{};
@@ -608,7 +606,7 @@ struct Application::Impl {
         body_mesh = renderer.create_mesh(make_box_vertices(glm::vec3(0.20f, 0.38f, 0.58f)),
                                          render::Topology::Triangles);
 
-        // --- Signalisation KVB (M17) : mât + panneau, en géométrie MeshVertex ---------
+        // --- Signalisation ATS (M30) : mât + panneau, en géométrie MeshVertex ---------
         {
             std::vector<render::MeshVertex> mast_v, panel_v;
             std::vector<std::uint32_t> mast_i, panel_i;
@@ -624,14 +622,14 @@ struct Application::Impl {
         mast_desc.metallic_factor = 0.6f;
         mast_desc.roughness_factor = 0.5f;
         sign_mast_material = renderer.create_material(mast_desc);
-        // Couleur du panneau par palier, du plus permissif (vert) au plus sévère (rouge).
-        // Couleurs VIVES et diélectriques : elles se lisent comme un signal en plein jour.
+        // Couleur du signal par aspect ATS (M30). Couleurs VIVES et diélectriques :
+        // elles se lisent comme un signal en plein jour.
         const glm::vec3 tier_colors[5] = {
-            {0.80f, 0.06f, 0.05f},  // 110 : rouge
-            {0.85f, 0.32f, 0.03f},  // 160 : orange
-            {0.82f, 0.62f, 0.03f},  // 220 : ambre
-            {0.35f, 0.60f, 0.05f},  // 270 : vert-jaune
-            {0.05f, 0.58f, 0.12f},  // 320 : vert
+            {0.80f, 0.06f, 0.05f},  // R  : rouge (arrêt)
+            {0.85f, 0.62f, 0.03f},  // Y  : jaune (caution, 45)
+            {0.55f, 0.72f, 0.05f},  // YG : vert-jaune (reduced, 65)
+            {0.35f, 0.60f, 0.05f},  // (inutilisé)
+            {0.05f, 0.58f, 0.12f},  // G  : vert (proceed, 90)
         };
         for (int t = 0; t < 5; ++t) {
             render::MaterialDesc d;
@@ -646,14 +644,13 @@ struct Application::Impl {
         // est absent, synthèse M6 si le .wav est absent — le moteur ne crashe jamais.
         asset_paths = resource::AssetPaths::discover();
         resources.set_upload_budget(2);
-        // Motrice TGV procédurale V2 (M20) : carrosserie loftée (superellipse + Béziers)
-        // à toit bombé, nez plongeant de 8 m, vitrages creusés dans la tôle, jupe et
-        // carénages de toit — générée par tools/gen_tgv_procedural.py.
-        train_model = resources.load_model("models/tgv_procedural.glb");
-        // Rame articulée (M16/M20) : voiture voyageurs (caisse-tube, bandeau creusé,
-        // soufflets) et bogie Jacobs partagé, générés par tools/gen_tgv_voiture.py.
-        voiture_model = resources.load_model("models/tgv_voiture.glb");
-        jacobs_bogie_model = resources.load_model("models/tgv_bogie.glb");
+        // Rame de métro japonais (M30 — pivot E235) : caisse cubique à panneaux,
+        // pare-brise plat en verre PBR, pupitre T-handle — tools/gen_metro.py.
+        train_model = resources.load_model("models/metro_motrice.glb");
+        // Voiture intermédiaire (4 doubles portes/face, banquettes longitudinales)
+        // et bogie, générés par le même script.
+        voiture_model = resources.load_model("models/metro_voiture.glb");
+        jacobs_bogie_model = resources.load_model("models/metro_bogie.glb");
         // Gare de départ (M18) : un module répété le long de la voie sur 0-400 m.
         station_model = resources.load_model("models/station.glb");
         tree_model = resources.load_model("models/tree.glb");
@@ -694,11 +691,11 @@ struct Application::Impl {
         // intenable le moindre essai à grande vitesse. Même esprit que NOIRE_STILL /
         // NOIRE_PIN_CAM / NOIRE_CREEP : un levier de mesure, jamais un défaut de jeu.
         // Départ à 20 km/h, DANS la limite de la zone de gare (30 km/h) : un vrai départ
-        // sans que le KVB ne serre l'urgence dès la première frame (M17.5). NOIRE_SPEED
+        // sans que l'ATS ne serre l'urgence dès la première frame (M17.5). NOIRE_SPEED
         // (km/h) reste le levier de banc pour partir lancé.
         const char* speed_env = std::getenv("NOIRE_SPEED");
         consist.set_speed(speed_env != nullptr ? std::atof(speed_env) / 3.6 : 20.0 / 3.6);
-        log::info("Commandes : Z/S (ou Flèches)=traction/frein, Espace=frein service, E=URGENCE, H=sifflet, K=KVB isolé | L=phares, P=portes, R=pluie, C=caméra (Cabine/Orbite) | souris=orbite/cabine, Ctrl/Maj=zoom, Échap=quitter");
+        log::info("Commandes : Z=traction (rappel à 0), S/A (ou Flèches)=cran frein +/-, Espace=frein service, E=URGENCE, H=sifflet, K=ATS isolé | L=phares, P=portes, R=pluie, C=caméra (Cabine/Orbite) | souris=orbite/cabine, Ctrl/Maj=zoom, Échap=quitter");
         window.set_cursor_captured(true);
 
         EngineHooks hooks;
@@ -709,8 +706,8 @@ struct Application::Impl {
         hooks.render = [this](double /*interpolation*/) { render_frame(); };
         engine.set_hooks(std::move(hooks));
 
-        log::info("Commandes : Z/S (ou Flèches)=traction/frein, Espace=frein service, "
-                  "E=URGENCE, H=sifflet, K=KVB isolé | L=phares, P=portes, R=pluie | "
+        log::info("Commandes : Z=traction (rappel à 0), S/A=cran frein +/-, "
+                  "E=URGENCE, H=sifflet, K=ATS isolé | L=phares, P=portes, R=pluie | "
                   "souris=orbite, Ctrl/Maj=zoom, Échap=quitter");
         return engine.initialize();
     }
@@ -720,11 +717,22 @@ struct Application::Impl {
 
         // On RELÈVE seulement l'état des touches ici (variable_update, cadencé sur
         // l'affichage). L'intégration du manipulateur se fait au pas fixe dans
-        // update_physics : voir throttle_handle. W est synonyme de Z (l'enum sert AZERTY
-        // et QWERTY), Flèche Haut/Bas double Z/S.
+        // update_physics. W est synonyme de Z (l'enum sert AZERTY et QWERTY),
+        // Flèche Haut/Bas double Z/S. M30 : Z = traction À RAPPEL (lâché = 0 %),
+        // S = cran de frein +1 (front montant), A = desserrage d'un cran.
         key_throttle_up = window.is_key_down(Key::Z) || window.is_key_down(Key::W) ||
                           window.is_key_down(Key::Up);
-        key_throttle_down = window.is_key_down(Key::S) || window.is_key_down(Key::Down);
+        const bool throttle_down_now =
+            window.is_key_down(Key::S) || window.is_key_down(Key::Down);
+        const bool notch_release_now = window.is_key_down(Key::A) || window.is_key_down(Key::Q);
+        if (throttle_down_now && !prev_throttle_down) {
+            brake_notch = std::min(7, brake_notch + 1);
+        }
+        if (notch_release_now && !prev_notch_release) {
+            brake_notch = std::max(0, brake_notch - 1);
+        }
+        prev_throttle_down = throttle_down_now;
+        prev_notch_release = notch_release_now;
         key_brake = window.is_key_down(Key::Space);      // frein de service (maintenu)
         key_emergency = window.is_key_down(Key::E);      // frein d'urgence
         key_horn = window.is_key_down(Key::H);           // sifflet (maintenu)
@@ -763,12 +771,12 @@ struct Application::Impl {
         }
         prev_p_down = p_down;
 
-        // KVB isolation (M21.5) : touche K, front montant = bascule.
+        // ATS isolation (M30) : touche K, front montant = bascule.
         const bool k_down = window.is_key_down(Key::K);
         if (k_down && !prev_k_down) {
-            const bool now_isolated = !consist.kvb_isolated();
-            consist.set_kvb_isolated(now_isolated);
-            log::info("KVB : {}", now_isolated ? "ISOLÉ (mode Arcade)" : "ACTIF");
+            const bool now_isolated = !consist.ats_isolated();
+            consist.set_ats_isolated(now_isolated);
+            log::info("ATS : {}", now_isolated ? "ISOLÉ (mode Arcade)" : "ACTIF");
         }
         prev_k_down = k_down;
 
@@ -821,14 +829,21 @@ struct Application::Impl {
             return;
         }
 
-        // Manipulateur de traction : intégré ICI, au pas FIXE, pour rester déterministe.
-        // Course complète en 2 s (0,5/s). Persistant : il reste où on le laisse.
+        // Manipulateur japonais (M30) — intégré ICI, au pas FIXE, pour rester
+        // déterministe. Traction À RAPPEL : Z tenue pousse la consigne (~1,2 s de
+        // course), Z lâchée la ramène à 0 % (~0,7 s). Toute traction TUE les crans
+        // de frein (la poignée repasse par neutre). Le frein reste serré sur ses
+        // crans tant qu'on n'accélère pas : c'est ce qui tient la rame à l'arrêt.
         if (key_throttle_up) {
-            throttle_handle = std::min(1.0, throttle_handle + dt * 0.5);
-        } else if (key_throttle_down) {
-            throttle_handle = std::max(0.0, throttle_handle - dt * 0.5);
+            brake_notch = 0;
+            throttle_handle = std::min(1.0, throttle_handle + dt / 1.2);
+        } else {
+            throttle_handle = std::max(0.0, throttle_handle - dt / 0.7);
         }
-        consist.set_controls(throttle_handle, key_brake ? 1.0 : 0.0, key_emergency);
+        // Consigne de frein = max(crans / 7, frein de service maintenu).
+        const double brake_demand =
+            std::max(static_cast<double>(brake_notch) / 7.0, key_brake ? 1.0 : 0.0);
+        consist.set_controls(throttle_handle, brake_demand, key_emergency);
         // La météo pilote l'adhérence : sec = 1, pluie battante = 0,36 (µ ~ 0,12). C'est
         // ce qui rend le patinage — hors d'atteinte à sec avec ces chiffres — possible
         // sous la pluie au-delà de ~71 % de traction.
@@ -916,14 +931,28 @@ struct Application::Impl {
         const int sim_minute = static_cast<int>(day_time / 60.0) % 60;
         lines.emplace_back(std::format("HEURE    {:02d}:{:02d}", sim_hour, sim_minute), label);
         lines.emplace_back(std::format("VITESSE  {: >5.0f} KM/H", wagon.speed() * 3.6), value);
-        // Limite KVB (M17) : rouge dès qu'on la dépasse (avertissement avant l'urgence).
+        // Aspect ATS (M30) : G/YG/Y/R déduit de la limite courante, en couleur.
         const double limit = consist.current_limit_kmh();
         const bool over_limit = wagon.speed() * 3.6 > limit;
-        lines.emplace_back(std::format("LIMITE   {: >5.0f} KM/H", limit),
-                           over_limit ? alert : glm::vec4{0.45f, 0.85f, 0.5f, 1.0f});
-        // Position du MANIPULATEUR (la consigne du mécanicien), pas l'effort réellement
-        // appliqué après la rampe de la chaîne de traction.
+        const char* aspect = "G";
+        glm::vec4 aspect_color{0.45f, 0.85f, 0.5f, 1.0f};       // G : vert
+        if (limit <= 0.0) {
+            aspect = "R";
+            aspect_color = glm::vec4{1.0f, 0.15f, 0.10f, 1.0f}; // rouge
+        } else if (limit <= 45.0) {
+            aspect = "Y";
+            aspect_color = glm::vec4{0.95f, 0.80f, 0.10f, 1.0f}; // jaune
+        } else if (limit <= 65.0) {
+            aspect = "YG";
+            aspect_color = glm::vec4{0.65f, 0.90f, 0.20f, 1.0f}; // vert-jaune
+        }
+        lines.emplace_back(std::format("ATS {: >2}   {: >5.0f} KM/H", aspect, limit),
+                           over_limit ? alert : aspect_color);
+        // Position du MANIPULATEUR (traction à rappel) et crans de frein engagés.
         lines.emplace_back(std::format("TRACTION {: >5.0f} %", throttle_handle * 100.0), value);
+        lines.emplace_back(std::format("FREIN    {: >5} B{}", key_brake ? "MAX" : "",
+                                       brake_notch),
+                           brake_notch > 0 || key_brake ? value : label);
         // CG = conduite générale. Sa pression EST l'état du frein que lit le mécanicien :
         // 5 bar = desserré, elle chute quand on serre.
         lines.emplace_back(std::format("CG      {: >5.1f} BAR", brake.pipe_pressure()),
@@ -942,15 +971,15 @@ struct Application::Impl {
             lines.emplace_back("IMMOBILISE", green_notice);
         }
 
-        // KVB (M17 + M21.5) : témoin prioritaire.
-        if (consist.kvb_isolated()) {
+        // ATS (M30) : témoin prioritaire.
+        if (consist.ats_isolated()) {
             // Clignotement : sin(t*4) > 0 => visible 50% du temps, ~2 Hz.
             // L'alpha oscille entre 0.3 et 1.0 pour un effet voyant sans disparaître.
             const float blink = 0.65f + 0.35f * std::sin(static_cast<float>(sim_time) * 8.0f);
             const glm::vec4 warn_color{0.95f, 0.80f, 0.15f, blink};
-            lines.emplace_back("KVB ISOLE", warn_color);
-        } else if (consist.kvb_active()) {
-            lines.emplace_back("KVB URGENCE", alert);
+            lines.emplace_back("ATS ISOLE", warn_color);
+        } else if (consist.ats_active()) {
+            lines.emplace_back("ATS URGENCE", alert);
         } else if (brake.emergency()) {
             lines.emplace_back("URGENCE", alert);
         } else if (wagon.slipping()) {
@@ -1006,7 +1035,7 @@ struct Application::Impl {
                 }
                 // EXCLUSION DE LA VOIE. `corridor_inner` est exactement la largeur de la
                 // plateforme aplanie : au-delà, le terrain redescend en talus, donc c'est
-                // la borne naturelle. Aucun arbre ne peut traverser le TGV.
+                // la borne naturelle. Aucun arbre ne peut traverser la rame.
                 const double d = terrain.distance_to_track(wx, wz);
                 if (d < terrain.config().corridor_inner || std::abs(wz - wp.z) > kTreeHalfWidth) {
                     continue;
@@ -1209,7 +1238,7 @@ struct Application::Impl {
         }
 
         if (!model_ready_reported && train_model && train_model->ready) {
-            log::info("M10 : motrice TGV procédurale chargée — {} primitive(s), cubes masqués",
+            log::info("M10 : motrice E235 procédurale chargée — {} primitive(s), cubes masqués",
                       train_model->primitives.size());
             model_ready_reported = true;
         }
@@ -1319,7 +1348,7 @@ struct Application::Impl {
             camera.look_at(target);
             view_mat = camera.view_matrix();
         } else {
-            // Caméra Cabine FPS (M29 - Reboot TGV AAA) : vue dégagée à travers le pare-brise PBR.
+            // Caméra Cabine FPS (M30 — métro E235) : vue dégagée à travers le pare-brise PBR.
             // near_plane réglé à 0.10 m par défaut (surchargeable via NOIRE_CAM_NEAR ou NOIRE_CAB_ZNEAR).
             static const char* env_near1 = std::getenv("NOIRE_CAM_NEAR");
             static const char* env_near2 = std::getenv("NOIRE_CAB_ZNEAR");
@@ -1331,8 +1360,8 @@ struct Application::Impl {
             static const char* env_z = std::getenv("NOIRE_CAM_Z");
 
             const float cam_x = (env_x != nullptr) ? static_cast<float>(std::atof(env_x)) : 0.0f;
-            const float cam_y = (env_y != nullptr) ? static_cast<float>(std::atof(env_y)) : 1.20f;
-            const float cam_z = (env_z != nullptr) ? static_cast<float>(std::atof(env_z)) : -2.50f;
+            const float cam_y = (env_y != nullptr) ? static_cast<float>(std::atof(env_y)) : 0.25f;
+            const float cam_z = (env_z != nullptr) ? static_cast<float>(std::atof(env_z)) : -8.55f;
             const glm::vec3 driver_head_local{cam_x, cam_y, cam_z};
 
             const glm::mat4 loco_ori = wagon.body_orientation();
@@ -1430,7 +1459,7 @@ struct Application::Impl {
             }
         }
 
-        // --- Phares du TGV (M21) : 2 spotlights coniques ---
+        // --- Phares de la rame (M21) : 2 spotlights coniques ---
         // Positions en espace CAMÉRA-RELATIF (origin-floating) : même convention que
         // tout le rendu. Direction en espace MONDE (invariant à la translation).
         if (headlights_on && train_model && train_model->ready) {
@@ -1601,44 +1630,49 @@ struct Application::Impl {
             items.push_back(render::DrawItem{body_model, body_mesh});
         }
 
-        // Voitures voyageurs (M16 + M21) : chaque caisse est posée par la cinématique
-        // inverse de ses bogies Jacobs. M21 : les DEUX DERNIÈRES primitives sont les
-        // battants de porte — elles reçoivent une matrice propre (bouchon + coulissement)
-        // au lieu de la matrice caisse commune. L'intérieur (N-3 et avant) est dessiné
-        // comme la carrosserie.
+        // Voitures (M30 — métro E235) : chaque caisse est posée par la cinématique
+        // inverse de ses bogies Jacobs. Les 16 DERNIÈRES primitives sont les battants
+        // de porte : 8 embrasures (0-3 flanc droit x>0, 4-7 flanc gauche), paire =
+        // vantail A puis B. Chaque battant reçoit sa matrice propre (bouchon latéral
+        // puis coulissement) au lieu de la matrice caisse commune.
         if (voiture_model && voiture_model->ready) {
             const auto& prims = voiture_model->primitives;
             const int n_prims = static_cast<int>(prims.size());
+            constexpr int kDoorPairs = 8;  // 4 doubles portes par face
             // Animation portes : deux phases.
-            // Phase 1 [door_t 0..0.3] : bouchon latéral de 15 cm (sortie de la coque).
-            // Phase 2 [door_t 0.3..1] : coulissement longitudinal de 90 cm.
+            // Phase 1 [door_t 0..0.3] : bouchon latéral de 10 cm (sortie de la coque).
+            // Phase 2 [door_t 0.3..1] : coulissement de 60 cm par vantail (les deux
+            // vantaux d'une paire s'écartent en sens opposés — porte à ouverture centrale).
             const float t1 = glm::clamp(door_t / 0.3f, 0.0f, 1.0f);
             const float t2 = glm::clamp((door_t - 0.3f) / 0.7f, 0.0f, 1.0f);
+            const bool has_doors = n_prims >= 2 * kDoorPairs;
+            const auto body_count = static_cast<std::size_t>(
+                has_doors ? n_prims - 2 * kDoorPairs : n_prims);
             for (int i = 0; i < consist.car_count(); ++i) {
                 const physics::CarBody& car = consist.car(i);
                 const glm::mat4 caisse_m = camera.relative_model(car.position()) *
                                            car.orientation() * kCarTransform.matrix();
-                // Coque + intérieur : toutes les primitives sauf les 2 dernières (battants).
-                const auto body_count = static_cast<std::size_t>(
-                    (n_prims >= 2) ? n_prims - 2 : n_prims);
+                // Coque + intérieur : toutes les primitives sauf les battants.
                 for (std::size_t j = 0; j < body_count; ++j) {
                     const render::MaterialId mat =
                         prims[j].material ? prims[j].material->id : 0;
                     items.push_back(render::DrawItem{caisse_m, prims[j].mesh, mat});
                 }
-                // Battants de porte (seulement si le GLB en possède bien 2 dédiées).
-                if (n_prims >= 2) {
-                    for (int side = 0; side < 2; ++side) {
-                        const float sx = (side == 0) ? +1.0f : -1.0f;
-                        const float sz = (side == 0) ? -1.0f : +1.0f;
-                        const glm::mat4 door_local = glm::translate(
-                            glm::mat4(1.0f),
-                            glm::vec3(sx * 0.15f * t1, 0.0f, sz * 0.90f * t2));
-                        const auto prim_idx = static_cast<std::size_t>(n_prims - 2 + side);
-                        const render::MaterialId mat =
-                            prims[prim_idx].material ? prims[prim_idx].material->id : 0;
-                        items.push_back(
-                            render::DrawItem{caisse_m * door_local, prims[prim_idx].mesh, mat});
+                if (has_doors) {
+                    for (int d = 0; d < kDoorPairs; ++d) {
+                        const float sx = (d < 4) ? +1.0f : -1.0f;  // flanc droit / gauche
+                        for (int leaf = 0; leaf < 2; ++leaf) {
+                            const float sz = (leaf == 0) ? -1.0f : +1.0f;  // A : -z, B : +z
+                            const glm::mat4 door_local = glm::translate(
+                                glm::mat4(1.0f),
+                                glm::vec3(sx * 0.10f * t1, 0.0f, sz * 0.60f * t2));
+                            const auto prim_idx = static_cast<std::size_t>(
+                                n_prims - 2 * kDoorPairs + 2 * d + leaf);
+                            const render::MaterialId mat =
+                                prims[prim_idx].material ? prims[prim_idx].material->id : 0;
+                            items.push_back(
+                                render::DrawItem{caisse_m * door_local, prims[prim_idx].mesh, mat});
+                        }
                     }
                 }
             }
@@ -1673,10 +1707,10 @@ struct Application::Impl {
             }
         }
 
-        // Panneaux de signalisation KVB (M17) : un panneau à chaque DÉBUT DE BLOC dans une
+        // Signaux ATS (M30) : un panneau à chaque DÉBUT DE BLOC dans une
         // fenêtre autour du train. Le panneau marque le début d'une zone de vitesse et sa
         // couleur en donne la sévérité — le conducteur le voit venir et anticipe. Même
-        // source de vérité que le KVB (consist.speed_limits()) : ils ne peuvent pas mentir.
+        // source de vérité que l'ATS (consist.speed_limits()) : ils ne peuvent pas mentir.
         if (sign_mast_mesh != 0 && sign_panel_mesh != 0) {
             const auto& limits = consist.speed_limits();
             const double x_train = wagon.chainage();
@@ -1708,33 +1742,37 @@ struct Application::Impl {
             }
         }
 
-        // Gare de départ (M18) : le module est RÉPÉTÉ le long de la voie de 0 à 400 m, posé
-        // à chaque fois sur la spline avec l'orientation de la voie — il épouse donc la
-        // courbe et la pente. Son repère local a y = 0 au plan de roulement, donc le dessus
-        // des quais (+1 m local) tombe pile au seuil des portes du TGV.
+        // Gares (M30 — métro de Tokyo) : une gare tous les 1 200 m, calée sur le
+        // profil ATS (quai = les 300 premiers mètres du cycle, cf. speed_limits.cpp).
+        // Le module est RÉPÉTÉ le long du quai, posé à chaque fois sur la spline avec
+        // l'orientation de la voie — il épouse donc la courbe et la pente.
         if (station_model && station_model->ready) {
             const double x_train = wagon.chainage();
             const glm::vec3 world_up(0.0f, 1.0f, 0.0f);
             constexpr double kStationModule = 40.0;
-            constexpr int kStationModules = 10;  // 10 x 40 m = 0 à 400 m
-            for (int i = 0; i < kStationModules; ++i) {
-                const double xc = kStationModule * (static_cast<double>(i) + 0.5);
-                if (xc < x_train - 600.0 || xc > x_train + 12000.0) {
-                    continue;  // hors de la fenêtre visible : le train a quitté la gare
-                }
-                glm::dvec3 pos, tangent;
-                track.sample(xc, pos, tangent);
-                const glm::vec3 forward = glm::vec3(glm::normalize(tangent));
-                const glm::vec3 right = glm::normalize(glm::cross(forward, world_up));
-                const glm::vec3 up = glm::cross(right, forward);
-                glm::mat4 basis(1.0f);
-                basis[0] = glm::vec4(right, 0.0f);
-                basis[1] = glm::vec4(up, 0.0f);
-                basis[2] = glm::vec4(-forward, 0.0f);
-                const glm::mat4 m = camera.relative_model(pos) * basis;
-                for (const resource::Model::Primitive& prim : station_model->primitives) {
-                    const render::MaterialId mat = prim.material ? prim.material->id : 0;
-                    items.push_back(render::DrawItem{m, prim.mesh, mat});
+            constexpr int kStationModules = 8;      // 8 x 40 m = quai de 320 m
+            constexpr double kStationSpacing = 1200.0;  // = profil ATS
+            const int k_first =
+                static_cast<int>(std::max(0.0, std::floor((x_train - 600.0) / kStationSpacing)));
+            const int k_last = static_cast<int>((x_train + 4000.0) / kStationSpacing);
+            for (int k = k_first; k <= k_last; ++k) {
+                for (int i = 0; i < kStationModules; ++i) {
+                    const double xc = k * kStationSpacing +
+                                      kStationModule * (static_cast<double>(i) + 0.5);
+                    glm::dvec3 pos, tangent;
+                    track.sample(xc, pos, tangent);
+                    const glm::vec3 forward = glm::vec3(glm::normalize(tangent));
+                    const glm::vec3 right = glm::normalize(glm::cross(forward, world_up));
+                    const glm::vec3 up = glm::cross(right, forward);
+                    glm::mat4 basis(1.0f);
+                    basis[0] = glm::vec4(right, 0.0f);
+                    basis[1] = glm::vec4(up, 0.0f);
+                    basis[2] = glm::vec4(-forward, 0.0f);
+                    const glm::mat4 m = camera.relative_model(pos) * basis;
+                    for (const resource::Model::Primitive& prim : station_model->primitives) {
+                        const render::MaterialId mat = prim.material ? prim.material->id : 0;
+                        items.push_back(render::DrawItem{m, prim.mesh, mat});
+                    }
                 }
             }
         }

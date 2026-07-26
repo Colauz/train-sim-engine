@@ -73,25 +73,24 @@ void Consist::place_at(double chainage) {
 }
 
 void Consist::update(double dt) {
-    // --- KVB (M17 + M21.5) : appliqué AVANT la physique de tête ----------------
-    // La limite courante est celle du bloc où se trouve le train (= le dernier panneau
+    // --- ATS (M30) : appliqué AVANT la physique de tête ----------------
+    // La limite courante est celle du bloc où se trouve le train (= le dernier signal
     // franchi). Hystérésis : on ARME l'urgence dès qu'on dépasse la limite de plus de la
     // marge, et on ne la RELÂCHE qu'une fois revenu AU niveau de la limite — le conducteur
     // doit donc réellement ralentir sous la limite pour récupérer la main.
     current_limit_kmh_ = limits_.limit_kmh(loco_.chainage());
     const double speed_kmh = loco_.speed() * 3.6;
-    if (speed_kmh > current_limit_kmh_ + config_.kvb_margin_kmh) {
-        kvb_active_ = true;
+    if (speed_kmh > current_limit_kmh_ + config_.ats_margin_kmh) {
+        ats_active_ = true;
     } else if (speed_kmh <= current_limit_kmh_) {
-        kvb_active_ = false;
+        ats_active_ = false;
     }
-    // KVB actif => traction coupée + freinage d'urgence, quelle que soit la consigne.
-    // M21.5 : si le KVB est ISOLÉ (mode Arcade), la surveillance reste active (kvb_active_
-    // se lève normalement, le HUD l'affiche) mais l'enforcement est désactivé — la
-    // consigne du conducteur passe telle quelle.
-    const bool kvb_enforcing = kvb_active_ && !kvb_isolated_;
-    const double throttle = kvb_enforcing ? 0.0 : throttle_cmd_;
-    const bool emergency = emergency_cmd_ || kvb_enforcing;
+    // ATS actif => traction coupée + freinage d'urgence, quelle que soit la consigne.
+    // Si l'ATS est ISOLÉ (mode Arcade), la surveillance reste active (ats_active_ se
+    // lève normalement, le HUD l'affiche) mais l'enforcement est désactivé.
+    const bool ats_enforcing = ats_active_ && !ats_isolated_;
+    const double throttle = ats_enforcing ? 0.0 : throttle_cmd_;
+    const bool emergency = emergency_cmd_ || ats_enforcing;
     loco_.set_controls(throttle, brake_cmd_, emergency);
 
     loco_.update(dt);

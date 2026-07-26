@@ -2,17 +2,10 @@
 
 namespace noire {
 
-// PROFIL DE LIMITATION DE VITESSE (M17, en dur au M17.5) — la « carte » des vitesses le
-// long de la voie, calquée sur un vrai départ de ligne française :
-//     0 – 2 km   :  30 km/h   (zone de gare / dépôt)
-//     2 – 15 km  : 160 km/h   (ligne classique)
-//    15 – 20 km  : 220 km/h   (raccordement LGV)
-//    20 km et +  : 320 km/h   (LGV pleine ligne)
-//
-// Le chainage sert d'abscisse (arc_rate ≈ 1 sur notre tracé => chainage ≈ km réels). C'est
-// l'unique source de vérité, partagée par le KVB (qui l'applique) et par les panneaux
-// trackside (qui l'affichent aux points de transition EXACTS) : ils ne peuvent pas se
-// contredire.
+// PROFIL DE LIMITATION DE VITESSE — ligne de métro japonais (M30), cf. speed_limits.cpp.
+// Aspects ATS/ATC : G (proceed, 90), YG (reduced, 65), Y (caution, 45), R (stop, 0).
+// C'est l'unique source de vérité, partagée par l'ATS (qui l'applique) et par les signaux
+// trackside (qui l'affichent aux points de transition EXACTS) : ils ne peuvent pas mentir.
 class SpeedLimits {
 public:
     // Limite (km/h) applicable au chainage x = celle de la zone qui le contient.

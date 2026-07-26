@@ -31,9 +31,9 @@ struct ConsistConfig {
 
     CarBodyConfig car_body;         // suspension des voitures (défauts CarBodyConfig)
 
-    // KVB (M17) : marge de tolérance avant déclenchement de l'urgence. Dépasser la limite
-    // de plus de kvb_margin_kmh arme le freinage d'urgence automatique.
-    double kvb_margin_kmh = 10.0;
+    // ATS (M30) : marge de tolérance avant déclenchement de l'urgence. Dépasser la
+    // limite de plus de ats_margin_kmh arme le freinage d'urgence automatique.
+    double ats_margin_kmh = 5.0;
 };
 
 class Consist {
@@ -65,17 +65,17 @@ public:
     // Bogies Jacobs (0..N), pour les dessiner.
     [[nodiscard]] const std::vector<Bogie>& jacobs_bogies() const { return jacobs_; }
 
-    // --- KVB (M17 + M21.5) ----------------------------------------------------
+    // --- ATS japonais (M30) -------------------------------------------------
     [[nodiscard]] const SpeedLimits& speed_limits() const { return limits_; }
     // Limite applicable à la position actuelle du train (km/h).
     [[nodiscard]] double current_limit_kmh() const { return current_limit_kmh_; }
-    // true tant que le KVB force le freinage d'urgence (dépassement > marge, non résorbé).
-    [[nodiscard]] bool kvb_active() const { return kvb_active_; }
-    // M21.5 : isolation manuelle du KVB (mode Arcade). Quand isolé, le KVB continue de
-    // surveiller (kvb_active_ se lève), mais il ne court-circuite PLUS la traction et ne
+    // true tant que l'ATS force le freinage d'urgence (dépassement > marge, non résorbé).
+    [[nodiscard]] bool ats_active() const { return ats_active_; }
+    // Isolation manuelle de l'ATS (mode Arcade). Quand isolé, l'ATS continue de
+    // surveiller (ats_active_ se lève), mais il ne court-circuite PLUS la traction et ne
     // force PLUS l'urgence. Le HUD affiche toujours la limite : le pilote sait qu'il triche.
-    void set_kvb_isolated(bool isolated) { kvb_isolated_ = isolated; }
-    [[nodiscard]] bool kvb_isolated() const { return kvb_isolated_; }
+    void set_ats_isolated(bool isolated) { ats_isolated_ = isolated; }
+    [[nodiscard]] bool ats_isolated() const { return ats_isolated_; }
 
 private:
     // Trouve l'abscisse x telle que la distance d'ARC de x_ref à x (vers l'arrière) vaut
@@ -94,16 +94,16 @@ private:
     std::vector<CarBody> cars_;   // N
     double prev_velocity_ = 0.0;  // pour l'accélération longitudinale (tangage des voitures)
 
-    // --- KVB (M17 + M21.5) ---
+    // --- ATS japonais (M30) ---
     SpeedLimits limits_;
     // Consigne du conducteur, en attente d'application (cf. set_controls).
     double throttle_cmd_ = 0.0;
     double brake_cmd_ = 0.0;
     bool emergency_cmd_ = false;
     // État courant du contrôle de vitesse.
-    double current_limit_kmh_ = 320.0;
-    bool kvb_active_ = false;
-    bool kvb_isolated_ = false;  // M21.5 : mode Arcade (isolation manuelle)
+    double current_limit_kmh_ = 90.0;
+    bool ats_active_ = false;
+    bool ats_isolated_ = false;  // mode Arcade (isolation manuelle)
 };
 
 }  // namespace noire::physics
