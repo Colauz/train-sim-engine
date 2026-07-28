@@ -33,7 +33,8 @@ void main() {
 
     float metallic = clamp(object.pbrFactors.x, 0.0, 1.0);
     float roughness = clamp(object.pbrFactors.y, kMinRoughness, 1.0);
-    vec3 color = shadeSurface(object.baseColorFactor.rgb, metallic, roughness, N, cameraRelPos);
+    vec3 color = shadeSurface(object.baseColorFactor.rgb, metallic, roughness, N, cameraRelPos,
+                              vec3(0.0));
 
     // LA couverture. Elle sort du vertex shader, où l'on sait de combien on a élargi le
     // ruban au-delà de sa taille vraie ; on rend ici en opacité ce qu'on a volé en largeur.

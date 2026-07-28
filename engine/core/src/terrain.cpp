@@ -79,11 +79,6 @@ double simplex2(double xin, double yin) {
     return 70.0 * n;  // normalisation empirique classique => ~[-1, 1]
 }
 
-double smoothstep(double a, double b, double x) {
-    const double t = std::clamp((x - a) / (b - a), 0.0, 1.0);
-    return t * t * (3.0 - 2.0 * t);
-}
-
 }  // namespace
 
 Terrain::Terrain(const TrackSource& track, TerrainConfig config)
@@ -118,21 +113,11 @@ double Terrain::distance_to_track(double wx, double wz) const {
 }
 
 double Terrain::height(double wx, double wz) const {
-    glm::dvec3 pos;
-    glm::dvec3 tangent;
-    track_.sample(wx - origin_x_, pos, tangent);
-
-    // Plateforme : le terrain sous la voie affleure le pied du ballast.
-    const double platform = pos.y - config_.ballast_depth;
-    const double natural = config_.amplitude * fbm(wx, wz);
-
-    // LE mélange. w = 0 sur la plateforme, 1 en pleine campagne. Entre les deux, la
-    // transition EST le talus : remblai là où le terrain naturel est plus bas que la
-    // voie, tranchée là où il est plus haut. Rien de spécial à coder pour l'un ou
-    // l'autre — c'est le même smoothstep qui creuse et qui remblaie.
-    const double w = smoothstep(config_.corridor_inner, config_.corridor_outer,
-                                std::abs(wz - pos.z));
-    return platform * (1.0 - w) + natural * w;
+    // M31 : la voie est un VIADUC (plan de roulement à +10 m, cf. ProceduralTrack). Le
+    // terrain reste donc partout NATUREL — plus de plateforme aplanie ni de talus : un
+    // remblai de 10 m de haut aurait été absurde, c'est le tablier du viaduc qui porte la
+    // voie. Le corridor (corridor_inner/outer) ne sert plus qu'au semis.
+    return config_.amplitude * fbm(wx, wz);
 }
 
 glm::dvec3 Terrain::normal(double wx, double wz, double step) const {

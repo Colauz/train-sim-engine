@@ -186,10 +186,13 @@ const float kFoliageTransDistort = 0.35;  // dévie L le long de N : brise l'apl
 // Éclaire une surface entièrement résolue et rend la couleur FINALE (tonemappée).
 // `cameraRelPos` : position du fragment relative à la caméra (origine flottante).
 // `foliage` : 0 = surface opaque ordinaire, 1 = feuillage (wrap + transmission).
+// `emissive` (M31) : lumière ÉMISE par la surface (fenêtres, néons), déjà modulée par le
+// facteur nuit côté appelant. Ajoutée en HDR avant le brouillard — une enseigne lointaine
+// se voile comme tout le reste.
 // Paramétré plutôt que dupliqué : une copie du coeur d'éclairage finirait par diverger,
 // et l'herbe ne s'éclairerait plus comme la voie qui la traverse.
 vec3 shadeSurfaceEx(vec3 albedo, float metallic, float roughness, vec3 N, vec3 cameraRelPos,
-                    float foliage) {
+                    float foliage, vec3 emissive) {
     // --- Météo : le film d'eau agit sur le MATÉRIAU, avant tout éclairage ---
     float wetness = u.params.x;
     roughness = max(mix(roughness, roughness * kWetRoughnessScale, wetness), kMinRoughness);
@@ -264,6 +267,10 @@ vec3 shadeSurfaceEx(vec3 albedo, float metallic, float roughness, vec3 N, vec3 c
 
     vec3 color = direct + ambientDiffuse + ambientSpecular;
 
+    // Émissif (M31) : la surface ÉMET — cette lumière ne dépend ni du soleil ni de l'IBL.
+    // Avant le brouillard pour que les néons lointains se fondent dans la nuit.
+    color += emissive;
+
     // --- Phares du TGV (M21) : 2 spotlights coniques, SANS ombre portée --------
     // u.spotColor.a = 0 → phares éteints, court-circuit. Contribution ajoutée EN HDR
     // avant le tone-mapping : l'ACES gère l'éblouissement naturellement.
@@ -322,8 +329,9 @@ vec3 shadeSurfaceEx(vec3 albedo, float metallic, float roughness, vec3 N, vec3 c
 }
 
 // Surface ordinaire : pas de feuillage.
-vec3 shadeSurface(vec3 albedo, float metallic, float roughness, vec3 N, vec3 cameraRelPos) {
-    return shadeSurfaceEx(albedo, metallic, roughness, N, cameraRelPos, 0.0);
+vec3 shadeSurface(vec3 albedo, float metallic, float roughness, vec3 N, vec3 cameraRelPos,
+                  vec3 emissive) {
+    return shadeSurfaceEx(albedo, metallic, roughness, N, cameraRelPos, 0.0, emissive);
 }
 
 #endif  // NOIRE_PBR_GLSL

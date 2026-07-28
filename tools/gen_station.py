@@ -1,38 +1,46 @@
 #!/usr/bin/env python3
-"""Un MODULE de gare TGV, au format .glb (M18).
+"""Un MODULE de station urbaine couverte, au format .glb (M31 — ex-M18 TGV).
 
-La gare est bâtie en RÉPÉTANT ce module le long de la voie (l'app le pose tous les 40 m
-sur la spline, orienté comme la voie : il épouse donc les courbes sans se déformer). Un
-module contient, dans son repère local (x = latéral, y = hauteur au-dessus du plan de
+La station est bâtie en RÉPÉTANT ce module le long de la voie (l'app le pose tous les
+40 m sur la spline, orienté comme la voie : il épouse donc les courbes sans se déformer).
+Un module contient, dans son repère local (x = latéral, y = hauteur au-dessus du plan de
 roulement, z = le long de la voie) :
   * deux QUAIS béton encadrant la voie, dont le dessus est à +1,00 m du rail (= le seuil
-    des portes du TGV, dont le plancher est à 1,05 m) ;
-  * des POTEAUX d'acier à intervalle régulier (20 m) ;
-  * une VERRIÈRE (toiture vitrée stylisée) portée par les poteaux, une par quai.
+    des portes, plancher à 1,05 m) ;
+  * des COLONNES d'acier aux deux extrémités des quais (hors gabarit) ;
+  * un GRAND TOIT PLEIN acier/verre enjambant TOUTE la largeur (les deux quais ET les
+    voies) — c'est une gare de métro aérien sur viaduc, plus deux verrières de quai ;
+  * des BANDEAUX ÉMISSIFS sous les rives du toit (néon cyan Neo-Tokyo), qui s'allument
+    la nuit (facteur émissif HDR, modulé par le facteur nuit du moteur).
 
-Repère : y = 0 est le PLAN DE ROULEMENT (comme la caisse : rail à -2,20 côté train, mais
-ici on raisonne depuis le rail). Aucune dépendance externe (stdlib seule)."""
+Repère : y = 0 est le PLAN DE ROULEMENT. Aucune dépendance externe (stdlib seule)."""
 import struct, json, sys
 
-MODULE_LEN = 40.0            # longueur d'un module ; l'app en pose 10 sur 0-400 m
+MODULE_LEN = 40.0            # longueur d'un module ; l'app en pose 8 par gare
 HZ = MODULE_LEN / 2.0
 
-PLAT_INNER = 1.75           # bord quai côté voie (le TGV fait 1,45 de demi-largeur)
+PLAT_INNER = 1.75           # bord quai côté voie (la caisse fait 1,45 de demi-largeur)
 PLAT_OUTER = 5.20           # bord extérieur
 PLAT_TOP = 1.00             # dessus du quai = plan de roulement + 1 m (seuil des portes)
-PLAT_BOTTOM = -1.60         # base enterrée
-PILLAR_HALF = 0.14
-PILLAR_TOP = 5.40
-ROOF_Y = 5.40
-ROOF_THICK = 0.16
-PILLAR_Z = (-10.0, 10.0)    # 2 poteaux par quai et par module => un tous les 20 m
+PLAT_BOTTOM = -1.60         # base enterrée (dans le tablier du viaduc)
+PILLAR_HALF = 0.18
+PILLAR_X = 6.10             # colonnes hors des quais, au droit des rives du toit
+ROOF_Y = 7.40               # intrados du grand toit (au-dessus de la caténaire, 6,60 m)
+ROOF_THICK = 0.20
+ROOF_HALF = 6.95            # demi-largeur du toit : couvre quais + voies
+STRIP_Y = 7.12              # bandeaux néon sous les rives du toit
+PILLAR_Z = (-10.0, 10.0)    # 2 colonnes par côté et par module => une tous les 20 m
 
 MATERIALS = [
     {"name": "beton", "factor": [0.62, 0.62, 0.60, 1.0], "metallic": 0.0, "roughness": 0.90},
     {"name": "acier", "factor": [0.48, 0.50, 0.53, 1.0], "metallic": 0.7, "roughness": 0.45},
     {"name": "verriere", "factor": [0.60, 0.68, 0.78, 1.0], "metallic": 0.0, "roughness": 0.08},
+    # Bandeau néon : albédo sombre, émissif CYAN HDR (> 1, hors spec stricte — assumé,
+    # c'est ce qui flambe la nuit). Le moteur module par le facteur nuit.
+    {"name": "neon", "factor": [0.05, 0.10, 0.12, 1.0], "metallic": 0.0, "roughness": 0.4,
+     "emissive": [0.15, 2.2, 2.6]},
 ]
-MAT_CONCRETE, MAT_STEEL, MAT_GLASS = 0, 1, 2
+MAT_CONCRETE, MAT_STEEL, MAT_GLASS, MAT_NEON = 0, 1, 2, 3
 
 
 class Part:
@@ -98,11 +106,15 @@ def write_glb(path, parts, node_name):
         primitives.append({"attributes": {"POSITION": base, "NORMAL": base + 1,
                                           "TEXCOORD_0": base + 2, "TANGENT": base + 3},
                            "indices": base + 4, "material": slot})
-    materials = [{"name": MATERIALS[m]["name"],
-                  "pbrMetallicRoughness": {"baseColorFactor": MATERIALS[m]["factor"],
-                                           "metallicFactor": MATERIALS[m]["metallic"],
-                                           "roughnessFactor": MATERIALS[m]["roughness"]}}
-                 for m, _ in used]
+    materials = []
+    for m, _ in used:
+        mat = {"name": MATERIALS[m]["name"],
+               "pbrMetallicRoughness": {"baseColorFactor": MATERIALS[m]["factor"],
+                                        "metallicFactor": MATERIALS[m]["metallic"],
+                                        "roughnessFactor": MATERIALS[m]["roughness"]}}
+        if "emissive" in MATERIALS[m]:
+            mat["emissiveFactor"] = MATERIALS[m]["emissive"]
+        materials.append(mat)
     gltf = {"asset": {"version": "2.0", "generator": "noire-station (CC0)"},
             "scene": 0, "scenes": [{"nodes": [0]}], "nodes": [{"mesh": 0, "name": node_name}],
             "meshes": [{"primitives": primitives}], "materials": materials,
@@ -120,26 +132,31 @@ def write_glb(path, parts, node_name):
 
 
 def build_station(out):
-    parts = [Part(), Part(), Part()]
+    parts = [Part(), Part(), Part(), Part()]
     # Deux quais, de part et d'autre de la voie. Ils débordent LÉGÈREMENT en z (± un chouïa)
     # pour que deux modules voisins se recouvrent au raccord et ne laissent aucun joint.
     z0, z1 = -HZ - 0.05, HZ + 0.05
     build_box(parts[MAT_CONCRETE], -PLAT_OUTER, PLAT_BOTTOM, z0, -PLAT_INNER, PLAT_TOP, z1)  # gauche
     build_box(parts[MAT_CONCRETE], PLAT_INNER, PLAT_BOTTOM, z0, PLAT_OUTER, PLAT_TOP, z1)    # droite
 
-    # Poteaux + verrière, un ensemble par quai.
+    # Colonnes aux deux extrémités (hors quai) + GRAND TOIT PLEIN sur toute la largeur.
     for sign in (-1.0, 1.0):
-        cx = sign * (PLAT_OUTER - 0.7)  # près du bord extérieur, hors du gabarit des portes
+        cx = sign * PILLAR_X
         for pz in PILLAR_Z:
-            build_box(parts[MAT_STEEL], cx - PILLAR_HALF, PLAT_TOP, pz - PILLAR_HALF,
-                      cx + PILLAR_HALF, PILLAR_TOP, pz + PILLAR_HALF)
-        # Verrière : dalle vitrée au-dessus du quai, en léger débord vers la voie.
-        rx0 = sign * PLAT_INNER - (0.6 if sign > 0 else -0.6)
-        rx1 = sign * (PLAT_OUTER + 0.3)
-        lo, hi = min(rx0, rx1), max(rx0, rx1)
-        build_box(parts[MAT_GLASS], lo, ROOF_Y, z0, hi, ROOF_Y + ROOF_THICK, z1)
+            build_box(parts[MAT_STEEL], cx - PILLAR_HALF, PLAT_BOTTOM, pz - PILLAR_HALF,
+                      cx + PILLAR_HALF, ROOF_Y, pz + PILLAR_HALF)
+    # Toit acier : une seule dalle qui enjambe quais ET voies (caténaire à 6,60 m max :
+    # elle passe en dessous, cf. canopy_attach_height côté app).
+    build_box(parts[MAT_STEEL], -ROOF_HALF, ROOF_Y, z0, ROOF_HALF, ROOF_Y + ROOF_THICK, z1)
+    # Lanterneau vitré central au-dessus des voies : il allège le toit le jour.
+    build_box(parts[MAT_GLASS], -1.6, ROOF_Y - 0.02, z0, 1.6, ROOF_Y + ROOF_THICK + 0.02, z1)
+    # Bandeaux néon sous les rives, côté ville : la signature nocturne de la station.
+    for sign in (-1.0, 1.0):
+        x0, x1 = sign * (ROOF_HALF - 0.30), sign * ROOF_HALF
+        lo, hi = min(x0, x1), max(x0, x1)
+        build_box(parts[MAT_NEON], lo, STRIP_Y, z0, hi, STRIP_Y + 0.22, z1)
 
-    write_glb(out, parts, "gare_module")
+    write_glb(out, parts, "station_module")
 
 
 if __name__ == "__main__":

@@ -25,6 +25,10 @@ private:
     double lateral_wave2_ = 175.0;
     double vertical_amp_ = 6.0;
     double vertical_wave_ = 520.0;
+    // M31 : la ligne est un VIADUC urbain — le plan de roulement vole 10 m au-dessus du
+    // sol naturel. Le terrain ne suit plus la voie (cf. Terrain::height) : ce sont le
+    // tablier et les piles du viaduc qui la portent (engine/scene/viaduct).
+    double base_height_ = 10.0;
 };
 
 }  // namespace noire

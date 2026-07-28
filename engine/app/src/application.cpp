@@ -29,6 +29,7 @@
 #include "noire/resource/resource_manager.hpp"
 #include "noire/scene/catenary.hpp"
 #include "noire/scene/track_mesh.hpp"
+#include "noire/scene/viaduct.hpp"
 #include "noire/scene/terrain_clipmap.hpp"
 #include "noire/scene/world_streamer.hpp"
 
@@ -136,23 +137,30 @@ constexpr glm::vec3 kRailColor{0.55f, 0.57f, 0.62f};      // acier poli par les 
 constexpr glm::vec3 kSleeperColor{0.28f, 0.27f, 0.25f};   // béton gris, un peu sale
 constexpr glm::vec3 kBallastColor{0.20f, 0.19f, 0.17f};   // gravier gris sombre
 
-// --- Semis de végétation (M11 phase 3) --------------------------------------
-// DÉTERMINISTE par construction : la position d'un arbre ne dépend QUE du hash de sa
+// --- Semis de bâtiments (M31 — Neo-Tokyo) -------------------------------------
+// DÉTERMINISTE par construction : la position d'un immeuble ne dépend QUE du hash de sa
 // cellule. Aucun état, aucun compteur, aucun aléa de frame — le train peut repasser, la
-// tuile être déchargée puis régénérée, l'app redémarrer : la forêt est identique. C'est
-// aussi ce qui permet de la semer depuis un worker sans la moindre synchronisation.
-// --- Caténaire (M12) ---
+// tuile être déchargée puis régénérée, l'app redémarrer : la ville est identique.
+// Trois variantes de gabarit (tour, immeuble, barre — tools/gen_building.py) car
+// l'échelle d'instance est uniforme : la variété des proportions est cuite dans les
+// modèles. --- Caténaire (M12) ---
 // Fenêtre engendrée de part et d'autre du train, et pas de re-génération. La fenêtre est
 // LARGE parce que c'est justement au loin que le rendu des câbles se joue : à 2 km, un fil
 // de contact fait 0,005 pixel, et c'est là qu'on veut le voir tenir.
 constexpr double kCatenaryRange = 2000.0;
 constexpr double kCatenaryStep = 200.0;
 
-constexpr double kTreeCell = 26.0;        // une cellule de semis, en mètres
-constexpr double kTreeHalfWidth = 260.0;  // portée latérale de part et d'autre de la voie
-// Au-delà, un arbre de 7 m couvre moins d'un pixel : le semer ne coûterait que des
-// triangles. C'est le seul garde-fou de budget.
-constexpr double kTreeRange = 620.0;
+// Viaduc (M31) : tablier + piles, engendré comme la caténaire sur une fenêtre glissante.
+// Portée plus grande que les câbles : le tablier doit exister partout où la voie se
+// voit encore (les tuiles de voie couvrent 10 km, mais le brouillard voile au-delà).
+constexpr double kViaductRange = 3500.0;
+constexpr double kViaductStep = 250.0;
+
+constexpr double kBuildingCell = 48.0;        // une cellule de semis, en mètres
+constexpr double kBuildingHalfWidth = 380.0;  // portée latérale de part et d'autre du viaduc
+constexpr double kBuildingRange = 700.0;      // au-delà, une tour de 100 m fond dans la nuit
+constexpr double kBuildingCorridor = 30.0;    // exclusion autour de l'axe du viaduc
+constexpr int kBuildingVariants = 3;          // tower / block / slab (gen_building.py)
 
 // --- Calibrage des modèles importés (M9) ------------------------------------
 // Un modèle trouvé sur internet n'a JAMAIS la bonne échelle, la bonne orientation ni la
@@ -225,13 +233,13 @@ unsigned char to_srgb_byte(float v) {
     return static_cast<unsigned char>(std::clamp(v, 0.0f, 1.0f) * 255.0f + 0.5f);
 }
 
-// Sol herbeux/terreux : 2 octaves de bruit lissé, généré à la volée (aucun asset).
-// La texture est RGBA8 SRGB => les octets écrits ici sont des valeurs sRGB, que le
-// matériel reconvertit en linéaire à l'échantillonnage.
+// Sol urbain (M31) : asphalte et béton sombres, 2 octaves de bruit lissé, généré à la
+// volée (aucun asset). La texture est RGBA8 SRGB => les octets écrits ici sont des
+// valeurs sRGB, que le matériel reconvertit en linéaire à l'échantillonnage.
 std::vector<unsigned char> make_ground_pixels(std::uint32_t size) {
     std::vector<unsigned char> pixels(static_cast<std::size_t>(size) * size * 4u);
-    const glm::vec3 dark{0.42f, 0.46f, 0.30f};
-    const glm::vec3 light{0.60f, 0.64f, 0.44f};
+    const glm::vec3 dark{0.15f, 0.15f, 0.16f};    // asphalte
+    const glm::vec3 light{0.30f, 0.30f, 0.31f};   // béton usé
     for (std::uint32_t y = 0; y < size; ++y) {
         for (std::uint32_t x = 0; x < size; ++x) {
             const float u = (static_cast<float>(x) + 0.5f) / static_cast<float>(size);
@@ -319,11 +327,12 @@ struct Application::Impl {
     // Pipeline d'assets (M7 étapes 4-5) : racine assets/ + cache/loaders asynchrones.
     resource::AssetPaths asset_paths;
     resource::ResourceManager resources;
-    resource::ModelHandle tree_model;
     resource::ModelHandle train_model;
     resource::ModelHandle voiture_model;       // voiture voyageurs (M16)
     resource::ModelHandle jacobs_bogie_model;  // bogie Jacobs partagé (M16)
     resource::ModelHandle station_model;       // module de gare répétable (M18)
+    // Bâtiments (M31) : trois gabarits (tour / immeuble / barre, gen_building.py).
+    std::array<resource::ModelHandle, kBuildingVariants> building_models;
     resource::AudioHandle rumble_clip;
     resource::EnvironmentHandle sky;
     // Textures PBR du ballast (Poly Haven, CC0). Maintenues vivantes par ces handles :
@@ -336,20 +345,21 @@ struct Application::Impl {
     std::array<resource::TextureHandle, 6> terrain_maps;
     bool terrain_textured = false;
 
-    // Végétation : un seul tampon d'instances, refait quand le train a franchi une
-    // cellule. Le semis est purement fonction du hash, donc le refaire est idempotent.
-    render::InstanceBufferId tree_instances = 0;
-    std::uint32_t tree_count = 0;
-    WorldPosition tree_origin{};
-    long tree_snap_x = 0, tree_snap_z = 0;
-    bool tree_snap_valid = false;
-    // Culling CPU (M15) : la liste COMPLÈTE des arbres (conservée pour la retester chaque
-    // frame contre le frustum) et le sous-ensemble VISIBLE recalculé à chaque frame. Ce
-    // dernier est un membre pour éviter une réallocation par frame — on le vide et le
-    // remplit, sa capacité se stabilise. Passé au Renderer par pointeur (DrawItem).
-    std::vector<render::InstanceData> tree_list;
-    std::vector<render::InstanceData> visible_trees;
-    std::uint32_t visible_tree_count = 0;
+    // Bâtiments (M31) : un tampon d'instances PAR VARIANTE (le pipeline instancié ne
+    // connaît qu'une échelle uniforme, la variété des proportions est dans les modèles).
+    // Refaits quand le train change de cellule ; le semis est purement fonction du hash,
+    // donc le refaire est idempotent.
+    std::array<render::InstanceBufferId, kBuildingVariants> building_instances{};
+    std::array<std::uint32_t, kBuildingVariants> building_counts{};
+    WorldPosition building_origin{};
+    long building_snap_x = 0, building_snap_z = 0;
+    bool building_snap_valid = false;
+    // Culling CPU (M15) : les listes COMPLÈTES par variante (conservées pour les retester
+    // chaque frame contre le frustum) et les sous-ensembles VISIBLES recalculés à chaque
+    // frame. Membres pour éviter une réallocation par frame.
+    std::array<std::vector<render::InstanceData>, kBuildingVariants> building_lists;
+    std::array<std::vector<render::InstanceData>, kBuildingVariants> visible_buildings;
+    std::array<std::uint32_t, kBuildingVariants> visible_building_counts{};
     double sim_time = 0.0;  // horloge du vent (s)
     long present_index = 0;  // compte les présentations (banc de mesure, cf. NOIRE_CREEP)
     std::chrono::steady_clock::time_point perf_t0 = std::chrono::steady_clock::now();
@@ -391,6 +401,15 @@ struct Application::Impl {
     WorldPosition pole_origin{};
     long catenary_snap = 0;
     bool catenary_valid = false;
+    // --- Viaduc (M31) : tablier + piles, fenêtre glissante comme la caténaire ---------
+    scene::ViaductProfile viaduct_profile{};
+    render::MeshId viaduct_mesh = 0;
+    render::MeshId viaduct_uploading = 0;  // même sas que la caténaire (jamais de trou)
+    render::MaterialId viaduct_material = 0;
+    WorldPosition viaduct_origin{};
+    WorldPosition viaduct_uploading_origin{};
+    long viaduct_snap = 0;
+    bool viaduct_valid = false;
     render::MaterialId sleeper_material = 0;
     render::MaterialId ballast_material = 0;
     // Terrain : secours = le sol procédural, remplacé par le splatting dès qu'il est prêt.
@@ -479,9 +498,10 @@ struct Application::Impl {
     bool prev_m_down = false;
 
     // --- Cycle Jour/Nuit (M21) -----------------------------------------------
-    // Démarre à 8h du matin. day_cycle_speed = rapport de compression temporelle :
+    // M31 : la simulation démarre à 22 h — Neo-Tokyo se joue de nuit, fenêtres et néons
+    // allumés. day_cycle_speed = rapport de compression temporelle :
     // 1 s réelle = 60 s simulées => une journée complète en ~24 min de jeu.
-    double day_time = 8.0 * 3600.0;
+    double day_time = 22.0 * 3600.0;
     double day_cycle_speed = 60.0;
 
     // --- Phares (M21) -------------------------------------------------------
@@ -562,9 +582,16 @@ struct Application::Impl {
         ballast_desc.roughness_factor = 0.95f;  // aucun reflet spéculaire net
         ballast_material = renderer.create_material(ballast_desc);
 
+        // Viaduc (M31) : béton clair, mat. Le tablier et les piles partagent ce matériau.
+        render::MaterialDesc viaduct_desc;
+        viaduct_desc.base_color_factor = glm::vec4(0.46f, 0.47f, 0.48f, 1.0f);  // béton
+        viaduct_desc.metallic_factor = 0.0f;
+        viaduct_desc.roughness_factor = 0.85f;
+        viaduct_material = renderer.create_material(viaduct_desc);
+
         // --- Caténaire (M12) ---
         // Le poteau : acier galvanisé, mat et clair. `foliage` reste FAUX — il partage le
-        // pipeline instancié avec les arbres, mais ni le vent ni la transmission.
+        // pipeline instancié avec la végétation, mais ni le vent ni la transmission.
         render::MaterialDesc pole_desc;
         pole_desc.base_color_factor = glm::vec4(0.52f, 0.54f, 0.56f, 1.0f);
         pole_desc.metallic_factor = 1.0f;
@@ -581,12 +608,12 @@ struct Application::Impl {
         wire_desc.roughness_factor = 0.45f;
         wire_material = renderer.create_material(wire_desc);
 
-        // M19 : la gare occupe le chainage 0-400 (cf. le module de gare, 10 x 40 m). Sous sa
-        // verrière, la caténaire ne plante PAS de poteaux — ils percuteraient les quais et le
-        // toit ; elle s'y suspend par des attaches, le porteur abaissé sous la verrière.
+        // M19/M31 : la gare occupe le chainage 0-400. Sous son grand toit (intrados à
+        // 7,40 m), la caténaire ne plante PAS de poteaux — ils percuteraient les quais et
+        // le toit ; elle s'y suspend par des attaches, le porteur abaissé sous le toit.
         catenary_profile.canopy_start = 0.0;
         catenary_profile.canopy_end = 400.0;
-        catenary_profile.canopy_attach_height = 5.35;  // juste sous la verrière (toit à 5.40)
+        catenary_profile.canopy_attach_height = 7.30;  // juste sous le toit (à 7,40 m)
 
         const scene::RailMeshData pole = scene::generate_pole_mesh(catenary_profile);
         pole_mesh = renderer.create_mesh_indexed(pole.vertices, pole.indices);
@@ -653,7 +680,13 @@ struct Application::Impl {
         jacobs_bogie_model = resources.load_model("models/metro_bogie.glb");
         // Gare de départ (M18) : un module répété le long de la voie sur 0-400 m.
         station_model = resources.load_model("models/station.glb");
-        tree_model = resources.load_model("models/tree.glb");
+        // Bâtiments Neo-Tokyo (M31) : trois gabarits, semés par reseed_buildings().
+        const char* building_files[kBuildingVariants] = {
+            "models/building_a.glb", "models/building_b.glb", "models/building_c.glb"};
+        for (int v = 0; v < kBuildingVariants; ++v) {
+            building_models[static_cast<std::size_t>(v)] =
+                resources.load_model(building_files[v]);
+        }
         rumble_clip = resources.load_audio("audio/roulement.wav");
 
         // Ballast (Poly Haven, CC0). L'ESPACE COLORIMÉTRIQUE est dicté par le RÔLE :
@@ -893,15 +926,20 @@ struct Application::Impl {
         door_t = glm::clamp(door_t + static_cast<float>(dt) * door_speed * door_dir, 0.0f, 1.0f);
 
         if (++telemetry_ticks % 120 == 0) {
+            std::uint32_t total = 0, visible = 0;
+            for (int v = 0; v < kBuildingVariants; ++v) {
+                total += building_counts[static_cast<std::size_t>(v)];
+                visible += visible_building_counts[static_cast<std::size_t>(v)];
+            }
             const int dh = static_cast<int>(day_time / 3600.0) % 24;
             const int dm = static_cast<int>(day_time / 60.0) % 60;
             log::info("v={:6.1f} km/h | pente={:+5.1f}% | {} | chunks={} | "
                       "pluie={:.0f}% | phares={} | {:02d}:{:02d} | "
-                      "{:.0f} fps (GPU {:.1f} ms) | arbres={}/{} vis",
+                      "{:.0f} fps (GPU {:.1f} ms) | bâtiments={}/{} vis",
                       wagon.speed() * 3.6, wagon.grade_percent(),
                       wagon.slipping() ? "PATINE   " : "adherent ", streamer.active_chunk_count(),
                       wetness * 100.0f, headlights_on ? "ON" : "OFF", dh, dm,
-                      perf_fps, perf_gpu_ms, visible_tree_count, tree_count);
+                      perf_fps, perf_gpu_ms, visible, total);
         }
     }
 
@@ -1005,86 +1043,96 @@ struct Application::Impl {
         return hud;
     }
 
-    // Sème la végétation autour du train. Appelé quand le train change de cellule.
-    void reseed_vegetation() {
+    // Sème les bâtiments autour du train. Appelé quand le train change de cellule.
+    // Mêmes garanties que la végétation du M11 : semis purement fonction du hash de la
+    // cellule, donc déterministe et sans état. Chaque cellule produit au plus UN
+    // immeuble, rangé dans la liste de sa variante (tour / immeuble / barre).
+    void reseed_buildings() {
         const WorldPosition wp = wagon.body_position();
-        std::vector<render::InstanceData> instances;
-        const auto cells = static_cast<long>(kTreeRange / kTreeCell) + 1;
-        const long cx0 = static_cast<long>(std::floor(wp.x / kTreeCell));
-        const long cz0 = static_cast<long>(std::floor(wp.z / kTreeCell));
+        std::array<std::vector<render::InstanceData>, kBuildingVariants> seeded;
+        const auto cells = static_cast<long>(kBuildingRange / kBuildingCell) + 1;
+        const long cx0 = static_cast<long>(std::floor(wp.x / kBuildingCell));
+        const long cz0 = static_cast<long>(std::floor(wp.z / kBuildingCell));
 
         for (long ci = cx0 - cells; ci <= cx0 + cells; ++ci) {
             for (long cj = cz0 - cells; cj <= cz0 + cells; ++cj) {
-                // Hash de la cellule : 3 tirages indépendants (position, présence, taille).
+                // Hash de la cellule : 4 tirages indépendants (variante, position,
+                // échelle, lacet).
                 const std::uint32_t h1 = hash_u32(static_cast<std::uint32_t>(ci) * 73856093u ^
                                                   static_cast<std::uint32_t>(cj) * 19349663u);
                 const std::uint32_t h2 = hash_u32(h1 ^ 0x9e3779b9u);
                 const std::uint32_t h3 = hash_u32(h2 ^ 0x85ebca6bu);
-                // Densité : ~55 % des cellules portent un arbre. Le reste est en culture —
-                // la Champagne est une plaine agricole, pas une forêt.
-                if ((h1 & 0xffffu) > 36000u) {
+                const std::uint32_t h4 = hash_u32(h3 ^ 0xc2b2ae35u);
+                // Densité : ~80 % des cellules sont bâties — mégalopole dense, le vide
+                // entre les tours est rare (c'est lui qui donne la profondeur).
+                if ((h1 & 0xffffu) > 52428u) {
                     continue;
                 }
                 const double jx = static_cast<double>((h2 >> 8) & 0xffffu) / 65535.0;
                 const double jz = static_cast<double>((h3 >> 8) & 0xffffu) / 65535.0;
-                const double wx = (static_cast<double>(ci) + jx) * kTreeCell;
-                const double wz = (static_cast<double>(cj) + jz) * kTreeCell;
+                const double wx = (static_cast<double>(ci) + jx) * kBuildingCell;
+                const double wz = (static_cast<double>(cj) + jz) * kBuildingCell;
 
-                if (std::hypot(wx - wp.x, wz - wp.z) > kTreeRange) {
+                if (std::hypot(wx - wp.x, wz - wp.z) > kBuildingRange) {
                     continue;
                 }
-                // EXCLUSION DE LA VOIE. `corridor_inner` est exactement la largeur de la
-                // plateforme aplanie : au-delà, le terrain redescend en talus, donc c'est
-                // la borne naturelle. Aucun arbre ne peut traverser la rame.
+                // EXCLUSION DU VIADUC : aucun immeuble ne traverse la ligne. Le couloir
+                // est bien plus large que l'emprise du tablier (±4,6 m) : il dégage les
+                // stations et laisse respirer la rue sous le viaduc.
                 const double d = terrain.distance_to_track(wx, wz);
-                if (d < terrain.config().corridor_inner || std::abs(wz - wp.z) > kTreeHalfWidth) {
+                if (d < kBuildingCorridor || std::abs(wz - wp.z) > kBuildingHalfWidth) {
                     continue;
                 }
+
+                // Variante : 20 % de tours hautes, 40 % d'immeubles, 40 % de barres.
+                const std::uint32_t pick = h4 % 10u;
+                const auto variant =
+                    static_cast<std::size_t>(pick < 2u ? 0u : (pick < 6u ? 1u : 2u));
 
                 render::InstanceData inst;
-                const double h = terrain.height(wx, wz);
-                inst.position_scale = glm::vec4(glm::vec3(glm::dvec3(wx, h, wz) - wp),
-                                                0.75f + 0.5f * (static_cast<float>(h3 & 0xffu) / 255.0f));
-                // La phase de vent vient de la position MONDE : deux arbres voisins ne
-                // peuvent pas onduler en cadence, et la phase ne change JAMAIS, même
-                // quand le semis est refait.
-                // z = 1 : AMPLITUDE du vent. Le pipeline instancié sert aussi les poteaux
-                // caténaire, qui la mettent à 0 — c'est l'instance qui décide de ployer ou non.
+                // Posé sur le terrain naturel, ENFONCÉ de 4 m : jamais de jour sous la
+                // semelle quand le sol ondule (la base des modèles est à y = 0).
+                const double h = terrain.height(wx, wz) - 4.0;
+                inst.position_scale = glm::vec4(
+                    glm::vec3(glm::dvec3(wx, h, wz) - wp),
+                    0.75f + 0.65f * (static_cast<float>(h3 & 0xffu) / 255.0f));
+                // Lacet : quarts de tour seulement — une ville en damier. z = 0 : AUCUN
+                // vent, l'instance décide (le pipeline est partagé avec la végétation).
                 inst.rotation_phase =
-                    glm::vec4(static_cast<float>((h2 & 0xffffu) / 65535.0 * 6.2831853),
-                              static_cast<float>(std::fmod(wx * 0.37 + wz * 0.21, 6.2831853)),
-                              1.0f, 0.0f);
-                instances.push_back(inst);
+                    glm::vec4(static_cast<float>((h4 >> 8) & 3u) * 1.5707963f, 0.0f, 0.0f, 0.0f);
+                seeded[variant].push_back(inst);
             }
         }
 
-        if (tree_instances != 0) {
-            renderer.destroy_instances(tree_instances);
+        for (int v = 0; v < kBuildingVariants; ++v) {
+            const auto i = static_cast<std::size_t>(v);
+            if (building_instances[i] != 0) {
+                renderer.destroy_instances(building_instances[i]);
+            }
+            building_instances[i] = renderer.create_instances(seeded[i]);
+            building_counts[i] = static_cast<std::uint32_t>(seeded[i].size());
         }
-        tree_instances = renderer.create_instances(instances);
-        tree_count = static_cast<std::uint32_t>(instances.size());
-        tree_origin = wp;
-        // Conserve la liste CPU : c'est elle qu'on retestera contre le frustum chaque frame
-        // (le tampon GPU persistant, lui, sert la passe d'ombres qui n'est pas cullée).
-        tree_list = std::move(instances);
+        building_origin = wp;
+        // Conserve les listes CPU : ce sont elles qu'on retestera contre le frustum chaque
+        // frame (les tampons GPU persistants servent la passe d'ombres, non cullée).
+        building_lists = std::move(seeded);
     }
 
-    // Culling CPU de la végétation (M15). Reteste la liste complète contre le frustum
-    // caméra et remplit `visible_trees`. Espace CAMÉRA-RELATIF : chaque arbre est ramené
-    // par rapport à la caméra (comme tout le rendu en origine flottante), puis testé
-    // contre les 6 plans extraits de proj*view. ~450 tests => quelques microsecondes.
-    void cull_vegetation(const glm::mat4& view, const glm::mat4& proj) {
-        visible_trees.clear();
-        // Décalage du groupe d'arbres par rapport à la caméra (float, faible) : identique à
-        // la translation de camera.relative_model(tree_origin).
-        const glm::vec3 group = glm::vec3(tree_origin - camera.position());
+    // Culling CPU des bâtiments (M15, adapté M31). Reteste les listes complètes contre le
+    // frustum caméra et remplit `visible_buildings`. Espace CAMÉRA-RELATIF, comme tout le
+    // rendu en origine flottante. ~700 tests => quelques microsecondes.
+    void cull_buildings(const glm::mat4& view, const glm::mat4& proj) {
+        // Hauteur et demi-diagonale de chaque gabarit (gen_building.py), pour la sphère
+        // englobante : tower 22x95x22, block 30x48x30, slab 42x26x22.
+        constexpr float kHeights[kBuildingVariants] = {95.0f, 48.0f, 26.0f};
+        constexpr float kHalfDiag[kBuildingVariants] = {15.6f, 21.2f, 23.7f};
 
-        // Plans du frustum par Gribb-Hartmann sur clip = proj * view (view sans
-        // translation : la caméra est à l'origine, donc `group + inst.pos` est directement
-        // le point à tester). Reverse-z : l'extraction reste correcte (près/loin sont juste
-        // permutés, mais les 6 plans bornent le même volume).
+        // Décalage du groupe par rapport à la caméra (float, faible) : identique à la
+        // translation de camera.relative_model(building_origin).
+        const glm::vec3 group = glm::vec3(building_origin - camera.position());
+
+        // Plans du frustum par Gribb-Hartmann (inchangé depuis le M15).
         const glm::mat4 clip = proj * view;
-        // Lignes de la matrice (glm est column-major : ligne i = (m[0][i]..m[3][i])).
         const glm::vec4 rx{clip[0][0], clip[1][0], clip[2][0], clip[3][0]};
         const glm::vec4 ry{clip[0][1], clip[1][1], clip[2][1], clip[3][1]};
         const glm::vec4 rz{clip[0][2], clip[1][2], clip[2][2], clip[3][2]};
@@ -1095,26 +1143,29 @@ struct Application::Impl {
             if (len > 1e-6f) p /= len;  // normalise => la marge du rayon est en mètres
         }
 
-        for (const render::InstanceData& inst : tree_list) {
-            const glm::vec3 c = group + glm::vec3(inst.position_scale);
-            // Sphère englobante : base sur le sol, l'arbre monte. Centre remonté à la
-            // mi-hauteur, rayon généreux (l'échelle est dans .w). Trop serré ferait
-            // « popper » un arbre en bord d'écran ; trop large ne culle plus rien.
-            const float scale = inst.position_scale.w;
-            const glm::vec3 center = c + glm::vec3(0.0f, 5.0f * scale, 0.0f);
-            const float radius = 7.0f * scale;
-            bool inside = true;
-            for (const glm::vec4& p : planes) {
-                if (glm::dot(glm::vec3(p), center) + p.w < -radius) {
-                    inside = false;
-                    break;
+        for (int v = 0; v < kBuildingVariants; ++v) {
+            const auto i = static_cast<std::size_t>(v);
+            visible_buildings[i].clear();
+            for (const render::InstanceData& inst : building_lists[i]) {
+                const glm::vec3 c = group + glm::vec3(inst.position_scale);
+                // Sphère englobante : base au sol, centre remonté à mi-hauteur, rayon
+                // généreux (hauteur + demi-empreinte, dans l'échelle de l'instance).
+                const float scale = inst.position_scale.w;
+                const glm::vec3 center = c + glm::vec3(0.0f, 0.5f * kHeights[i] * scale, 0.0f);
+                const float radius = (0.55f * kHeights[i] + kHalfDiag[i]) * scale;
+                bool inside = true;
+                for (const glm::vec4& p : planes) {
+                    if (glm::dot(glm::vec3(p), center) + p.w < -radius) {
+                        inside = false;
+                        break;
+                    }
+                }
+                if (inside) {
+                    visible_buildings[i].push_back(inst);
                 }
             }
-            if (inside) {
-                visible_trees.push_back(inst);
-            }
+            visible_building_counts[i] = static_cast<std::uint32_t>(visible_buildings[i].size());
         }
-        visible_tree_count = static_cast<std::uint32_t>(visible_trees.size());
     }
 
     // Caténaire : ré-engendrée quand le train a franchi kCatenaryStep. Les poteaux étant
@@ -1172,6 +1223,40 @@ struct Application::Impl {
         insulator_count = static_cast<std::uint32_t>(data.insulators.size());
         if (insulator_count > 0) {
             insulator_instances = renderer.create_instances(data.insulators);
+        }
+    }
+
+    // Viaduc (M31) : ré-engendré quand le train a franchi kViaductStep. Même sas que la
+    // caténaire (create_mesh_indexed est asynchrone : on ne substitue qu'un maillage
+    // prêt), mêmes grilles ABSOLUES (piles au chainage fixe : rien ne saute).
+    void update_viaduct() {
+        if (viaduct_uploading != 0 && renderer.is_mesh_ready(viaduct_uploading)) {
+            if (viaduct_mesh != 0) {
+                renderer.destroy_mesh(viaduct_mesh);
+            }
+            viaduct_mesh = viaduct_uploading;
+            viaduct_origin = viaduct_uploading_origin;
+            viaduct_uploading = 0;
+            viaduct_valid = true;
+        }
+        const long snap = std::lround(wagon.chainage() / kViaductStep);
+        if (viaduct_uploading != 0 || (viaduct_valid && snap == viaduct_snap)) {
+            return;
+        }
+
+        const double center = static_cast<double>(snap) * kViaductStep;
+        glm::dvec3 pos, tangent;
+        track.sample(center, pos, tangent);
+        const WorldPosition origin{pos};
+        scene::RailMeshData deck = scene::generate_viaduct(
+            track, terrain, center - kViaductRange, center + kViaductRange, origin,
+            viaduct_profile);
+
+        const render::MeshId fresh = renderer.create_mesh_indexed(deck.vertices, deck.indices);
+        if (fresh != 0) {
+            viaduct_uploading = fresh;
+            viaduct_uploading_origin = origin;
+            viaduct_snap = snap;
         }
     }
 
@@ -1260,20 +1345,25 @@ struct Application::Impl {
         // Streaming (thread principal), toujours exécuté (même minimisé).
         streamer.update(wagon.chainage(), renderer);
         update_catenary();
+        update_viaduct();
         clipmap.update(wagon.body_position(), renderer);
 
-        // Végétation : re-semée quand le train franchit une cellule. Le semis étant
-        // déterministe, les arbres déjà présents retombent EXACTEMENT au même endroit —
+        // Bâtiments : re-semés quand le train franchit une cellule. Le semis étant
+        // déterministe, les immeubles déjà présents retombent EXACTEMENT au même endroit —
         // seuls ceux qui entrent ou sortent de portée changent.
-        if (tree_model && tree_model->ready) {
+        bool buildings_ready = true;
+        for (const auto& m : building_models) {
+            buildings_ready = buildings_ready && m && m->ready;
+        }
+        if (buildings_ready) {
             const WorldPosition wp = wagon.body_position();
-            const long sx = static_cast<long>(std::floor(wp.x / kTreeCell));
-            const long sz = static_cast<long>(std::floor(wp.z / kTreeCell));
-            if (!tree_snap_valid || sx != tree_snap_x || sz != tree_snap_z) {
-                reseed_vegetation();
-                tree_snap_x = sx;
-                tree_snap_z = sz;
-                tree_snap_valid = true;
+            const long sx = static_cast<long>(std::floor(wp.x / kBuildingCell));
+            const long sz = static_cast<long>(std::floor(wp.z / kBuildingCell));
+            if (!building_snap_valid || sx != building_snap_x || sz != building_snap_z) {
+                reseed_buildings();
+                building_snap_x = sx;
+                building_snap_z = sz;
+                building_snap_valid = true;
             }
         }
 
@@ -1517,34 +1607,43 @@ struct Application::Impl {
             }
         }
 
-        // Végétation, dessinée APRÈS le terrain et la voie : son fragment fait `discard`,
-        // ce qui INTERDIT l'early-z sur ce pipeline. En la mettant en dernier, au moins le
-        // depth-test rejette tout ce que le sol cache déjà.
-        if (tree_model && tree_model->ready && tree_instances != 0 && tree_count > 0) {
-            // Frustum culling CPU (M15) : ne garde que les arbres dans le champ. Le résultat
-            // (visible_trees) part par pointeur dans cpu_instances => la PASSE PRINCIPALE
-            // dessine ce sous-ensemble. La passe d'ombres, elle, reçoit toujours le tampon
-            // complet (tree_instances/tree_count) : un arbre hors champ projette encore.
-            // NOIRE_NOCULL : désactive le frustum culling (dessine TOUS les arbres dans la
-            // passe principale), pour mesurer le gain. Même esprit que les autres leviers
-            // de banc (NOIRE_PIN_CAM / STILL / CREEP / SPEED).
+        // Bâtiments (M31), dessinés APRÈS le terrain et la voie : leur fragment peut
+        // faire `discard` (pipeline instancié partagé avec le feuillage), ce qui INTERDIT
+        // l'early-z — en dernier, au moins le depth-test rejette ce que le sol cache.
+        {
+            // Frustum culling CPU : la PASSE PRINCIPALE ne dessine que le sous-ensemble
+            // visible ; la passe d'ombres reçoit les tampons complets (une tour hors
+            // champ projette encore). NOIRE_NOCULL : désactive le culling (banc).
             static const bool nocull = std::getenv("NOIRE_NOCULL") != nullptr;
             if (!nocull) {
-                cull_vegetation(uniforms.view, uniforms.proj);
+                cull_buildings(uniforms.view, uniforms.proj);
             } else {
-                visible_tree_count = tree_count;
+                visible_building_counts = building_counts;
             }
-            const glm::mat4 group = camera.relative_model(tree_origin);
-            for (const resource::Model::Primitive& prim : tree_model->primitives) {
-                render::DrawItem item;
-                item.model = group;
-                item.mesh = prim.mesh;
-                item.material = prim.material ? prim.material->id : 0;
-                item.instances = tree_instances;       // complet => ombres
-                item.instance_count = tree_count;
-                item.cpu_instances = nocull ? nullptr : &visible_trees;  // cullé => vue caméra
-                items.push_back(item);
+            const glm::mat4 group = camera.relative_model(building_origin);
+            for (int v = 0; v < kBuildingVariants; ++v) {
+                const auto i = static_cast<std::size_t>(v);
+                if (!building_models[i] || !building_models[i]->ready ||
+                    building_instances[i] == 0 || building_counts[i] == 0) {
+                    continue;
+                }
+                for (const resource::Model::Primitive& prim : building_models[i]->primitives) {
+                    render::DrawItem item;
+                    item.model = group;
+                    item.mesh = prim.mesh;
+                    item.material = prim.material ? prim.material->id : 0;
+                    item.instances = building_instances[i];   // complet => ombres
+                    item.instance_count = building_counts[i];
+                    item.cpu_instances = nocull ? nullptr : &visible_buildings[i];
+                    items.push_back(item);
+                }
             }
+        }
+
+        // Viaduc (M31) : tablier + piles, opaque, avec la voie (il la porte).
+        if (viaduct_mesh != 0) {
+            items.push_back(render::DrawItem{camera.relative_model(viaduct_origin),
+                                             viaduct_mesh, viaduct_material});
         }
 
         // Poteaux caténaire (M12) : OPAQUES, donc avec le reste. Un seul draw call pour
@@ -1798,6 +1897,9 @@ struct Application::Impl {
         voiture_model.reset();
         jacobs_bogie_model.reset();
         station_model.reset();
+        for (auto& m : building_models) {
+            m.reset();
+        }
         audio.shutdown();
         renderer.wait_idle();
         renderer.shutdown();

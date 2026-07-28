@@ -4,16 +4,19 @@
 #include "common/pbr.glsl"
 #include "common/foliage.glsl"
 
-// set = 1 : matériau ordinaire (3 textures). Le feuillage n'utilise que la base color —
-// mais pour son ALPHA autant que pour sa couleur.
+// set = 1 : matériau ordinaire (4 textures). Le feuillage n'utilise que la base color —
+// mais pour son ALPHA autant que pour sa couleur. L'émissif sert aux bâtiments
+// instanciés (M31) : ce pipeline ne sert plus qu'à des instances.
 layout(set = 1, binding = 0) uniform sampler2D baseColorMap;
 layout(set = 1, binding = 1) uniform sampler2D metallicRoughnessMap;
 layout(set = 1, binding = 2) uniform sampler2D normalMap;
+layout(set = 1, binding = 3) uniform sampler2D emissiveMap;
 
 layout(push_constant) uniform PushConstants {
     mat4 model;
     vec4 baseColorFactor;
     vec4 pbrFactors;  // x = metallic, y = roughness, z = normalScale
+    vec4 emissiveFactor;  // rgb = émissif HDR (M31)
 } object;
 
 layout(location = 0) in vec2 fragUV;
@@ -51,6 +54,12 @@ void main() {
 
     // Le pipeline instancié sert AUSSI les poteaux caténaire (M12), qui ne veulent ni
     // diffus enveloppé ni transmission : c'est le matériau qui tranche, via pbrFactors.w.
+    // Émissif (M31) : fenêtres des bâtiments instanciés, modulé par la nuit comme dans
+    // mesh_textured.frag.
+    vec3 emissive = texture(emissiveMap, fragUV).rgb * object.emissiveFactor.rgb *
+                    mix(0.15, 1.0, u.skyParams.x);
     outColor = vec4(
-        shadeSurfaceEx(base.rgb, metallic, roughness, N, cameraRelPos, object.pbrFactors.w), 1.0);
+        shadeSurfaceEx(base.rgb, metallic, roughness, N, cameraRelPos, object.pbrFactors.w,
+                       emissive),
+        1.0);
 }

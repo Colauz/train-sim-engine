@@ -9,12 +9,14 @@
 layout(set = 1, binding = 0) uniform sampler2D baseColorMap;
 layout(set = 1, binding = 1) uniform sampler2D metallicRoughnessMap;
 layout(set = 1, binding = 2) uniform sampler2D normalMap;
+layout(set = 1, binding = 3) uniform sampler2D emissiveMap;
 
 // Miroir exact de TexturedPushConstants (renderer.cpp) : cf. mesh_textured.vert.
 layout(push_constant) uniform PushConstants {
     mat4 model;
     vec4 baseColorFactor;
     vec4 pbrFactors;  // x = metallic, y = roughness, z = normalScale
+    vec4 emissiveFactor;  // rgb = émissif HDR (M31)
 } object;
 
 layout(location = 0) in vec2 fragUV;
@@ -37,5 +39,12 @@ void main() {
     vec3 N = shadingNormal(fragNormal, fragTangent, texture(normalMap, fragUV).rgb,
                            object.pbrFactors.z);
 
-    outColor = vec4(shadeSurface(albedo, metallic, roughness, N, cameraRelPos), alpha);
+    // Émissif (M31) : convention glTF (facteur * texture), modulé par la NUIT
+    // (u.skyParams.x) : les fenêtres et les néons veillent à ~15 % le jour et flambent
+    // dès que le soleil se couche. L'ACES, en aval, gère le HDR.
+    vec3 emissive = texture(emissiveMap, fragUV).rgb * object.emissiveFactor.rgb *
+                    mix(0.15, 1.0, u.skyParams.x);
+
+    outColor = vec4(shadeSurface(albedo, metallic, roughness, N, cameraRelPos, emissive),
+                    alpha);
 }

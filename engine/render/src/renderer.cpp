@@ -103,8 +103,9 @@ struct TexturedPushConstants {
     glm::mat4 model;               // offset 0
     glm::vec4 base_color_factor;   // offset 64
     glm::vec4 pbr_factors;         // offset 80 : x=metallic, y=roughness, z=normal_scale
+    glm::vec4 emissive_factor;     // offset 96 : rgb = émissif HDR (M31)
 };
-static_assert(sizeof(TexturedPushConstants) == 96,
+static_assert(sizeof(TexturedPushConstants) == 112,
               "les push constants doivent tenir dans les 128 octets garantis par la spec");
 
 // Push constants de l'ombre du FEUILLAGE. Le temps y passe plutôt que par le set 0 :
@@ -2700,9 +2701,11 @@ TextureId Renderer::resolve_texture(TextureId requested, TextureId fallback) con
 
 MaterialId Renderer::create_material(const MaterialDesc& desc) {
     Material material;
-    material.textures = {desc.base_color, desc.metallic_roughness, desc.normal, 0, 0, 0};
+    material.textures = {desc.base_color, desc.metallic_roughness, desc.normal,
+                         desc.emissive, 0, 0};
     material.texture_count = kMaterialTextures;
     material.base_color_factor = desc.base_color_factor;
+    material.emissive_factor = glm::vec4(desc.emissive_factor, 0.0f);
     material.shading = desc.shading;
     // .w porte l'« être du feuillage ». Le mettre dans le MATÉRIAU et non dans le pipeline
     // est ce qui permet à l'arbre et au poteau de partager le pipeline instancié.
@@ -2734,7 +2737,9 @@ void Renderer::update_pending_materials() {
             continue;
         }
         // Secours PAR RÔLE : le terrain répète simplement le triplet (base, mr, normale)
-        // pour son second jeu, donc le rôle se déduit de l'indice modulo 3.
+        // pour son second jeu, donc le rôle se déduit de l'indice modulo 3. L'émissif
+        // (indice 3 => 3 % 3 = 0) tombe sur le blanc : c'est le FACTEUR seul qui décide,
+        // et il vaut 0 par défaut — aucune lueur fantôme.
         const TextureId fallbacks[3] = {white_texture_, default_mr_texture_, flat_normal_texture_};
         std::array<TextureId, kTerrainTextures> resolved{};
         bool all_ready = true;
@@ -3709,6 +3714,7 @@ void Renderer::record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
                 push.model = item.model;
                 push.base_color_factor = material.base_color_factor;
                 push.pbr_factors = material.pbr_factors;
+                push.emissive_factor = material.emissive_factor;
 
                 const VkDescriptorSet env_set = resolve_environment_set();
                 if (env_set == VK_NULL_HANDLE) {

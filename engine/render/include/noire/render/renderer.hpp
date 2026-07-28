@@ -110,8 +110,13 @@ struct MaterialDesc {
     TextureId base_color = 0;          // sRGB
     TextureId metallic_roughness = 0;  // linéaire — G = roughness, B = metallic (glTF)
     TextureId normal = 0;              // linéaire — normal map en espace tangent
+    TextureId emissive = 0;            // sRGB — fenêtres/néons (M31) ; secours = blanc 1x1
     // Multiplie la texture de base. LINÉAIRE (la conversion sRGB est matérielle).
     glm::vec4 base_color_factor{1.0f, 1.0f, 1.0f, 1.0f};
+    // Facteur émissif LINÉAIRE, HDR autorisé (> 1 pour un néon qui flambe). Noir = aucun
+    // émissif (défaut glTF). Multiplie la texture émissive, puis le facteur nuit dans le
+    // shader : les enseignes s'allument quand le jour tombe.
+    glm::vec3 emissive_factor{0.0f, 0.0f, 0.0f};
     float metallic_factor = 1.0f;   // défauts glTF
     float roughness_factor = 1.0f;
     float normal_scale = 1.0f;
@@ -310,12 +315,15 @@ private:
     // téléversées, donc AVANT tout bind : on ne réécrit jamais un set en vol.
     struct Material {
         VkDescriptorSet descriptor = VK_NULL_HANDLE;
-        // 3 textures (matériau ordinaire) ou 6 (terrain : herbe + craie).
+        // 4 textures (matériau ordinaire) ou 6 (terrain : herbe + craie).
         std::array<TextureId, 6> textures{};
-        std::uint32_t texture_count = 3;
+        std::uint32_t texture_count = 4;
         Shading shading = Shading::Textured;
         glm::vec4 base_color_factor{1.0f};
         glm::vec4 pbr_factors{1.0f, 1.0f, 1.0f, 0.0f};  // x=metallic, y=roughness, z=normal_scale
+        // Émissif (M31) : rgb = facteur HDR (peut dépasser 1,0 — néons, fenêtres),
+        // .a inutilisé. S'AJOUTE à l'éclairage, modulé par le facteur nuit (pbr.glsl).
+        glm::vec4 emissive_factor{0.0f};
         bool written = false;
         // M22 : matériau semi-transparent (vitrage). Dessiné par pipeline_transparent_.
         bool transparent = false;
@@ -558,7 +566,7 @@ private:
     MaterialId default_material_ = 0;     // tout en secours (DrawItem::material == 0)
     static constexpr std::uint32_t kMaxTextures = 128;
     static constexpr std::uint32_t kMaxMaterials = 64;
-    static constexpr std::uint32_t kMaterialTextures = 3;  // bindings du set 1
+    static constexpr std::uint32_t kMaterialTextures = 4;  // bindings du set 1
     static constexpr std::uint32_t kTerrainTextures = 6;   // bindings du set 1 terrain
 
     // --- Environnement / skybox (M8 étape 6a) --------------------------------

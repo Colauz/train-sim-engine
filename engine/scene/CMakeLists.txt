@@ -1,6 +1,7 @@
 add_library(noire_scene
     src/catenary.cpp
     src/track_mesh.cpp
+    src/viaduct.cpp
     src/world_streamer.cpp
     src/terrain_clipmap.cpp)
 add_library(noire::scene ALIAS noire_scene)

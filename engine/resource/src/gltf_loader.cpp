@@ -134,6 +134,13 @@ int resolve_material(const cgltf_material* material, const std::string& gltf_dir
                                           render::TextureFormat::LinearData, out, image_cache);
         data.normal_scale = material->normal_texture.scale;
     }
+    // Émissif (M31) : couleur => sRGB, comme la base color.
+    data.emissive_factor = glm::vec3(material->emissive_factor[0], material->emissive_factor[1],
+                                     material->emissive_factor[2]);
+    if (material->emissive_texture.texture != nullptr) {
+        data.emissive_image = resolve_image(material->emissive_texture.texture->image, gltf_dir,
+                                            render::TextureFormat::SrgbColor, out, image_cache);
+    }
 
     const int index = static_cast<int>(out.materials.size());
     out.materials.push_back(data);

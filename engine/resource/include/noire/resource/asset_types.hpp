@@ -27,7 +27,12 @@ struct MaterialData {
     int base_color_image = -1;
     int metallic_roughness_image = -1;
     int normal_image = -1;
+    int emissive_image = -1;
     glm::vec4 base_color_factor{1.0f, 1.0f, 1.0f, 1.0f};
+    // Facteur émissif glTF. Les scripts maison (gen_building, gen_station) écrivent des
+    // valeurs > 1 : hors spec stricte (qui exige KHR_materials_emissive_strength) mais
+    // cgltf les lit telles quelles, et c'est ce qui donne le HDR des néons (M31).
+    glm::vec3 emissive_factor{0.0f, 0.0f, 0.0f};
     float metallic_factor = 1.0f;
     float roughness_factor = 1.0f;
     float normal_scale = 1.0f;

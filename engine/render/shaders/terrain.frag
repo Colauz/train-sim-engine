@@ -155,5 +155,5 @@ void main() {
     vec3 nMap = normalize(mix(gNor, cNor, chalk) * 2.0 - 1.0) * 0.5 + 0.5;
     vec3 N = shadingNormal(fragNormal, fragTangent, nMap, 1.0);
 
-    outColor = vec4(shadeSurface(albedo, metallic, roughness, N, cameraRelPos), 1.0);
+    outColor = vec4(shadeSurface(albedo, metallic, roughness, N, cameraRelPos, vec3(0.0)), 1.0);
 }

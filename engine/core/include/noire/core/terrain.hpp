@@ -7,25 +7,18 @@
 
 namespace noire {
 
-// Paramètres du relief. Valeurs calées sur la Champagne crayeuse autour de
-// Châlons-en-Champagne : vallonnée en douceur, pas de canyon.
+// Paramètres du relief. M31 (Neo-Tokyo) : la ville est bâtie sur une plaine douce —
+// l'ancien vallonné champenois (25 m) enterrait les immeubles ou les faisait flotter.
 struct TerrainConfig {
-    // Dénivelé autour du niveau moyen. À 15 m, le talus moyen le long de la voie ne fait
-    // que 4,4 m : la ligne effleure le terrain au lieu de le fendre, et l'oeil lit « plat ».
-    // À 25 m : 6,3 m de talus moyen, 20 m au plus fort — soit exactement la fourchette
-    // « 20 à 40 m » visée, sans jamais devenir un canyon.
-    double amplitude = 25.0;
-    // Longueur d'onde de la 1re octave. C'est elle, PAS l'amplitude, qui décide si le
-    // relief se voit : à 2400 m pour 12 m d'amplitude, la pente max tombe à 4° et l'oeil
-    // lit « plat » (mesuré). À 1200 m : 8,6° et ~19 m de relief par km — vallonné et
-    // lisible, sans devenir alpin. En dessous de 900 m ça devient abrupt, ce qui n'est
-    // plus la Champagne.
+    // Dénivelé autour du niveau moyen. 8 m suffisent à animer le sol entre les tours sans
+    // jamais menacer les empreintes des bâtiments (qui s'enterrent de quelques mètres).
+    double amplitude = 8.0;
+    // Longueur d'onde de la 1re octave. Grande : la plaine urbaine ondule en douceur.
     double base_wavelength = 1200.0;
     int octaves = 4;                 // chaque octave double la fréquence et halve l'amplitude
-    // Corridor ferroviaire : c'est LE mécanisme du jalon. À moins de `inner` de l'axe, le
-    // terrain EST la plateforme (plat) ; au-delà de `outer`, il est purement naturel ;
-    // entre les deux, l'interpolation FABRIQUE le remblai ou la tranchée — il n'y a rien
-    // à synchroniser, c'est la même fonction des deux côtés.
+    // Corridor ferroviaire : historiquement la zone aplanie autour de la voie. Depuis le
+    // M31 la voie est un viaduc et le terrain est partout naturel (cf. Terrain::height) —
+    // ces champs ne servent plus qu'au semis (exclusion autour de l'axe).
     double corridor_inner = 25.0;
     double corridor_outer = 120.0;
     double ballast_depth = 0.8;      // le terrain sous la voie = plan de roulement - 0.8

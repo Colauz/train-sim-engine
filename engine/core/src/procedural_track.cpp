@@ -7,7 +7,7 @@ namespace noire {
 void ProceduralTrack::sample(double x, glm::dvec3& position, glm::dvec3& tangent) const {
     const double z = lateral_amp_ * std::sin(x / lateral_wave_) +
                      lateral_amp2_ * std::sin(x / lateral_wave2_);
-    const double y = vertical_amp_ * std::sin(x / vertical_wave_);
+    const double y = base_height_ + vertical_amp_ * std::sin(x / vertical_wave_);
 
     // Dérivées par rapport à x (pour la tangente).
     const double dz = (lateral_amp_ / lateral_wave_) * std::cos(x / lateral_wave_) +
