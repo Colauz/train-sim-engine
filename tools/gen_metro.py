@@ -90,11 +90,16 @@ for _ in range(16):
     MATERIALS.append({"name": "porte", "factor": [0.72, 0.74, 0.77, 1.0],
                       "metallic": 0.90, "roughness": 0.38})
 MAT_DOOR0 = 10
-# 26..28 : bogie + 2 essieux (parts séparées, les 2 dernières du GLB bogie).
+# 26..41 : bande verte sur les 16 battants de porte (M36)
+for _ in range(16):
+    MATERIALS.append({"name": "bande", "factor": [0.42, 0.73, 0.35, 1.0],
+                      "metallic": 0.20, "roughness": 0.40})
+MAT_DOOR_BANDE0 = 26
+# 42..44 : bogie + 2 essieux (parts séparées, les 3 dernières du GLB bogie).
 MATERIALS.append({"name": "bogie", "factor": [0.09, 0.09, 0.10, 1.0], "metallic": 0.0, "roughness": 0.65})
 MATERIALS.append({"name": "essieu", "factor": [0.55, 0.55, 0.56, 1.0], "metallic": 1.0, "roughness": 0.30})
 MATERIALS.append({"name": "essieu", "factor": [0.55, 0.55, 0.56, 1.0], "metallic": 1.0, "roughness": 0.30})
-MAT_BOGIE, MAT_AXLE_A, MAT_AXLE_B = 26, 27, 28
+MAT_BOGIE, MAT_AXLE_A, MAT_AXLE_B = 42, 43, 44
 
 # Embrasures de portes (z0, z1, y0, y1). La motrice décale sa 1re porte vers
 # l'arrière (la cloison de cabine occupe z = -8.0).
@@ -210,7 +215,7 @@ def build_floor(parts):
                             HALF_W - 0.10, BODY_BOT - 0.14, Z_TAIL - 1.2)
 
 
-def build_side_walls(parts, openings=OPENINGS, windows=WINDOWS):
+def build_side_walls(parts, openings=OPENINGS, windows=WINDOWS, doorways=DOORWAYS):
     """Murs latéraux avec fenêtres et portes DÉCOUPÉES, verre dans les baies."""
     for side in (-1.0, 1.0):
         xa, xb = sorted((side * HALF_W, side * (HALF_W - WALL)))
@@ -219,11 +224,19 @@ def build_side_walls(parts, openings=OPENINGS, windows=WINDOWS):
         for (z0, z1, y0, y1) in windows:
             parts[MAT_GLASS].add_box(xa - 0.005, y0, z0, xb + 0.005, y1, z1,
                                      top=False, bot=False, front=False, back=False)
-        # Bande verte Yamanote plaquée : décalée de 2 mm HORS du plan du mur
-        # (sa face interne ne doit pas être coplanaire avec la tôle — M30.5).
+        # Bande verte Yamanote DÉCOUPÉE sur la carrosserie fixe (M36) :
+        # Saute les ouvertures des portes afin de ne pas flotter à l'ouverture.
         x0, x1 = sorted((side * (HALF_W + 0.002), side * (HALF_W + 0.014)))
-        parts[MAT_BANDE].add_box(x0, WIN_SILL - 0.22, Z_HEAD + 0.3,
-                                 x1, WIN_SILL - 0.04, Z_TAIL - 0.3)
+        door_spans = sorted([(d[0], d[1]) for d in doorways])
+        cur_z = Z_HEAD + 0.3
+        for (dz0, dz1) in door_spans:
+            if dz0 > cur_z:
+                parts[MAT_BANDE].add_box(x0, WIN_SILL - 0.22, cur_z,
+                                         x1, WIN_SILL - 0.04, dz0)
+            cur_z = max(cur_z, dz1)
+        if Z_TAIL - 0.3 > cur_z:
+            parts[MAT_BANDE].add_box(x0, WIN_SILL - 0.22, cur_z,
+                                     x1, WIN_SILL - 0.04, Z_TAIL - 0.3)
 
 
 def build_roof(parts):
@@ -326,48 +339,54 @@ def build_cab(parts):
     parts[MAT_BENCH].add_box(-0.26, -0.45, -8.27, 0.26, 0.15, -8.17)         # dossier
 
 
-def build_door_leaf(part, side, z0, z1):
-    """Un vantail coulissant, AFFLEURANT fermé (rentré de 4 mm, et 4 mm de jour
-    au milieu de la paire : aucune face coplanaire, M30.5)."""
+def build_door_leaf(steel_part, bande_part, side, z0, z1):
+    """Un vantail coulissant (panneau en acier + segment de bande verte M36)."""
     x_out = side * (HALF_W - 0.004)
     x_in = side * (HALF_W - 0.084)
-    part.add_box(min(x_out, x_in), DOOR_Y0 + 0.004, z0 + 0.004,
-                 max(x_out, x_in), DOOR_Y1 - 0.004, z1 - 0.004)
+    steel_part.add_box(min(x_out, x_in), DOOR_Y0 + 0.004, z0 + 0.004,
+                       max(x_out, x_in), DOOR_Y1 - 0.004, z1 - 0.004)
+
+    # Segment de bande verte fixé sur la face extérieure du vantail (M36)
+    bx0, bx1 = sorted((side * (HALF_W - 0.004 + 0.002), side * (HALF_W - 0.004 + 0.014)))
+    bande_part.add_box(bx0, WIN_SILL - 0.22, z0 + 0.004,
+                       bx1, WIN_SILL - 0.04, z1 - 0.004)
 
 
 def build_door_parts(parts, doorways):
-    """LES 16 DERNIÈRES PARTS du GLB : battants. Embrasures 0-3 = flanc droit
-    (x>0), 4-7 = flanc gauche ; paire = vantail A (coulisse vers -z) puis B
-    (vers +z). Convention INDEX que l'app C++ anime (pas de lookup par nom)."""
+    """LES 32 DERNIÈRES PARTS du GLB : battants (16 acier + 16 bande verte M36).
+    Embrasures 0-3 = flanc droit (x>0), 4-7 = flanc gauche ; paire = vantail A (coulisse vers -z)
+    puis B (vers +z). Convention INDEX que l'app C++ anime."""
     for d in range(8):
         side = 1.0 if d < 4 else -1.0
         z0, z1, _, _ = doorways[d % 4]
         zc = 0.5 * (z0 + z1)
-        build_door_leaf(parts[MAT_DOOR0 + 2 * d], side, z0, zc)       # vantail A
-        build_door_leaf(parts[MAT_DOOR0 + 2 * d + 1], side, zc, z1)   # vantail B
+        # Vantail A
+        build_door_leaf(parts[MAT_DOOR0 + 2 * d], parts[MAT_DOOR_BANDE0 + 2 * d], side, z0, zc)
+        # Vantail B
+        build_door_leaf(parts[MAT_DOOR0 + 2 * d + 1], parts[MAT_DOOR_BANDE0 + 2 * d + 1], side, zc, z1)
 
 
 def build_motrice(out):
     parts = [Part() for _ in MATERIALS]
     build_floor(parts)
-    build_side_walls(parts, MOTRICE_OPENINGS, MOTRICE_WINDOWS)
+    build_side_walls(parts, MOTRICE_OPENINGS, MOTRICE_WINDOWS, MOTRICE_DOORWAYS)
     build_roof(parts)
     build_end_face(parts, Z_HEAD, with_windshield=True)
     build_end_face(parts, Z_TAIL, with_windshield=False)
     build_interior(parts, MOTRICE_CENTERS)
     build_cab(parts)
-    # Portes de la motrice ANIMÉES elles aussi (M30.5) : 16 dernières primitives.
+    # Portes de la motrice ANIMÉES elles aussi (M30.5) : 32 dernières primitives.
     build_door_parts(parts, MOTRICE_DOORWAYS)
     write_glb(out, parts, "E235_motrice")
 
 
 # ==============================================================================
-# VOITURE — 4 doubles portes par face, battants = 16 dernières primitives
+# VOITURE — 4 doubles portes par face, battants = 32 dernières primitives
 # ==============================================================================
 def build_voiture(out):
     parts = [Part() for _ in MATERIALS]
     build_floor(parts)
-    build_side_walls(parts)
+    build_side_walls(parts, OPENINGS, WINDOWS, DOORWAYS)
     build_roof(parts)
     build_end_face(parts, Z_HEAD, with_windshield=False)
     build_end_face(parts, Z_TAIL, with_windshield=False)

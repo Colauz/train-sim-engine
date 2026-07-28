@@ -1939,22 +1939,24 @@ struct Application::Impl {
         // physique multi-corps), mais SES BOGIES sont dessinés SÉPARÉMENT — plaqués sur la
         // voie, sans le moindre tangage de caisse. C'est la HIÉRARCHIE ferroviaire correcte :
         // le bogie roule sur le rail, la caisse flotte au-dessus sur ses ressorts.
-        // M30.5 : comme pour les voitures, les 16 DERNIÈRES primitives de la motrice sont
-        // les battants de porte (même convention, même animation).
+        // M30.5 / M36 : les dernières primitives de la motrice / voiture sont les battants de porte
+        // (16 battants en acier + optionnellement 16 décors de bande verte solidaire des portes).
         constexpr int kDoorPairs = 8;  // 4 doubles portes par face
         const float door_t1 = glm::clamp(door_t / 0.3f, 0.0f, 1.0f);
         const float door_t2 = glm::clamp((door_t - 0.3f) / 0.7f, 0.0f, 1.0f);
         auto push_car = [&](const resource::ModelHandle& model, const glm::mat4& caisse_m) {
             const auto& prims = model->primitives;
             const int n_prims = static_cast<int>(prims.size());
-            const bool has_doors = n_prims >= 2 * kDoorPairs;
-            const auto body_count = static_cast<std::size_t>(
-                has_doors ? n_prims - 2 * kDoorPairs : n_prims);
+            const bool has_door_bands = n_prims >= 4 * kDoorPairs; // 32 primitives de portes (M36)
+            const bool has_doors = n_prims >= 2 * kDoorPairs;      // 16 primitives de portes
+            const int door_prims = has_door_bands ? 4 * kDoorPairs : (has_doors ? 2 * kDoorPairs : 0);
+            const auto body_count = static_cast<std::size_t>(n_prims - door_prims);
+
             for (std::size_t j = 0; j < body_count; ++j) {
                 const render::MaterialId mat = prims[j].material ? prims[j].material->id : 0;
                 items.push_back(render::DrawItem{caisse_m, prims[j].mesh, mat});
             }
-            if (has_doors) {
+            if (door_prims > 0) {
                 for (int d = 0; d < kDoorPairs; ++d) {
                     const float sx = (d < 4) ? +1.0f : -1.0f;  // flanc droit / gauche
                     for (int leaf = 0; leaf < 2; ++leaf) {
@@ -1962,12 +1964,25 @@ struct Application::Impl {
                         const glm::mat4 door_local = glm::translate(
                             glm::mat4(1.0f),
                             glm::vec3(sx * 0.10f * door_t1, 0.0f, sz * 0.60f * door_t2));
-                        const auto prim_idx = static_cast<std::size_t>(
-                            n_prims - 2 * kDoorPairs + 2 * d + leaf);
-                        const render::MaterialId mat =
-                            prims[prim_idx].material ? prims[prim_idx].material->id : 0;
+                        const int leaf_idx = 2 * d + leaf;
+
+                        // 1. Panneau de battant en acier
+                        const auto prim_steel = static_cast<std::size_t>(
+                            n_prims - door_prims + leaf_idx);
+                        const render::MaterialId mat_steel =
+                            prims[prim_steel].material ? prims[prim_steel].material->id : 0;
                         items.push_back(
-                            render::DrawItem{caisse_m * door_local, prims[prim_idx].mesh, mat});
+                            render::DrawItem{caisse_m * door_local, prims[prim_steel].mesh, mat_steel});
+
+                        // 2. Décoration bande verte sur le battant (si présente M36)
+                        if (has_door_bands) {
+                            const auto prim_band = static_cast<std::size_t>(
+                                n_prims - 2 * kDoorPairs + leaf_idx);
+                            const render::MaterialId mat_band =
+                                prims[prim_band].material ? prims[prim_band].material->id : 0;
+                            items.push_back(
+                                render::DrawItem{caisse_m * door_local, prims[prim_band].mesh, mat_band});
+                        }
                     }
                 }
             }
