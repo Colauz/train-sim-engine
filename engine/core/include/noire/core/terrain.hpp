@@ -28,11 +28,6 @@ struct TerrainConfig {
 // appelable simultanément depuis les workers (génération de tuiles), depuis le
 // générateur de voie (accotement) et depuis le semis de végétation. Aucune LUT, aucun
 // heightmap : le monde est infini et reproductible à l'identique.
-//
-// HYPOTHÈSE : la voie progresse selon +x, donc le chainage vaut (x monde - origine).
-// C'est vrai de ProceduralTrack. Une vraie ligne Châlons-Paris, aux courbes arbitraires,
-// exigerait une recherche du point le plus proche sur la spline — à traiter le jour où
-// la voie ne sera plus une fonction de x.
 class Terrain {
 public:
     Terrain(const TrackSource& track, TerrainConfig config = {});
@@ -41,8 +36,8 @@ public:
     [[nodiscard]] double height(double wx, double wz) const;
     // Normale du sol, par différences centrées sur height().
     [[nodiscard]] glm::dvec3 normal(double wx, double wz, double step = 1.0) const;
-    // Distance horizontale à l'axe de la voie. Sert au semis de végétation : aucun arbre
-    // ne doit pousser sur la plateforme.
+    // Distance horizontale euclidienne à l'axe de la voie (point le plus proche sur la
+    // spline, M45). Sert au semis : aucun bâtiment ne doit empiéter sur le corridor.
     [[nodiscard]] double distance_to_track(double wx, double wz) const;
 
     [[nodiscard]] const TerrainConfig& config() const { return config_; }

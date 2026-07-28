@@ -160,7 +160,7 @@ constexpr double kViaductStep = 250.0;
 constexpr double kBuildingCell = 30.0;        // une cellule de semis, en mètres (= CityGrid)
 constexpr double kBuildingHalfWidth = 380.0;  // portée latérale de part et d'autre du viaduc
 constexpr double kBuildingRange = 700.0;      // au-delà, une tour de 100 m fond dans la nuit
-constexpr double kBuildingCorridor = 15.0;    // M44 : exclusion absolue autour de l'axe de la voie
+constexpr double kBuildingCorridor = 20.0;    // M45 : distance minimale centre-immeuble ↔ axe voie
 constexpr int kBuildingVariants = 3;          // tower / block / slab (gen_building.py)
 
 // --- Calibrage des modèles importés (M9) ------------------------------------
@@ -1407,14 +1407,6 @@ struct Application::Impl {
                 const auto variant =
                     static_cast<std::size_t>(pick < 2u ? 0u : (pick < 6u ? 1u : 2u));
 
-                // EXCLUSION DU VIADUC : exclusion stricte du couloir de la voie
-                const double d = terrain.distance_to_track(wx, wz);
-                if (d < kBuildingCorridor || std::abs(wz - wp.z) > kBuildingHalfWidth) {
-                    continue;
-                }
-
-                render::InstanceData inst;
-                const double h = terrain.height(wx, wz) - 4.0;
                 // M44 : hauteur d'immeuble voulue entre 20 et 150 m. L'échelle
                 // d'instance ramène le gabarit du modèle (tour 95 m, block 48 m,
                 // slab 26 m — gen_building.py) exactement à cette hauteur.
@@ -1422,6 +1414,22 @@ struct Application::Impl {
                 const float desired_h =
                     20.0f + 130.0f * (static_cast<float>(h3 & 0xffu) / 255.0f);
                 const float scale = desired_h / kModelHeights[variant];
+
+                // M45 — CORRIDOR DE SÉCURITÉ ABSOLU : distance euclidienne réelle entre
+                // le centre de l'immeuble et l'axe de la voie (point le plus proche sur
+                // la spline, cf. Terrain::distance_to_track). Le spawn est ANNULÉ si le
+                // bâtiment — son empreinte réelle à l'échelle comprise — approche à
+                // moins de 20 m de l'axe. Aucun mur ne peut traverser le viaduc.
+                constexpr float kHalfDiag[kBuildingVariants] = {15.6f, 21.2f, 23.7f};
+                const double clearance =
+                    kBuildingCorridor + static_cast<double>(kHalfDiag[variant]) * scale;
+                const double d = terrain.distance_to_track(wx, wz);
+                if (d < clearance || std::abs(wz - wp.z) > kBuildingHalfWidth) {
+                    continue;
+                }
+
+                render::InstanceData inst;
+                const double h = terrain.height(wx, wz) - 4.0;
                 inst.position_scale = glm::vec4(
                     glm::vec3(glm::dvec3(wx, h, wz) - wp), scale);
 

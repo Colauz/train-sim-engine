@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace noire {
 
@@ -106,10 +107,32 @@ double Terrain::fbm(double x, double z) const {
 }
 
 double Terrain::distance_to_track(double wx, double wz) const {
-    glm::dvec3 pos;
-    glm::dvec3 tangent;
-    track_.sample(wx - origin_x_, pos, tangent);
-    return std::abs(wz - pos.z);
+    // M45 : distance euclidienne RÉELLE à l'axe de la voie, et plus l'approximation
+    // |wz - z(s)| qui n'était valable que pour une voie presque droite alignée sur X —
+    // en courbe, elle laissait des immeubles paver le viaduc. On cherche le chainage
+    // qui minimise la distance horizontale : balayage grossier autour de l'estimation
+    // (wx - origin_x_), puis deux raffinements. Coût : ~140 samples de spline par appel.
+    glm::dvec3 pos, tangent;
+
+    double best_s = wx - origin_x_;
+    double best_d2 = std::numeric_limits<double>::max();
+
+    double lo = best_s - 400.0, hi = best_s + 400.0, step = 5.0;
+    for (int pass = 0; pass < 3; ++pass) {
+        for (double s = lo; s <= hi; s += step) {
+            track_.sample(s, pos, tangent);
+            const double dx = pos.x - wx, dz = pos.z - wz;
+            const double d2 = dx * dx + dz * dz;
+            if (d2 < best_d2) {
+                best_d2 = d2;
+                best_s = s;
+            }
+        }
+        lo = best_s - step;
+        hi = best_s + step;
+        step *= 0.1;
+    }
+    return std::sqrt(best_d2);
 }
 
 double Terrain::height(double wx, double wz) const {
