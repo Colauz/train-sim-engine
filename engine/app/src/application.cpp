@@ -806,11 +806,16 @@ struct Application::Impl {
     void update_input(double dt) {
         using platform::Key;
 
-        // --- Menu Pause & Plein écran (M33) ---
+        // --- Menu Pause & Plein écran (M33 / M35) ---
         const bool esc_down = window.is_key_down(Key::Escape);
         if (esc_down && !prev_esc_down) {
             is_paused = !is_paused;
             window.set_cursor_captured(!is_paused && camera_mode == CameraMode::Cab);
+            if (is_paused) {
+                audio.pause();
+            } else {
+                audio.resume();
+            }
             log::info("Jeu : {}", is_paused ? "PAUSE" : "REPRISE");
         }
         prev_esc_down = esc_down;
@@ -835,11 +840,11 @@ struct Application::Impl {
             }
             prev_down_down = down_down;
 
+            bool resume_requested = false;
             const bool enter_down = window.is_key_down(Key::Enter) || window.is_key_down(Key::Space);
             if (enter_down && !prev_enter_down) {
                 if (pause_menu_selected == 0) {
-                    is_paused = false;
-                    window.set_cursor_captured(camera_mode == CameraMode::Cab);
+                    resume_requested = true;
                 } else if (pause_menu_selected == 1) {
                     window.toggle_fullscreen();
                 } else if (pause_menu_selected == 2) {
@@ -849,12 +854,18 @@ struct Application::Impl {
             prev_enter_down = enter_down;
 
             if (window.is_key_down(Key::Num1)) {
-                is_paused = false;
-                window.set_cursor_captured(camera_mode == CameraMode::Cab);
+                resume_requested = true;
             } else if (window.is_key_down(Key::Num2)) {
                 window.toggle_fullscreen();
             } else if (window.is_key_down(Key::Num3)) {
                 window.request_close();
+            }
+
+            if (resume_requested) {
+                is_paused = false;
+                audio.resume();
+                window.set_cursor_captured(camera_mode == CameraMode::Cab);
+                log::info("Jeu : REPRISE");
             }
             return; // Bloque la prise d'input du simulateur pendant la pause
         }
@@ -1207,7 +1218,7 @@ struct Application::Impl {
             y += kLine;
         }
 
-        // Menu Pause Superposé (M33)
+        // Menu Pause Superposé (M33 / M35)
         if (is_paused) {
             const auto fb_size = window.framebuffer_size();
             const float sw = static_cast<float>(fb_size.width > 0 ? fb_size.width : 1280);
@@ -1216,42 +1227,68 @@ struct Application::Impl {
             // Voile assombri plein écran
             hud.rects.push_back({{0.0f, 0.0f}, {sw, sh}, {0.0f, 0.0f, 0.0f, 0.70f}});
 
-            // Carte de menu Pause centrée
-            const float card_w = 480.0f;
-            const float card_h = 280.0f;
-            const float card_x = (sw - card_w) * 0.5f;
-            const float card_y = (sh - card_h) * 0.5f;
-
-            hud.rects.push_back({{card_x, card_y}, {card_w, card_h}, {0.08f, 0.09f, 0.12f, 0.95f}});
-            hud.rects.push_back({{card_x, card_y}, {card_w, 4.0f}, {0.20f, 0.60f, 1.0f, 1.0f}}); // accent bleu
-
-            // Titre PAUSE
-            const float menu_scale = 3.0f;
-            const float title_x = card_x + 30.0f;
-            float cur_y = card_y + 25.0f;
-            hud.texts.push_back({{title_x, cur_y}, menu_scale, {1.0f, 0.85f, 0.20f, 1.0f}, "--- MENU PAUSE ---"});
-            cur_y += 50.0f;
-
-            // Options du menu
+            const std::string title_str = "--- MENU PAUSE ---";
             const std::array<std::string, 3> options = {
                 "1. Reprendre (Echap)",
                 std::format("2. Plein Ecran (F11) [{}]", window.is_fullscreen() ? "ON" : "OFF"),
                 "3. Quitter le jeu"
             };
+            const std::string footer_str = "[Haut/Bas] Choisir | [Entree] Valider";
 
-            for (std::size_t i = 0; i < 3; ++i) {
-                const bool selected = (static_cast<int>(i) == pause_menu_selected);
-                if (selected) {
-                    hud.rects.push_back({{card_x + 15.0f, cur_y - 4.0f}, {card_w - 30.0f, 36.0f}, {0.20f, 0.35f, 0.55f, 0.85f}});
-                    hud.texts.push_back({{title_x + 10.0f, cur_y}, menu_scale, {1.0f, 1.0f, 1.0f, 1.0f}, std::format("> {}", options[i])});
-                } else {
-                    hud.texts.push_back({{title_x, cur_y}, menu_scale, {0.75f, 0.78f, 0.82f, 1.0f}, std::format("  {}", options[i])});
-                }
-                cur_y += 42.0f;
+            // Déterminer la longueur de la plus longue option
+            std::size_t max_option_chars = title_str.size();
+            for (const auto& opt : options) {
+                max_option_chars = std::max(max_option_chars, opt.size() + 3);
             }
 
-            // Indication de navigation
-            hud.texts.push_back({{card_x + 20.0f, card_y + card_h - 32.0f}, 2.0f, {0.55f, 0.58f, 0.62f, 1.0f}, "[Haut/Bas] Choisir | [Entree] Valider"});
+            // Calcul dynamique de la largeur et échelle (M35 anti-débordement)
+            const float card_w = std::clamp(sw * 0.50f, 440.0f, std::min(sw - 32.0f, 640.0f));
+
+            const float max_text_width_margin = card_w - 50.0f;
+            const float raw_scale = max_text_width_margin / (static_cast<float>(max_option_chars) * 6.0f);
+            const float menu_scale = std::clamp(std::floor(raw_scale), 2.0f, 3.0f);
+            const float char_advance = 6.0f * menu_scale;
+            const float line_h = 7.0f * menu_scale + 12.0f;
+
+            // Calcul dynamique de la hauteur du menu
+            const float card_h = 25.0f + line_h + 15.0f + 3.0f * (line_h + 6.0f) + 40.0f;
+
+            // Centrage de la carte
+            const float card_x = (sw - card_w) * 0.5f;
+            const float card_y = (sh - card_h) * 0.5f;
+
+            // Fond du menu avec contour bleu
+            hud.rects.push_back({{card_x, card_y}, {card_w, card_h}, {0.08f, 0.09f, 0.12f, 0.95f}});
+            hud.rects.push_back({{card_x, card_y}, {card_w, 4.0f}, {0.20f, 0.60f, 1.0f, 1.0f}}); // accent bleu
+
+            // Titre centré
+            const float title_w = static_cast<float>(title_str.size()) * char_advance;
+            const float title_x = card_x + (card_w - title_w) * 0.5f;
+            float cur_y = card_y + 20.0f;
+            hud.texts.push_back({{title_x, cur_y}, menu_scale, {1.0f, 0.85f, 0.20f, 1.0f}, title_str});
+            cur_y += line_h + 15.0f;
+
+            // Options centrées
+            for (std::size_t i = 0; i < 3; ++i) {
+                const bool selected = (static_cast<int>(i) == pause_menu_selected);
+                const std::string line_str = selected ? std::format("> {}", options[i]) : std::format("  {}", options[i]);
+                const float line_w = static_cast<float>(line_str.size()) * char_advance;
+                const float line_x = card_x + (card_w - line_w) * 0.5f;
+
+                if (selected) {
+                    hud.rects.push_back({{card_x + 15.0f, cur_y - 3.0f}, {card_w - 30.0f, line_h + 2.0f}, {0.20f, 0.35f, 0.55f, 0.85f}});
+                    hud.texts.push_back({{line_x, cur_y}, menu_scale, {1.0f, 1.0f, 1.0f, 1.0f}, line_str});
+                } else {
+                    hud.texts.push_back({{line_x, cur_y}, menu_scale, {0.75f, 0.78f, 0.82f, 1.0f}, line_str});
+                }
+                cur_y += line_h + 6.0f;
+            }
+
+            // Footer / Indication centrée
+            const float footer_scale = std::min(menu_scale, 2.0f);
+            const float footer_w = static_cast<float>(footer_str.size()) * 6.0f * footer_scale;
+            const float footer_x = card_x + (card_w - footer_w) * 0.5f;
+            hud.texts.push_back({{footer_x, card_y + card_h - 28.0f}, footer_scale, {0.55f, 0.58f, 0.62f, 1.0f}, footer_str});
         }
 
         return hud;

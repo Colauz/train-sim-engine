@@ -358,6 +358,20 @@ void AudioEngine::shutdown() {
     impl_.reset();
 }
 
+void AudioEngine::pause() {
+    if (!valid()) {
+        return;
+    }
+    ma_engine_stop(&impl_->engine);
+}
+
+void AudioEngine::resume() {
+    if (!valid()) {
+        return;
+    }
+    ma_engine_start(&impl_->engine);
+}
+
 void AudioEngine::update_listener(const WorldPosition& position, const glm::vec3& velocity,
                                   const glm::vec3& forward, const glm::vec3& up) {
     if (!valid()) {

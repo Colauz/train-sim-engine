@@ -27,6 +27,10 @@ public:
     void shutdown();
     [[nodiscard]] bool valid() const;
 
+    // Pause / Reprise globale du moteur audio (M35).
+    void pause();
+    void resume();
+
     // Listener attaché à la caméra.
     void update_listener(const WorldPosition& position, const glm::vec3& velocity,
                          const glm::vec3& forward, const glm::vec3& up);
