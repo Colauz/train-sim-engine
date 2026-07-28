@@ -34,7 +34,8 @@ enum class Key {
     Space, LeftShift, LeftControl,
     E, M, H, K, P, C, // E=urgence, M=pluie (M14), H=sifflet, K=KVB isolé (M21.5), P=portes (M21), C=caméra (M23)
     R, L,            // R=pluie (M21, P reprise par les portes), L=phares (M21)
-    Escape,
+    Escape, F11, Enter,
+    Num1, Num2, Num3,
     Up, Down, Left, Right,
 };
 
@@ -59,6 +60,11 @@ public:
     [[nodiscard]] bool was_resized() const { return resized_; }
     void reset_resized() { resized_ = false; }
 
+    // --- Plein écran (M33) ---------------------------------------------------
+    void set_fullscreen(bool enable);
+    void toggle_fullscreen();
+    [[nodiscard]] bool is_fullscreen() const;
+
     // --- Inputs ---------------------------------------------------------------
     [[nodiscard]] bool is_key_down(Key key) const;
     // Déplacement du curseur depuis le dernier appel (puis remise à zéro).
@@ -77,6 +83,12 @@ private:
     WindowConfig config_;
     GLFWwindow* window_ = nullptr;
     bool resized_ = false;
+
+    // Sauvegarde des dimensions en mode fenêtré (M33)
+    int saved_x_ = 100;
+    int saved_y_ = 100;
+    int saved_w_ = 1280;
+    int saved_h_ = 720;
 
     // Suivi du curseur pour calculer les deltas.
     double last_cursor_x_ = 0.0;

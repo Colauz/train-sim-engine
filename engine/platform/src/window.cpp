@@ -29,6 +29,11 @@ int to_glfw_key(Key key) {
         case Key::R:            return GLFW_KEY_R;
         case Key::L:            return GLFW_KEY_L;
         case Key::Escape:       return GLFW_KEY_ESCAPE;
+        case Key::F11:          return GLFW_KEY_F11;
+        case Key::Enter:        return GLFW_KEY_ENTER;
+        case Key::Num1:         return GLFW_KEY_1;
+        case Key::Num2:         return GLFW_KEY_2;
+        case Key::Num3:         return GLFW_KEY_3;
         case Key::Up:           return GLFW_KEY_UP;
         case Key::Down:         return GLFW_KEY_DOWN;
         case Key::Left:         return GLFW_KEY_LEFT;
@@ -38,7 +43,8 @@ int to_glfw_key(Key key) {
 }
 }  // namespace
 
-Window::Window(WindowConfig config) : config_(config) {}
+Window::Window(WindowConfig config)
+    : config_(config), saved_w_(static_cast<int>(config.width)), saved_h_(static_cast<int>(config.height)) {}
 
 Window::~Window() { shutdown(); }
 
@@ -99,6 +105,42 @@ FramebufferSize Window::framebuffer_size() const {
         glfwGetFramebufferSize(window_, &w, &h);
     }
     return FramebufferSize{static_cast<std::uint32_t>(w), static_cast<std::uint32_t>(h)};
+}
+
+void Window::set_fullscreen(bool enable) {
+    if (window_ == nullptr) {
+        return;
+    }
+    const bool currently_fullscreen = (glfwGetWindowMonitor(window_) != nullptr);
+    if (enable == currently_fullscreen) {
+        return;
+    }
+
+    if (enable) {
+        glfwGetWindowPos(window_, &saved_x_, &saved_y_);
+        glfwGetWindowSize(window_, &saved_w_, &saved_h_);
+
+        GLFWmonitor* monitor = glfwGetPrimaryMonitor();
+        if (monitor != nullptr) {
+            const GLFWvidmode* mode = glfwGetVideoMode(monitor);
+            if (mode != nullptr) {
+                glfwSetWindowMonitor(window_, monitor, 0, 0, mode->width, mode->height, mode->refreshRate);
+                log::info("Passage en PLEIN ÉCRAN : {}x{}@{}Hz", mode->width, mode->height, mode->refreshRate);
+            }
+        }
+    } else {
+        glfwSetWindowMonitor(window_, nullptr, saved_x_, saved_y_, saved_w_, saved_h_, 0);
+        log::info("Passage en mode FENÊTRÉ : {}x{}", saved_w_, saved_h_);
+    }
+    resized_ = true;
+}
+
+void Window::toggle_fullscreen() {
+    set_fullscreen(!is_fullscreen());
+}
+
+bool Window::is_fullscreen() const {
+    return window_ != nullptr && (glfwGetWindowMonitor(window_) != nullptr);
 }
 
 bool Window::is_key_down(Key key) const {

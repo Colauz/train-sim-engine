@@ -71,6 +71,8 @@ public:
     [[nodiscard]] double current_limit_kmh() const { return current_limit_kmh_; }
     // true tant que l'ATS force le freinage d'urgence (dépassement > marge, non résorbé).
     [[nodiscard]] bool ats_active() const { return ats_active_; }
+    // Réarmement de l'ATS d'urgence (M33) : annule le freinage d'urgence ATS une fois le train à l'arrêt.
+    void reset_ats() { ats_active_ = false; }
     // Isolation manuelle de l'ATS (mode Arcade). Quand isolé, l'ATS continue de
     // surveiller (ats_active_ se lève), mais il ne court-circuite PLUS la traction et ne
     // force PLUS l'urgence. Le HUD affiche toujours la limite : le pilote sait qu'il triche.

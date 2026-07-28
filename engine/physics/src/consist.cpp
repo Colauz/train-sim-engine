@@ -74,16 +74,14 @@ void Consist::place_at(double chainage) {
 
 void Consist::update(double dt) {
     // --- ATS (M30) : appliqué AVANT la physique de tête ----------------
-    // La limite courante est celle du bloc où se trouve le train (= le dernier signal
-    // franchi). Hystérésis : on ARME l'urgence dès qu'on dépasse la limite de plus de la
-    // marge, et on ne la RELÂCHE qu'une fois revenu AU niveau de la limite — le conducteur
-    // doit donc réellement ralentir sous la limite pour récupérer la main.
+    // La limite courante est celle du bloc où se trouve le train (= le dernier signal franchi).
+    // Hystérésis / Latch (M33) : on ARME l'urgence dès qu'on dépasse la limite de plus de la
+    // marge. L'urgence reste verrouillée (ats_active_ = true) jusqu'à ce que le conducteur
+    // réarme le système à l'arrêt (0 km/h) via le Mascon (EB -> N).
     current_limit_kmh_ = limits_.limit_kmh(loco_.chainage());
     const double speed_kmh = loco_.speed() * 3.6;
     if (speed_kmh > current_limit_kmh_ + config_.ats_margin_kmh) {
         ats_active_ = true;
-    } else if (speed_kmh <= current_limit_kmh_) {
-        ats_active_ = false;
     }
     // ATS actif => traction coupée + freinage d'urgence, quelle que soit la consigne.
     // Si l'ATS est ISOLÉ (mode Arcade), la surveillance reste active (ats_active_ se

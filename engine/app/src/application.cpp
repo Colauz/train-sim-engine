@@ -258,6 +258,51 @@ std::vector<unsigned char> make_ground_pixels(std::uint32_t size) {
 
 }  // namespace
 
+// Manipulateur japonais à Paliers (Mascon M33)
+enum class MasconNotch : int {
+    EB = 0,
+    B8 = 1, B7 = 2, B6 = 3, B5 = 4, B4 = 5, B3 = 6, B2 = 7, B1 = 8,
+    N  = 9,
+    P1 = 10, P2 = 11, P3 = 12, P4 = 13, P5 = 14
+};
+
+[[nodiscard]] std::string mascon_label(MasconNotch notch) {
+    switch (notch) {
+        case MasconNotch::EB: return "[ EMERGENCY ]";
+        case MasconNotch::B8: return "[ BRAKE 8 ]";
+        case MasconNotch::B7: return "[ BRAKE 7 ]";
+        case MasconNotch::B6: return "[ BRAKE 6 ]";
+        case MasconNotch::B5: return "[ BRAKE 5 ]";
+        case MasconNotch::B4: return "[ BRAKE 4 ]";
+        case MasconNotch::B3: return "[ BRAKE 3 ]";
+        case MasconNotch::B2: return "[ BRAKE 2 ]";
+        case MasconNotch::B1: return "[ BRAKE 1 ]";
+        case MasconNotch::N:  return "[ NEUTRE ]";
+        case MasconNotch::P1: return "[ POWER 1 ]";
+        case MasconNotch::P2: return "[ POWER 2 ]";
+        case MasconNotch::P3: return "[ POWER 3 ]";
+        case MasconNotch::P4: return "[ POWER 4 ]";
+        case MasconNotch::P5: return "[ POWER 5 ]";
+    }
+    return "[ NEUTRE ]";
+}
+
+[[nodiscard]] glm::vec4 mascon_color(MasconNotch notch) {
+    switch (notch) {
+        case MasconNotch::EB:
+            return glm::vec4{1.0f, 0.15f, 0.10f, 1.0f};  // Rouge
+        case MasconNotch::B8: case MasconNotch::B7: case MasconNotch::B6: case MasconNotch::B5:
+        case MasconNotch::B4: case MasconNotch::B3: case MasconNotch::B2: case MasconNotch::B1:
+            return glm::vec4{1.0f, 0.55f, 0.10f, 1.0f};  // Orange
+        case MasconNotch::N:
+            return glm::vec4{0.85f, 0.85f, 0.85f, 1.0f};  // Blanc / Gris
+        case MasconNotch::P1: case MasconNotch::P2: case MasconNotch::P3:
+        case MasconNotch::P4: case MasconNotch::P5:
+            return glm::vec4{0.15f, 0.90f, 0.25f, 1.0f};  // Vert
+    }
+    return glm::vec4{1.0f, 1.0f, 1.0f, 1.0f};
+}
+
 struct Application::Impl {
     explicit Impl(ApplicationConfig cfg)
         : config(std::move(cfg)),
@@ -469,15 +514,21 @@ struct Application::Impl {
     float orbit_pitch = 0.30f;
     float orbit_distance = 42.0f;
 
-    // Manipulateur japonais (M30) : traction À RAPPEL — la consigne retombe à 0 %
-    // dès que la touche est lâchée (poignée à ressort / deadman). Le FREIN, lui,
-    // est à CRANS persistants (0..7) : un cran engagé reste serré tant qu'on ne le
-    // desserre pas (ou qu'on ne tractionne pas). Intégré au pas FIXE dans
-    // update_physics, jamais à la fréquence d'affichage : le Wagon est déterministe.
-    double throttle_handle = 0.0;
-    int brake_notch = 0;             // crans de frein engagés (0..7)
-    bool prev_throttle_down = false; // détection de front pour les crans
-    bool prev_notch_release = false;
+    // Manipulateur japonais à Paliers (Mascon M33)
+    MasconNotch mascon_notch = MasconNotch::N;
+    bool prev_z_down = false;
+    bool prev_s_down = false;
+    bool ats_reset_armed = false;
+
+    // Menu Pause & Plein Écran (M33)
+    bool is_paused = false;
+    bool prev_esc_down = false;
+    bool prev_f11_down = false;
+    bool prev_up_down = false;
+    bool prev_down_down = false;
+    bool prev_enter_down = false;
+    int pause_menu_selected = 0;  // 0: Reprendre, 1: Plein Écran, 2: Quitter
+
     // Caméra (M23) : Orbite (externe) ou Cabine (FPS poste de conduite), bascule sur C.
     enum class CameraMode {
         Orbit,
@@ -489,9 +540,7 @@ struct Application::Impl {
     float cab_pitch = -0.18f;
 
     // Consignes relevées par update_input (variable), consommées par update_physics (fixe).
-    bool key_throttle_up = false;
     bool key_brake = false;
-    bool key_emergency = false;
     bool key_horn = false;         // sifflet (H) — maintenu
     // Enveloppe du sifflet : attaque rapide quand H est tenue, détente plus lente au
     // relâché. Évite le clic d'un volume qui saute de 0 à 1.
@@ -738,7 +787,9 @@ struct Application::Impl {
         // (km/h) reste le levier de banc pour partir lancé.
         const char* speed_env = std::getenv("NOIRE_SPEED");
         consist.set_speed(speed_env != nullptr ? std::atof(speed_env) / 3.6 : 20.0 / 3.6);
-        log::info("Commandes : Z=traction (rappel à 0), S/A (ou Flèches)=cran frein +/-, Espace=frein service, E=URGENCE, H=sifflet, K=ATS isolé | L=phares, P=portes, R=pluie, C=caméra (Cabine/Orbite) | souris=orbite/cabine, Ctrl/Maj=zoom, Échap=quitter");
+        log::info("Commandes : Z=Mascon +1 (P1..P5), S=Mascon -1 (B1..B8, EB), E=URGENCE, "
+                  "H=sifflet, K=ATS isolé | L=phares, P=portes, R=pluie | "
+                  "souris=orbite/cabine, Ctrl/Maj=zoom, Échap=Pause / Menu, F11=Plein écran");
         window.set_cursor_captured(true);
 
         EngineHooks hooks;
@@ -749,39 +800,106 @@ struct Application::Impl {
         hooks.render = [this](double /*interpolation*/) { render_frame(); };
         engine.set_hooks(std::move(hooks));
 
-        log::info("Commandes : Z=traction (rappel à 0), S/A=cran frein +/-, "
-                  "E=URGENCE, H=sifflet, K=ATS isolé | L=phares, P=portes, R=pluie | "
-                  "souris=orbite, Ctrl/Maj=zoom, Échap=quitter");
         return engine.initialize();
     }
 
     void update_input(double dt) {
         using platform::Key;
 
-        // On RELÈVE seulement l'état des touches ici (variable_update, cadencé sur
-        // l'affichage). L'intégration du manipulateur se fait au pas fixe dans
-        // update_physics. W est synonyme de Z (l'enum sert AZERTY et QWERTY),
-        // Flèche Haut/Bas double Z/S. M30 : Z = traction À RAPPEL (lâché = 0 %),
-        // S = cran de frein +1 (front montant), A = desserrage d'un cran.
-        key_throttle_up = window.is_key_down(Key::Z) || window.is_key_down(Key::W) ||
-                          window.is_key_down(Key::Up);
-        const bool throttle_down_now =
-            window.is_key_down(Key::S) || window.is_key_down(Key::Down);
-        const bool notch_release_now = window.is_key_down(Key::A) || window.is_key_down(Key::Q);
-        if (throttle_down_now && !prev_throttle_down) {
-            brake_notch = std::min(7, brake_notch + 1);
+        // --- Menu Pause & Plein écran (M33) ---
+        const bool esc_down = window.is_key_down(Key::Escape);
+        if (esc_down && !prev_esc_down) {
+            is_paused = !is_paused;
+            window.set_cursor_captured(!is_paused && camera_mode == CameraMode::Cab);
+            log::info("Jeu : {}", is_paused ? "PAUSE" : "REPRISE");
         }
-        if (notch_release_now && !prev_notch_release) {
-            brake_notch = std::max(0, brake_notch - 1);
+        prev_esc_down = esc_down;
+
+        const bool f11_down = window.is_key_down(Key::F11);
+        if (f11_down && !prev_f11_down) {
+            window.toggle_fullscreen();
         }
-        prev_throttle_down = throttle_down_now;
-        prev_notch_release = notch_release_now;
-        key_brake = window.is_key_down(Key::Space);      // frein de service (maintenu)
-        key_emergency = window.is_key_down(Key::E);      // frein d'urgence
+        prev_f11_down = f11_down;
+
+        if (is_paused) {
+            // Navigation dans le menu Pause (Flèches, Z/S, 1/2/3, Entrée)
+            const bool up_down = window.is_key_down(Key::Up) || window.is_key_down(Key::W) || window.is_key_down(Key::Z);
+            if (up_down && !prev_up_down) {
+                pause_menu_selected = (pause_menu_selected + 2) % 3;
+            }
+            prev_up_down = up_down;
+
+            const bool down_down = window.is_key_down(Key::Down) || window.is_key_down(Key::S);
+            if (down_down && !prev_down_down) {
+                pause_menu_selected = (pause_menu_selected + 1) % 3;
+            }
+            prev_down_down = down_down;
+
+            const bool enter_down = window.is_key_down(Key::Enter) || window.is_key_down(Key::Space);
+            if (enter_down && !prev_enter_down) {
+                if (pause_menu_selected == 0) {
+                    is_paused = false;
+                    window.set_cursor_captured(camera_mode == CameraMode::Cab);
+                } else if (pause_menu_selected == 1) {
+                    window.toggle_fullscreen();
+                } else if (pause_menu_selected == 2) {
+                    window.request_close();
+                }
+            }
+            prev_enter_down = enter_down;
+
+            if (window.is_key_down(Key::Num1)) {
+                is_paused = false;
+                window.set_cursor_captured(camera_mode == CameraMode::Cab);
+            } else if (window.is_key_down(Key::Num2)) {
+                window.toggle_fullscreen();
+            } else if (window.is_key_down(Key::Num3)) {
+                window.request_close();
+            }
+            return; // Bloque la prise d'input du simulateur pendant la pause
+        }
+
+        // --- Mode Jeu Actif ---
+        // Manipulateur à Paliers Mascon (M33) : Z monte d'un cran (vers P5), S descend (vers EB)
+        const bool z_down = window.is_key_down(Key::Z) || window.is_key_down(Key::W) || window.is_key_down(Key::Up);
+        if (z_down && !prev_z_down) {
+            if (mascon_notch < MasconNotch::P5) {
+                mascon_notch = static_cast<MasconNotch>(static_cast<int>(mascon_notch) + 1);
+            }
+        }
+        prev_z_down = z_down;
+
+        const bool s_down = window.is_key_down(Key::S) || window.is_key_down(Key::Down);
+        if (s_down && !prev_s_down) {
+            if (mascon_notch > MasconNotch::EB) {
+                mascon_notch = static_cast<MasconNotch>(static_cast<int>(mascon_notch) - 1);
+            }
+        }
+        prev_s_down = s_down;
+
+        // Touche Urgence directe
+        if (window.is_key_down(Key::E)) {
+            mascon_notch = MasconNotch::EB;
+        }
+
+        // Reset de l'ATS d'urgence (M33) :
+        // Si l'ATS d'urgence est actif et la vitesse à 0 km/h, passer le Mascon sur EB arme le reset.
+        // Puis ramener le Mascon sur N annule l'urgence ATS.
+        const bool stopped = std::abs(wagon.speed()) <= 0.01 || consist.immobilized();
+        if (consist.ats_active() && stopped) {
+            if (mascon_notch == MasconNotch::EB) {
+                ats_reset_armed = true;
+            } else if (ats_reset_armed && mascon_notch == MasconNotch::N) {
+                consist.reset_ats();
+                ats_reset_armed = false;
+                log::info("ATS : Urgence acquittée, système réarmé (freins libérés)");
+            }
+        } else if (!consist.ats_active()) {
+            ats_reset_armed = false;
+        }
+
+        key_brake = window.is_key_down(Key::Space);      // frein manuel d'appoint
         key_horn = window.is_key_down(Key::H);           // sifflet (maintenu)
-        if (window.is_key_down(Key::Escape)) {
-            window.request_close();
-        }
 
         // Pluie : bascule sur front montant de R (M21 : P libérée pour les portes).
         // M reste synonyme pour la compatibilité. La transition douce pilote brouillard,
@@ -875,6 +993,9 @@ struct Application::Impl {
     }
 
     void update_physics(double dt) {
+        if (is_paused) {
+            return;
+        }
         // NOIRE_STILL : gèle la physique mais laisse courir l'horloge du vent. Avec
         // NOIRE_CREEP et NOIRE_PIN_CAM, c'est le banc qui rend une mesure REPRODUCTIBLE.
         static const bool still = std::getenv("NOIRE_STILL") != nullptr;
@@ -883,21 +1004,28 @@ struct Application::Impl {
             return;
         }
 
-        // Manipulateur japonais (M30) — intégré ICI, au pas FIXE, pour rester
-        // déterministe. Traction À RAPPEL : Z tenue pousse la consigne (~1,2 s de
-        // course), Z lâchée la ramène à 0 % (~0,7 s). Toute traction TUE les crans
-        // de frein (la poignée repasse par neutre). Le frein reste serré sur ses
-        // crans tant qu'on n'accélère pas : c'est ce qui tient la rame à l'arrêt.
-        if (key_throttle_up) {
-            brake_notch = 0;
-            throttle_handle = std::min(1.0, throttle_handle + dt / 1.2);
-        } else {
-            throttle_handle = std::max(0.0, throttle_handle - dt / 0.7);
+        // Manipulateur japonais à Paliers (Mascon M33)
+        double throttle_demand = 0.0;
+        double brake_demand = 0.0;
+        bool emergency_demand = false;
+
+        if (mascon_notch >= MasconNotch::P1) {
+            const int p_level = static_cast<int>(mascon_notch) - static_cast<int>(MasconNotch::N);
+            throttle_demand = static_cast<double>(p_level) / 5.0;
+        } else if (mascon_notch <= MasconNotch::B1 && mascon_notch >= MasconNotch::B8) {
+            const int b_level = static_cast<int>(MasconNotch::N) - static_cast<int>(mascon_notch);
+            brake_demand = static_cast<double>(b_level) / 8.0;
+        } else if (mascon_notch == MasconNotch::EB) {
+            brake_demand = 1.0;
+            emergency_demand = true;
         }
-        // Consigne de frein = max(crans / 7, frein de service maintenu).
-        const double brake_demand =
-            std::max(static_cast<double>(brake_notch) / 7.0, key_brake ? 1.0 : 0.0);
-        consist.set_controls(throttle_handle, brake_demand, key_emergency);
+
+        // Freinage manuel Espace en surimpression si maintenu
+        if (key_brake) {
+            brake_demand = 1.0;
+        }
+
+        consist.set_controls(throttle_demand, brake_demand, emergency_demand);
         // La météo pilote l'adhérence : sec = 1, pluie battante = 0,36 (µ ~ 0,12). C'est
         // ce qui rend le patinage — hors d'atteinte à sec avec ces chiffres — possible
         // sous la pluie au-delà de ~71 % de traction.
@@ -1020,11 +1148,8 @@ struct Application::Impl {
         }
         lines.emplace_back(std::format("ATS {: >2}   {: >5.0f} KM/H", aspect, limit),
                            over_limit ? alert : aspect_color);
-        // Position du MANIPULATEUR (traction à rappel) et crans de frein engagés.
-        lines.emplace_back(std::format("TRACTION {: >5.0f} %", throttle_handle * 100.0), value);
-        lines.emplace_back(std::format("FREIN    {: >5} B{}", key_brake ? "MAX" : "",
-                                       brake_notch),
-                           brake_notch > 0 || key_brake ? value : label);
+        // Manipulateur à Paliers Mascon (M33)
+        lines.emplace_back(std::format("MASCON   {}", mascon_label(mascon_notch)), mascon_color(mascon_notch));
         // CG = conduite générale. Sa pression EST l'état du frein que lit le mécanicien :
         // 5 bar = desserré, elle chute quand on serre.
         lines.emplace_back(std::format("CG      {: >5.1f} BAR", brake.pipe_pressure()),
@@ -1046,20 +1171,23 @@ struct Application::Impl {
         // ATS (M30) : témoin prioritaire.
         if (consist.ats_isolated()) {
             // Clignotement : sin(t*4) > 0 => visible 50% du temps, ~2 Hz.
-            // L'alpha oscille entre 0.3 et 1.0 pour un effet voyant sans disparaître.
             const float blink = 0.65f + 0.35f * std::sin(static_cast<float>(sim_time) * 8.0f);
             const glm::vec4 warn_color{0.95f, 0.80f, 0.15f, blink};
             lines.emplace_back("ATS ISOLE", warn_color);
         } else if (consist.ats_active()) {
-            lines.emplace_back("ATS URGENCE", alert);
+            const bool stopped = std::abs(wagon.speed()) <= 0.01 || consist.immobilized();
+            if (stopped) {
+                lines.emplace_back("ATS URGENCE (REARMER: EB -> N)", alert);
+            } else {
+                lines.emplace_back("ATS URGENCE", alert);
+            }
         } else if (brake.emergency()) {
             lines.emplace_back("URGENCE", alert);
         } else if (wagon.slipping()) {
             lines.emplace_back("PATINAGE", alert);
         }
 
-        // La plaque se dimensionne sur le contenu : une taille en dur se décalerait au
-        // premier libellé rallongé.
+        // La plaque se dimensionne sur le contenu : une taille en dur se décalerait au premier libellé rallongé.
         std::size_t widest = 0;
         for (const auto& [text, color] : lines) {
             widest = std::max(widest, text.size());
@@ -1074,6 +1202,54 @@ struct Application::Impl {
             hud.texts.push_back({{kOrigin + kPad, y}, kScale, color, text});
             y += kLine;
         }
+
+        // Menu Pause Superposé (M33)
+        if (is_paused) {
+            const auto fb_size = window.framebuffer_size();
+            const float sw = static_cast<float>(fb_size.width > 0 ? fb_size.width : 1280);
+            const float sh = static_cast<float>(fb_size.height > 0 ? fb_size.height : 720);
+
+            // Voile assombri plein écran
+            hud.rects.push_back({{0.0f, 0.0f}, {sw, sh}, {0.0f, 0.0f, 0.0f, 0.70f}});
+
+            // Carte de menu Pause centrée
+            const float card_w = 480.0f;
+            const float card_h = 280.0f;
+            const float card_x = (sw - card_w) * 0.5f;
+            const float card_y = (sh - card_h) * 0.5f;
+
+            hud.rects.push_back({{card_x, card_y}, {card_w, card_h}, {0.08f, 0.09f, 0.12f, 0.95f}});
+            hud.rects.push_back({{card_x, card_y}, {card_w, 4.0f}, {0.20f, 0.60f, 1.0f, 1.0f}}); // accent bleu
+
+            // Titre PAUSE
+            const float menu_scale = 3.0f;
+            const float title_x = card_x + 30.0f;
+            float cur_y = card_y + 25.0f;
+            hud.texts.push_back({{title_x, cur_y}, menu_scale, {1.0f, 0.85f, 0.20f, 1.0f}, "--- MENU PAUSE ---"});
+            cur_y += 50.0f;
+
+            // Options du menu
+            const std::array<std::string, 3> options = {
+                "1. Reprendre (Echap)",
+                std::format("2. Plein Ecran (F11) [{}]", window.is_fullscreen() ? "ON" : "OFF"),
+                "3. Quitter le jeu"
+            };
+
+            for (std::size_t i = 0; i < 3; ++i) {
+                const bool selected = (static_cast<int>(i) == pause_menu_selected);
+                if (selected) {
+                    hud.rects.push_back({{card_x + 15.0f, cur_y - 4.0f}, {card_w - 30.0f, 36.0f}, {0.20f, 0.35f, 0.55f, 0.85f}});
+                    hud.texts.push_back({{title_x + 10.0f, cur_y}, menu_scale, {1.0f, 1.0f, 1.0f, 1.0f}, std::format("> {}", options[i])});
+                } else {
+                    hud.texts.push_back({{title_x, cur_y}, menu_scale, {0.75f, 0.78f, 0.82f, 1.0f}, std::format("  {}", options[i])});
+                }
+                cur_y += 42.0f;
+            }
+
+            // Indication de navigation
+            hud.texts.push_back({{card_x + 20.0f, card_y + card_h - 32.0f}, 2.0f, {0.55f, 0.58f, 0.62f, 1.0f}, "[Haut/Bas] Choisir | [Entree] Valider"});
+        }
+
         return hud;
     }
 
