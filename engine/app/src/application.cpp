@@ -334,6 +334,8 @@ struct Application::Impl {
     // Bâtiments (M31) : trois gabarits (tour / immeuble / barre, gen_building.py).
     std::array<resource::ModelHandle, kBuildingVariants> building_models;
     resource::AudioHandle rumble_clip;
+    resource::AudioHandle hassha_clip;  // jingle de départ (M32)
+    resource::AudioHandle ats_clip;     // alarme ATS (M32)
     resource::EnvironmentHandle sky;
     // Textures PBR du ballast (Poly Haven, CC0). Maintenues vivantes par ces handles :
     // les relâcher recyclerait les textures GPU sous le matériau.
@@ -368,6 +370,8 @@ struct Application::Impl {
     double perf_fps = 0.0;
     double perf_gpu_ms = 0.0;
     bool rumble_source_applied = false;
+    bool hassha_source_applied = false;
+    bool ats_source_applied = false;
 
     // Sol : plan solide texturé (M8 étape 2), il reçoit l'ombre portée du train.
     // Secours du terrain tant que ses textures Poly Haven ne sont pas arrivées. Le
@@ -515,6 +519,9 @@ struct Application::Impl {
     float door_t = 0.0f;
     bool doors_opening = false;
     bool prev_p_down = false;
+    // M32 : fermeture à la japonaise — à la demande de fermeture, on joue la hassha
+    // melody puis on attend 3 s AVANT de lancer l'animation. > 0 = attente en cours.
+    float door_close_timer = 0.0f;
 
     // --- Isolation ATS (M30) -----------------------------------------------
     bool prev_k_down = false;
@@ -688,6 +695,9 @@ struct Application::Impl {
                 resources.load_model(building_files[v]);
         }
         rumble_clip = resources.load_audio("audio/roulement.wav");
+        // M32 : jingle de départ (fermeture des portes) et alarme ATS de cabine.
+        hassha_clip = resources.load_audio("audio/hassha_melody.wav");
+        ats_clip = resources.load_audio("audio/ats_alarm.wav");
 
         // Ballast (Poly Haven, CC0). L'ESPACE COLORIMÉTRIQUE est dicté par le RÔLE :
         // la base color est du sRGB, l'ARM et la normal map sont des DONNÉES — les
@@ -791,13 +801,24 @@ struct Application::Impl {
         }
         prev_l_down = l_down;
 
-        // Portes (M21 + M22 + M23) : touche P, front montant = bascule ouverture/fermeture.
+        // Portes (M21 + M22 + M23 + M32) : touche P, front montant = bascule.
         // Sécurité M23 : interdiction d'ouvrir si non immobilisé (vitesse > 0.01 m/s sans clamp).
+        // M32 : la FERMETURE est différée — hassha melody puis 3 s d'attente (comptée au
+        // pas fixe). L'ouverture reste immédiate. Re-appuyer pendant l'attente annule.
         const bool p_down = window.is_key_down(Key::P);
         if (p_down && !prev_p_down) {
-            if (doors_opening || consist.immobilized() || std::abs(wagon.speed()) <= 0.01) {
-                doors_opening = !doors_opening;
-                log::info("Portes : {}", doors_opening ? "OUVERTURE" : "FERMETURE");
+            if (doors_opening) {
+                if (door_close_timer > 0.0f) {
+                    door_close_timer = 0.0f;  // annulation de la fermeture en attente
+                    log::info("Portes : fermeture ANNULÉE");
+                } else {
+                    door_close_timer = 3.0f;
+                    audio.play_hassha(0.9f);
+                    log::info("Portes : FERMETURE (hassha melody, 3 s)");
+                }
+            } else if (consist.immobilized() || std::abs(wagon.speed()) <= 0.01) {
+                doors_opening = true;
+                log::info("Portes : OUVERTURE");
             } else {
                 log::info("Portes : VERROUILLÉES (train non immobilisé)");
             }
@@ -915,12 +936,25 @@ struct Application::Impl {
         const WorldPosition nose = wagon.front_bogie().position() + fwd * 8.0;
         audio.set_horn(nose, train_velocity, horn_level * 0.8f);
 
+        // Alarme ATS (M32) : carillon en boucle tant que l'overspeed est actif. Le
+        // freinage d'urgence de l'ATS ramène la vitesse sous la limite => ats_active()
+        // retombe et la boucle se tait (même schéma que le sifflet : volume piloté).
+        audio.set_ats_alarm(consist.ats_active() ? 0.7f : 0.0f);
+
         sim_time += dt;
         day_time += dt * day_cycle_speed;
 
         // --- Portes : animation au pas fixe (déterministe) ---
         // 2 secondes pour ouvrir ou fermer (0.5/s). Intégré ici comme le throttle :
         // l'animation reste à la même vitesse quelle que soit la fréquence d'affichage.
+        // M32 : la fermeture n'est déclenchée qu'au bout des 3 s de la hassha melody.
+        if (door_close_timer > 0.0f) {
+            door_close_timer -= static_cast<float>(dt);
+            if (door_close_timer <= 0.0f) {
+                doors_opening = false;
+                log::info("Portes : FERMETURE");
+            }
+        }
         const float door_speed = 0.5f;
         const float door_dir = doors_opening ? 1.0f : -1.0f;
         door_t = glm::clamp(door_t + static_cast<float>(dt) * door_speed * door_dir, 0.0f, 1.0f);
@@ -1340,6 +1374,21 @@ struct Application::Impl {
                 log::info("M7 étape 5 : roulement.wav branché sur l'émetteur audio (spatialisé + Doppler)");
             }
             rumble_source_applied = true;  // une seule fois, même si l'audio est indisponible
+        }
+        // M32 : même branchement pour la hassha melody (one-shot) et l'alarme ATS (boucle).
+        if (!hassha_source_applied && hassha_clip && hassha_clip->ready) {
+            if (audio.set_source(audio::AudioEngine::Emitter::Hassha, hassha_clip->pcm.data(),
+                                 hassha_clip->pcm.size())) {
+                log::info("M32 : hassha_melody.wav branché sur l'émetteur one-shot");
+            }
+            hassha_source_applied = true;
+        }
+        if (!ats_source_applied && ats_clip && ats_clip->ready) {
+            if (audio.set_source(audio::AudioEngine::Emitter::AtsAlarm, ats_clip->pcm.data(),
+                                 ats_clip->pcm.size())) {
+                log::info("M32 : ats_alarm.wav branché sur l'émetteur ATS (boucle)");
+            }
+            ats_source_applied = true;
         }
 
         // Streaming (thread principal), toujours exécuté (même minimisé).

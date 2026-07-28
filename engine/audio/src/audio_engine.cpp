@@ -95,6 +95,50 @@ std::vector<float> synth_rumble() {
     return s;
 }
 
+// Hassha melody (M32, fallback synthèse) : suite de notes douces pentatoniques,
+// ~2,8 s, chaque note avec attaque courte et décroissance exponentielle.
+std::vector<float> synth_hassha() {
+    constexpr float kNotes[] = {587.33f, 659.25f, 880.00f, 987.77f,
+                                1174.66f, 987.77f, 880.00f, 1174.66f};  // ré mi la si...
+    constexpr float kNoteDur = 0.35f;
+    const int n = static_cast<int>(kSampleRate * (kNoteDur * 8.0f));
+    std::vector<float> s(static_cast<std::size_t>(n), 0.0f);
+    for (int i = 0; i < n; ++i) {
+        const float t = static_cast<float>(i) / kSampleRate;
+        const int note = std::min(7, static_cast<int>(t / kNoteDur));
+        const float tn = t - static_cast<float>(note) * kNoteDur;
+        const float env = std::min(1.0f, tn * 60.0f) * std::exp(-tn * 3.5f);
+        const float f = kNotes[note];
+        s[static_cast<std::size_t>(i)] =
+            (std::sin(2.0f * kPi * f * tn) * 0.7f + std::sin(2.0f * kPi * 2.0f * f * tn) * 0.2f) *
+            env * 0.6f;
+    }
+    return s;
+}
+
+// Alarme ATS (M32, fallback synthèse) : « ding » de carillon répété, boucle 1 s.
+// Deux frappes (0 s et 0,5 s) : tonal + harmonique, décroissance cloche.
+std::vector<float> synth_ats() {
+    const int n = kSampleRate;  // 1 s => fréquences entières = boucle sans couture
+    std::vector<float> s(static_cast<std::size_t>(n), 0.0f);
+    for (int i = 0; i < n; ++i) {
+        const float t = static_cast<float>(i) / kSampleRate;
+        float v = 0.0f;
+        for (const float strike : {0.0f, 0.5f}) {
+            const float ts = t - strike;
+            if (ts < 0.0f) {
+                continue;
+            }
+            const float env = std::exp(-ts * 7.0f);
+            v += (std::sin(2.0f * kPi * 1046.5f * ts) * 0.6f +
+                  std::sin(2.0f * kPi * 2093.0f * ts) * 0.25f) *
+                 env;
+        }
+        s[static_cast<std::size_t>(i)] = v * 0.5f;
+    }
+    return s;
+}
+
 }  // namespace
 
 struct AudioEngine::Impl {
@@ -106,6 +150,8 @@ struct AudioEngine::Impl {
     std::vector<float> squeal_pcm;
     std::vector<float> rumble_pcm;
     std::vector<float> horn_pcm;
+    std::vector<float> hassha_pcm;
+    std::vector<float> ats_pcm;
 
     std::array<ma_audio_buffer, kJointPoolSize> clack_bufs{};
     std::array<ma_sound, kJointPoolSize> joint_pool{};
@@ -114,9 +160,13 @@ struct AudioEngine::Impl {
     ma_audio_buffer squeal_buf{};
     ma_audio_buffer rumble_buf{};
     ma_audio_buffer horn_buf{};
+    ma_audio_buffer hassha_buf{};
+    ma_audio_buffer ats_buf{};
     ma_sound squeal_sound{};
     ma_sound rumble_sound{};
     ma_sound horn_sound{};
+    ma_sound hassha_sound{};
+    ma_sound ats_sound{};
 
     WorldPosition listener_pos{0.0, 0.0, 0.0};
 
@@ -151,6 +201,20 @@ struct AudioEngine::Impl {
         ma_sound_set_volume(&sound, 0.0f);  // le prochain set_rumble/set_squeal pilotera le volume
         ma_sound_start(&sound);
         return true;
+    }
+
+    // Idem pour un son ONE-SHOT (hassha melody) : pas de boucle, pas de démarrage
+    // automatique — c'est play_hassha() qui arme la lecture.
+    bool rebuild_oneshot(ma_sound& sound, ma_audio_buffer& buffer, std::vector<float>& storage,
+                         const float* pcm, std::size_t frames) {
+        ma_sound_stop(&sound);
+        ma_sound_uninit(&sound);
+        ma_audio_buffer_uninit(&buffer);
+        storage.assign(pcm, pcm + frames);
+        if (!make_buffer(storage, buffer)) {
+            return false;
+        }
+        return ma_sound_init_from_data_source(&engine, &buffer, 0, nullptr, &sound) == MA_SUCCESS;
     }
 
     // Idem pour le pool de « clacs » one-shot (kJointPoolSize sons partageant le PCM).
@@ -197,6 +261,8 @@ bool AudioEngine::initialize() {
     impl_->squeal_pcm = synth_squeal();
     impl_->rumble_pcm = synth_rumble();
     impl_->horn_pcm = synth_horn();
+    impl_->hassha_pcm = synth_hassha();
+    impl_->ats_pcm = synth_ats();
 
     // Chaque clac du pool a son propre audio_buffer (curseur indépendant) mais
     // partage les mêmes données PCM (référencées, non copiées).
@@ -207,6 +273,8 @@ bool AudioEngine::initialize() {
     ok = ok && Impl::make_buffer(impl_->squeal_pcm, impl_->squeal_buf);
     ok = ok && Impl::make_buffer(impl_->rumble_pcm, impl_->rumble_buf);
     ok = ok && Impl::make_buffer(impl_->horn_pcm, impl_->horn_buf);
+    ok = ok && Impl::make_buffer(impl_->hassha_pcm, impl_->hassha_buf);
+    ok = ok && Impl::make_buffer(impl_->ats_pcm, impl_->ats_buf);
     if (!ok) {
         log::error("Audio : échec de création des buffers procéduraux");
         return false;
@@ -241,6 +309,19 @@ bool AudioEngine::initialize() {
     ma_sound_set_volume(&impl_->horn_sound, 0.0f);
     ma_sound_start(&impl_->horn_sound);
 
+    // Hassha melody (M32) : one-shot non spatialisé — PAS de ma_sound_start ici,
+    // c'est play_hassha() qui déclenche la lecture à la fermeture des portes.
+    ma_sound_init_from_data_source(&impl_->engine, &impl_->hassha_buf, 0, nullptr,
+                                   &impl_->hassha_sound);
+
+    // Alarme ATS (M32) : boucle continue, muette au repos (volume piloté), non
+    // spatialisée — c'est un avertisseur de cabine, entendu « dans le poste ».
+    ma_sound_init_from_data_source(&impl_->engine, &impl_->ats_buf, 0, nullptr,
+                                   &impl_->ats_sound);
+    ma_sound_set_looping(&impl_->ats_sound, MA_TRUE);
+    ma_sound_set_volume(&impl_->ats_sound, 0.0f);
+    ma_sound_start(&impl_->ats_sound);
+
     ma_engine_listener_set_world_up(&impl_->engine, 0, 0.0f, 1.0f, 0.0f);
 
     impl_->sounds_ok = true;
@@ -260,12 +341,16 @@ void AudioEngine::shutdown() {
         ma_sound_uninit(&impl_->squeal_sound);
         ma_sound_uninit(&impl_->rumble_sound);
         ma_sound_uninit(&impl_->horn_sound);
+        ma_sound_uninit(&impl_->hassha_sound);
+        ma_sound_uninit(&impl_->ats_sound);
         for (ma_audio_buffer& b : impl_->clack_bufs) {
             ma_audio_buffer_uninit(&b);
         }
         ma_audio_buffer_uninit(&impl_->squeal_buf);
         ma_audio_buffer_uninit(&impl_->rumble_buf);
         ma_audio_buffer_uninit(&impl_->horn_buf);
+        ma_audio_buffer_uninit(&impl_->hassha_buf);
+        ma_audio_buffer_uninit(&impl_->ats_buf);
     }
     if (impl_->engine_ok) {
         ma_engine_uninit(&impl_->engine);
@@ -335,6 +420,22 @@ void AudioEngine::play_rail_joint(const WorldPosition& position, const glm::vec3
     ma_sound_start(&s);
 }
 
+void AudioEngine::play_hassha(float volume) {
+    if (!valid()) {
+        return;
+    }
+    ma_sound_set_volume(&impl_->hassha_sound, volume);
+    ma_sound_seek_to_pcm_frame(&impl_->hassha_sound, 0);
+    ma_sound_start(&impl_->hassha_sound);
+}
+
+void AudioEngine::set_ats_alarm(float volume) {
+    if (!valid()) {
+        return;
+    }
+    ma_sound_set_volume(&impl_->ats_sound, volume);
+}
+
 bool AudioEngine::set_source(Emitter emitter, const float* pcm, std::size_t frame_count) {
     if (!valid() || pcm == nullptr || frame_count == 0) {
         return false;
@@ -348,6 +449,12 @@ bool AudioEngine::set_source(Emitter emitter, const float* pcm, std::size_t fram
                                        pcm, frame_count);
         case Emitter::Joint:
             return impl_->rebuild_joint(pcm, frame_count);
+        case Emitter::Hassha:
+            return impl_->rebuild_oneshot(impl_->hassha_sound, impl_->hassha_buf,
+                                          impl_->hassha_pcm, pcm, frame_count);
+        case Emitter::AtsAlarm:
+            return impl_->rebuild_loop(impl_->ats_sound, impl_->ats_buf, impl_->ats_pcm,
+                                       pcm, frame_count);
     }
     return false;
 }

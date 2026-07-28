@@ -127,8 +127,11 @@ void Wagon::update(double dt) {
 
     // M23 : Zero-Speed Clamp (fix sécurité portes). Si le freinage est actif et que la
     // vitesse passe sous 0.1 m/s (~0.36 km/h), forcer la vitesse exactement à 0.0 m/s.
+    // M32 : UNIQUEMENT si aucune traction n'est appliquée — sinon la propulsion du pas
+    // courant était annulée frame après frame et le train restait « collé » au rail
+    // tant que le frein n'était pas entièrement desserré.
     const bool brake_active = (air_brake_.pipe_pressure() < 4.95) || air_brake_.emergency() || (brake_force > 0.0);
-    if (brake_active && std::abs(velocity_) < 0.1) {
+    if (brake_active && throttle_ <= 0.0 && std::abs(velocity_) < 0.1) {
         velocity_ = 0.0;
         immobilized_ = true;
     } else if (velocity_ == 0.0 && brake_active) {

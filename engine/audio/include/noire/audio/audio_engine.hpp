@@ -44,13 +44,20 @@ public:
     // Joint de rail : « clac » one-shot spatialisé (pool interne round-robin).
     void play_rail_joint(const WorldPosition& position, const glm::vec3& velocity, float volume);
 
+    // Hassha melody (M32) : jingle de départ joué en ONE-SHOT à la fermeture des
+    // portes, non spatialisé (sonnerie de quai entendue depuis la cabine).
+    void play_hassha(float volume);
+    // Alarme ATS (M32) : « ding » de carillon EN BOUCLE tant que l'overspeed est actif.
+    // Comme le sifflet : `volume` = 0 rend la boucle muette sans la réinitialiser.
+    void set_ats_alarm(float volume);
+
     // Émetteurs pilotables par un PCM EXTERNE (M7 étape 5). Remplace la synthèse M6
     // d'un émetteur par le PCM fourni (mono float32 48 kHz, cf. decode_audio_file),
     // en conservant tout le chemin de spatialisation + Doppler. Le PCM est COPIÉ
     // (l'AudioEngine reste propriétaire de ses données). Si non appelé (ou fichier
     // manquant côté appelant), l'émetteur garde le son de synthèse — fallback M6.
     // Renvoie false si l'audio est indisponible ou le PCM invalide.
-    enum class Emitter { Rumble, Squeal, Joint };
+    enum class Emitter { Rumble, Squeal, Joint, Hassha, AtsAlarm };
     bool set_source(Emitter emitter, const float* pcm, std::size_t frame_count);
 
 private:
