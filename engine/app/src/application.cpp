@@ -465,7 +465,8 @@ struct Application::Impl {
     // Terrain : secours = le sol procédural, remplacé par le splatting dès qu'il est prêt.
     render::MaterialId terrain_material = 0;
 
-    // --- Grille Urbaine & Lampadaires (M37) -----------------------------------
+    // --- Grille Urbaine & Lampadaires (M37 / M38) -----------------------------
+    scene::CityGrid city_grid{24.0, 3, 18.0};  // cellule 24m, 1 route / 3, corridor ±18m
     resource::ModelHandle streetlamp_model;
     render::MeshId road_mesh = 0;
     render::MeshId sidewalk_mesh = 0;
@@ -1328,9 +1329,8 @@ struct Application::Impl {
     // immeuble, rangé dans la liste de sa variante (tour / immeuble / barre).
     void reseed_city_grid() {
         const WorldPosition wp = wagon.body_position();
-        scene::CityGrid grid;
-        const auto road_data = grid.generate_roads(wp, 600.0, kBuildingCell, 32.0);
-        const auto sw_data = grid.generate_sidewalks(wp, 600.0, kBuildingCell, 32.0);
+        const auto road_data = city_grid.generate_roads(wp, 600.0);
+        const auto sw_data = city_grid.generate_sidewalks(wp, 600.0);
 
         if (road_mesh != 0) {
             renderer.destroy_mesh(road_mesh);
@@ -1350,24 +1350,19 @@ struct Application::Impl {
         city_grid_origin = wp;
     }
 
+    // --- Lampadaires (M38) : aux frontières ROUTE ↔ PARCELLE -----------------
     void reseed_streetlamps() {
         const WorldPosition wp = wagon.body_position();
-        std::vector<render::InstanceData> seeded;
-        const double range = 500.0;
-        const double step = 24.0;
-        const auto count = static_cast<long>(range / step);
-        const long cx0 = static_cast<long>(std::floor(wp.x / step));
+        const auto posts = city_grid.generate_lamppost_positions(wp, 500.0);
 
-        for (long i = cx0 - count; i <= cx0 + count; ++i) {
-            const double wx = static_cast<double>(i) * step;
-            for (float sz : {-16.5f, 16.5f}) {
-                const double wz = wp.z + static_cast<double>(sz);
-                render::InstanceData inst;
-                inst.position_scale = glm::vec4(glm::vec3(glm::dvec3(wx, 0.0, wz) - wp), 1.0f);
-                const float yaw = (sz < 0.0f) ? 1.5708f : -1.5708f;
-                inst.rotation_phase = glm::vec4(yaw, 0.0f, 0.0f, 0.0f);
-                seeded.push_back(inst);
-            }
+        std::vector<render::InstanceData> seeded;
+        seeded.reserve(posts.size());
+        for (const auto& lp : posts) {
+            render::InstanceData inst;
+            inst.position_scale = glm::vec4(
+                glm::vec3(glm::dvec3(lp.wx, 0.0, lp.wz) - wp), 1.0f);
+            inst.rotation_phase = glm::vec4(lp.yaw, 0.0f, 0.0f, 0.0f);
+            seeded.push_back(inst);
         }
 
         if (streetlamp_instances != 0) {
@@ -1383,15 +1378,13 @@ struct Application::Impl {
         streetlamp_origin = wp;
     }
 
-    // Sème les bâtiments autour du train. Appelé quand le train change de cellule.
+    // --- Bâtiments (M38) : uniquement sur les cellules PARCELLE --------------
     void reseed_buildings() {
         const WorldPosition wp = wagon.body_position();
         std::array<std::vector<render::InstanceData>, kBuildingVariants> seeded;
         const auto cells = static_cast<long>(kBuildingRange / kBuildingCell) + 1;
         const long cx0 = static_cast<long>(std::floor(wp.x / kBuildingCell));
         const long cz0 = static_cast<long>(std::floor(wp.z / kBuildingCell));
-
-        constexpr float kHalfDiag[kBuildingVariants] = {15.6f, 21.2f, 23.7f};
 
         for (long ci = cx0 - cells; ci <= cx0 + cells; ++ci) {
             for (long cj = cz0 - cells; cj <= cz0 + cells; ++cj) {
@@ -1413,16 +1406,20 @@ struct Application::Impl {
                     continue;
                 }
 
+                // M38 : l'immeuble ne peut apparaître QUE sur une cellule PARCELLE du
+                // damier urbain. Si la cellule est une ROUTE ou dans le CORRIDOR du
+                // viaduc, on l'annule.
+                if (!city_grid.is_plot(wx, wz)) {
+                    continue;
+                }
+
                 const std::uint32_t pick = h4 % 10u;
                 const auto variant =
                     static_cast<std::size_t>(pick < 2u ? 0u : (pick < 6u ? 1u : 2u));
 
-                // EXCLUSION DU VIADUC (M37 Anti-Collision) : aucun immeuble ne traverse la ligne.
-                // Le couloir de sécurité garanti (20 m + demi-diagonale du bâtiment) élimine
-                // tout chevauchement avec le viaduc et laisse respirer le boulevard central.
+                // EXCLUSION DU VIADUC : distance physique (M37) toujours en secours
                 const double d = terrain.distance_to_track(wx, wz);
-                const double min_safe_dist = 20.0 + static_cast<double>(kHalfDiag[variant]);
-                if (d < min_safe_dist || std::abs(wz - wp.z) > kBuildingHalfWidth) {
+                if (d < kBuildingCorridor || std::abs(wz - wp.z) > kBuildingHalfWidth) {
                     continue;
                 }
 
@@ -1432,7 +1429,7 @@ struct Application::Impl {
                     glm::vec3(glm::dvec3(wx, h, wz) - wp),
                     0.75f + 0.65f * (static_cast<float>(h3 & 0xffu) / 255.0f));
 
-                // Décalage d'UVs unique par bâtiment (M37 anti-clones dans mesh_instanced.vert)
+                // Décalage d'UVs unique par bâtiment (M37 anti-clones)
                 const float u_off = static_cast<float>((h2 >> 4) & 0x0fu) * 0.25f;
                 const float v_off = static_cast<float>((h3 >> 4) & 0x0fu) * 0.125f;
                 inst.rotation_phase = glm::vec4(

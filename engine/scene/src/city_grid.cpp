@@ -5,18 +5,21 @@
 
 namespace noire::scene {
 
+// ---------------------------------------------------------------------------
+// Helpers géométriques
+// ---------------------------------------------------------------------------
 namespace {
 
 void add_quad(CityGridMeshData& out, const glm::vec3& p0, const glm::vec3& p1,
-              const glm::vec3& p2, const glm::vec3& p3, const glm::vec3& normal,
-              const glm::vec2& uv_scale = glm::vec2(1.0f)) {
-    const std::uint32_t base = static_cast<std::uint32_t>(out.vertices.size());
+              const glm::vec3& p2, const glm::vec3& p3, const glm::vec3& normal) {
+    const auto base = static_cast<std::uint32_t>(out.vertices.size());
     const glm::vec4 tangent(1.0f, 0.0f, 0.0f, 1.0f);
+    const glm::vec3 n = normal;
 
-    out.vertices.push_back(render::MeshVertex{p0, normal, glm::vec2(0.0f, 0.0f) * uv_scale, tangent});
-    out.vertices.push_back(render::MeshVertex{p1, normal, glm::vec2(1.0f, 0.0f) * uv_scale, tangent});
-    out.vertices.push_back(render::MeshVertex{p2, normal, glm::vec2(1.0f, 1.0f) * uv_scale, tangent});
-    out.vertices.push_back(render::MeshVertex{p3, normal, glm::vec2(0.0f, 1.0f) * uv_scale, tangent});
+    out.vertices.push_back(render::MeshVertex{p0, n, {0.0f, 0.0f}, tangent});
+    out.vertices.push_back(render::MeshVertex{p1, n, {1.0f, 0.0f}, tangent});
+    out.vertices.push_back(render::MeshVertex{p2, n, {1.0f, 1.0f}, tangent});
+    out.vertices.push_back(render::MeshVertex{p3, n, {0.0f, 1.0f}, tangent});
 
     out.indices.push_back(base);
     out.indices.push_back(base + 1);
@@ -26,121 +29,178 @@ void add_quad(CityGridMeshData& out, const glm::vec3& p0, const glm::vec3& p1,
     out.indices.push_back(base + 3);
 }
 
-void add_box(CityGridMeshData& out, float x0, float y0, float z0, float x1, float y1, float z1) {
-    const glm::vec3 n_up(0.0f, 1.0f, 0.0f);
-    const glm::vec3 n_left(-1.0f, 0.0f, 0.0f);
-    const glm::vec3 n_right(1.0f, 0.0f, 0.0f);
-    const glm::vec3 n_front(0.0f, 0.0f, 1.0f);
-    const glm::vec3 n_back(0.0f, 0.0f, -1.0f);
+void add_box(CityGridMeshData& out, float x0, float y0, float z0,
+             float x1, float y1, float z1) {
+    const glm::vec3 up(0.0f, 1.0f, 0.0f);
+    const glm::vec3 dn(0.0f, -1.0f, 0.0f);
+    const glm::vec3 nx_neg(-1.0f, 0.0f, 0.0f);
+    const glm::vec3 nx_pos( 1.0f, 0.0f, 0.0f);
+    const glm::vec3 nz_neg(0.0f, 0.0f, -1.0f);
+    const glm::vec3 nz_pos(0.0f, 0.0f,  1.0f);
 
     // Dessus
-    add_quad(out, {x0, y1, z1}, {x1, y1, z1}, {x1, y1, z0}, {x0, y1, z0}, n_up);
+    add_quad(out, {x0, y1, z1}, {x1, y1, z1}, {x1, y1, z0}, {x0, y1, z0}, up);
     // Côtés
-    add_quad(out, {x0, y0, z1}, {x0, y0, z0}, {x0, y1, z0}, {x0, y1, z1}, n_left);
-    add_quad(out, {x1, y0, z0}, {x1, y0, z1}, {x1, y1, z1}, {x1, y1, z0}, n_right);
-    add_quad(out, {x1, y0, z1}, {x0, y0, z1}, {x0, y1, z1}, {x1, y1, z1}, n_front);
-    add_quad(out, {x0, y0, z0}, {x1, y0, z0}, {x1, y1, z0}, {x0, y1, z0}, n_back);
+    add_quad(out, {x0, y0, z0}, {x0, y0, z1}, {x0, y1, z1}, {x0, y1, z0}, nx_neg);
+    add_quad(out, {x1, y0, z1}, {x1, y0, z0}, {x1, y1, z0}, {x1, y1, z1}, nx_pos);
+    add_quad(out, {x0, y0, z1}, {x1, y0, z1}, {x1, y1, z1}, {x0, y1, z1}, nz_pos);
+    add_quad(out, {x1, y0, z0}, {x0, y0, z0}, {x0, y1, z0}, {x1, y1, z0}, nz_neg);
+}
+
+// Modulo euclidien (toujours >= 0) pour les indices de cellule négatifs.
+inline int emod(long a, int m) {
+    const int r = static_cast<int>(a % m);
+    return r < 0 ? r + m : r;
 }
 
 }  // namespace
 
-CityGridMeshData CityGrid::generate_roads(const WorldPosition& center, double range,
-                                           double cell_size, double track_corridor_w) const {
+// ---------------------------------------------------------------------------
+// CityGrid
+// ---------------------------------------------------------------------------
+
+CityGrid::CityGrid(double cell_size, int road_period, double corridor_half_w)
+    : cell_size_(cell_size), road_period_(road_period), corridor_half_w_(corridor_half_w) {}
+
+CellRole CityGrid::cell_role(long ci, long cj) const {
+    // Le centre-monde de la cellule (ci, cj) en Z.
+    const double cz_center = (static_cast<double>(cj) + 0.5) * cell_size_;
+    if (std::abs(cz_center) < corridor_half_w_) {
+        return CellRole::Corridor;
+    }
+    // Une cellule est une ROUTE si son indice modulo road_period_ == 0 sur l'un des axes.
+    if (emod(ci, road_period_) == 0 || emod(cj, road_period_) == 0) {
+        return CellRole::Road;
+    }
+    return CellRole::Plot;
+}
+
+bool CityGrid::is_plot(double wx, double wz) const {
+    const long ci = static_cast<long>(std::floor(wx / cell_size_));
+    const long cj = static_cast<long>(std::floor(wz / cell_size_));
+    return cell_role(ci, cj) == CellRole::Plot;
+}
+
+// ---------------------------------------------------------------------------
+// Routes : un quad plat par cellule de type Road, posé à Y = 0.01.
+// Coordonnées en espace caméra-relatif (center → 0, 0, 0).
+// ---------------------------------------------------------------------------
+CityGridMeshData CityGrid::generate_roads(const WorldPosition& center, double range) const {
     CityGridMeshData out;
-    const float y_road = 0.02f;  // légèrement au-dessus du sol naturel pour éviter le z-fighting
+    const float y = 0.01f;  // juste au-dessus du sol pour éviter le z-fighting
+    const glm::vec3 up(0.0f, 1.0f, 0.0f);
 
-    const long cx0 = static_cast<long>(std::floor(center.x / cell_size));
-    const long cz0 = static_cast<long>(std::floor(center.z / cell_size));
-    const auto steps = static_cast<long>(std::ceil(range / cell_size));
+    const long ci_min = static_cast<long>(std::floor((center.x - range) / cell_size_));
+    const long ci_max = static_cast<long>(std::floor((center.x + range) / cell_size_));
+    const long cj_min = static_cast<long>(std::floor((center.z - range) / cell_size_));
+    const long cj_max = static_cast<long>(std::floor((center.z + range) / cell_size_));
 
-    const float road_half_w = 5.0f;          // 10m de largeur pour les rues
-    const float boulevard_half_w = static_cast<float>(track_corridor_w * 0.5); // boulevard central
+    for (long ci = ci_min; ci <= ci_max; ++ci) {
+        for (long cj = cj_min; cj <= cj_max; ++cj) {
+            if (cell_role(ci, cj) != CellRole::Road) {
+                continue;
+            }
+            // Coins de la cellule en espace caméra-relatif.
+            const float x0 = static_cast<float>(static_cast<double>(ci) * cell_size_ - center.x);
+            const float x1 = static_cast<float>(static_cast<double>(ci + 1) * cell_size_ - center.x);
+            const float z0 = static_cast<float>(static_cast<double>(cj) * cell_size_ - center.z);
+            const float z1 = static_cast<float>(static_cast<double>(cj + 1) * cell_size_ - center.z);
 
-    // 1. Boulevard central sous le viaduc (longitudinal)
-    const float min_x = static_cast<float>(center.x - range);
-    const float max_x = static_cast<float>(center.x + range);
-
-    add_quad(out,
-             {min_x, y_road, -boulevard_half_w},
-             {max_x, y_road, -boulevard_half_w},
-             {max_x, y_road, boulevard_half_w},
-             {min_x, y_road, boulevard_half_w},
-             {0.0f, 1.0f, 0.0f},
-             glm::vec2((max_x - min_x) / 10.0f, boulevard_half_w * 2.0f / 10.0f));
-
-    // 2. Rues transversales en damier (perpendiculaires au viaduc)
-    for (long ci = cx0 - steps; ci <= cx0 + steps; ++ci) {
-        const float rx = static_cast<float>(static_cast<double>(ci) * cell_size - center.x);
-        const float rz_min = static_cast<float>(-range);
-        const float rz_max = static_cast<float>(range);
-
-        add_quad(out,
-                 {rx - road_half_w, y_road, rz_min},
-                 {rx + road_half_w, y_road, rz_min},
-                 {rx + road_half_w, y_road, rz_max},
-                 {rx - road_half_w, y_road, rz_max},
-                 {0.0f, 1.0f, 0.0f},
-                 glm::vec2(road_half_w * 2.0f / 10.0f, (rz_max - rz_min) / 10.0f));
-    }
-
-    // 3. Rues longitudinales secondaires bordant les pâtés de maisons
-    for (long cj = cz0 - steps; cj <= cz0 + steps; ++cj) {
-        const float rz = static_cast<float>(static_cast<double>(cj) * cell_size - center.z);
-        if (std::abs(rz) < boulevard_half_w) {
-            continue;  // déjà couvert par le boulevard central
+            add_quad(out, {x0, y, z1}, {x1, y, z1}, {x1, y, z0}, {x0, y, z0}, up);
         }
-
-        add_quad(out,
-                 {min_x, y_road, rz - road_half_w},
-                 {max_x, y_road, rz - road_half_w},
-                 {max_x, y_road, rz + road_half_w},
-                 {min_x, y_road, rz + road_half_w},
-                 {0.0f, 1.0f, 0.0f},
-                 glm::vec2((max_x - min_x) / 10.0f, road_half_w * 2.0f / 10.0f));
     }
-
     return out;
 }
 
-CityGridMeshData CityGrid::generate_sidewalks(const WorldPosition& center, double range,
-                                               double cell_size, double track_corridor_w) const {
+// ---------------------------------------------------------------------------
+// Trottoirs : bordure surélevée (15 cm) sur chaque bord d'une cellule PARCELLE
+// qui touche une cellule ROUTE. Largeur du trottoir : 2 m.
+// ---------------------------------------------------------------------------
+CityGridMeshData CityGrid::generate_sidewalks(const WorldPosition& center, double range) const {
     CityGridMeshData out;
-    const float y0 = 0.02f;
-    const float y1 = 0.17f;  // bordure surélevée de 15 cm
+    const float sw_w = 2.0f;     // largeur du trottoir en mètres
+    const float y0 = 0.01f;      // base (niveau du sol)
+    const float y1 = 0.16f;      // dessus (surélevé de 15 cm)
 
-    const long cx0 = static_cast<long>(std::floor(center.x / cell_size));
-    const long cz0 = static_cast<long>(std::floor(center.z / cell_size));
-    const auto steps = static_cast<long>(std::ceil(range / cell_size));
+    const long ci_min = static_cast<long>(std::floor((center.x - range) / cell_size_));
+    const long ci_max = static_cast<long>(std::floor((center.x + range) / cell_size_));
+    const long cj_min = static_cast<long>(std::floor((center.z - range) / cell_size_));
+    const long cj_max = static_cast<long>(std::floor((center.z + range) / cell_size_));
 
-    const float road_half_w = 5.0f;
-    const float boulevard_half_w = static_cast<float>(track_corridor_w * 0.5);
-    const float sw_width = 3.0f;  // 3m de trottoir bordant chaque bloc
+    const auto cs = static_cast<float>(cell_size_);
 
-    for (long ci = cx0 - steps; ci <= cx0 + steps; ++ci) {
-        for (long cj = cz0 - steps; cj <= cz0 + steps; ++cj) {
-            const float bx0 = static_cast<float>(static_cast<double>(ci) * cell_size - center.x) + road_half_w;
-            const float bx1 = static_cast<float>(static_cast<double>(ci + 1) * cell_size - center.x) - road_half_w;
-            const float bz0 = static_cast<float>(static_cast<double>(cj) * cell_size - center.z) + road_half_w;
-            const float bz1 = static_cast<float>(static_cast<double>(cj + 1) * cell_size - center.z) - road_half_w;
-
-            if (bx1 <= bx0 || bz1 <= bz0) {
+    for (long ci = ci_min; ci <= ci_max; ++ci) {
+        for (long cj = cj_min; cj <= cj_max; ++cj) {
+            if (cell_role(ci, cj) != CellRole::Plot) {
                 continue;
             }
-            // Saute les blocs traversant le boulevard du viaduc
-            if (std::abs((bz0 + bz1) * 0.5f) < boulevard_half_w) {
-                continue;
-            }
+            const float x0f = static_cast<float>(static_cast<double>(ci) * cell_size_ - center.x);
+            const float z0f = static_cast<float>(static_cast<double>(cj) * cell_size_ - center.z);
 
-            // Trottoir entourant le bloc
-            // Bord Nord/Sud/Est/Ouest du pavé
-            add_box(out, bx0, y0, bz0, bx1, y1, bz0 + sw_width);
-            add_box(out, bx0, y0, bz1 - sw_width, bx1, y1, bz1);
-            add_box(out, bx0, y0, bz0 + sw_width, bx0 + sw_width, y1, bz1 - sw_width);
-            add_box(out, bx1 - sw_width, y0, bz0 + sw_width, bx1, y1, bz1 - sw_width);
+            // Bord -X : si la cellule (ci-1, cj) est une Route
+            if (cell_role(ci - 1, cj) == CellRole::Road) {
+                add_box(out, x0f, y0, z0f, x0f + sw_w, y1, z0f + cs);
+            }
+            // Bord +X
+            if (cell_role(ci + 1, cj) == CellRole::Road) {
+                add_box(out, x0f + cs - sw_w, y0, z0f, x0f + cs, y1, z0f + cs);
+            }
+            // Bord -Z
+            if (cell_role(ci, cj - 1) == CellRole::Road) {
+                add_box(out, x0f, y0, z0f, x0f + cs, y1, z0f + sw_w);
+            }
+            // Bord +Z
+            if (cell_role(ci, cj + 1) == CellRole::Road) {
+                add_box(out, x0f, y0, z0f + cs - sw_w, x0f + cs, y1, z0f + cs);
+            }
         }
     }
-
     return out;
+}
+
+// ---------------------------------------------------------------------------
+// Lampadaires : un par bord de cellule PARCELLE qui touche une ROUTE, le long
+// de l'axe du bord, espacés tous les ~cell_size mètres. Le lampadaire est
+// centré sur le trottoir, orienté vers la route.
+// ---------------------------------------------------------------------------
+std::vector<LampPost> CityGrid::generate_lamppost_positions(const WorldPosition& center,
+                                                             double range) const {
+    std::vector<LampPost> posts;
+    const double half = cell_size_ * 0.5;
+    const double sw_offset = 1.0;  // au milieu du trottoir (2 m de large)
+
+    const long ci_min = static_cast<long>(std::floor((center.x - range) / cell_size_));
+    const long ci_max = static_cast<long>(std::floor((center.x + range) / cell_size_));
+    const long cj_min = static_cast<long>(std::floor((center.z - range) / cell_size_));
+    const long cj_max = static_cast<long>(std::floor((center.z + range) / cell_size_));
+
+    for (long ci = ci_min; ci <= ci_max; ++ci) {
+        for (long cj = cj_min; cj <= cj_max; ++cj) {
+            if (cell_role(ci, cj) != CellRole::Plot) {
+                continue;
+            }
+            const double cx = (static_cast<double>(ci) + 0.5) * cell_size_;
+            const double cz = (static_cast<double>(cj) + 0.5) * cell_size_;
+
+            // Bord -X (route à gauche) : lampadaire au milieu du bord, orienté vers -X
+            if (cell_role(ci - 1, cj) == CellRole::Road) {
+                posts.push_back({cx - half + sw_offset, cz, 1.5708f});  // face -X
+            }
+            // Bord +X
+            if (cell_role(ci + 1, cj) == CellRole::Road) {
+                posts.push_back({cx + half - sw_offset, cz, -1.5708f});  // face +X
+            }
+            // Bord -Z
+            if (cell_role(ci, cj - 1) == CellRole::Road) {
+                posts.push_back({cx, cz - half + sw_offset, 0.0f});  // face -Z
+            }
+            // Bord +Z
+            if (cell_role(ci, cj + 1) == CellRole::Road) {
+                posts.push_back({cx, cz + half - sw_offset, 3.14159f});  // face +Z
+            }
+        }
+    }
+    return posts;
 }
 
 }  // namespace noire::scene
