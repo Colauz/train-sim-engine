@@ -80,8 +80,35 @@ void Consist::update(double dt) {
     // réarme le système à l'arrêt (0 km/h) via le Mascon (EB -> N).
     current_limit_kmh_ = limits_.limit_kmh(loco_.chainage());
     const double speed_kmh = loco_.speed() * 3.6;
-    if (speed_kmh > current_limit_kmh_ + config_.ats_margin_kmh) {
-        ats_active_ = true;
+
+    // --- Délai de Grâce ATS 10s (M34) ---
+    if (!ats_isolated_) {
+        if (ats_active_) {
+            // Phase 3 : Arrêt d'urgence déjà verrouillé (latched) -> en attente d'acquittement à 0 km/h
+            ats_warning_ = false;
+            ats_warning_timer_ = 0.0;
+        } else if (speed_kmh > current_limit_kmh_) {
+            // Phase 1 : Avertissement (Warning)
+            ats_warning_ = true;
+            ats_warning_timer_ += dt;
+
+            // Phase 3 : Punition si le timer atteint 10.0 secondes sans réaction de freinage suffisante
+            if (ats_warning_timer_ >= 10.0) {
+                ats_active_ = true;
+                ats_warning_ = false;
+                ats_warning_timer_ = 0.0;
+            }
+        } else {
+            // Phase 2 : Condition d'annulation
+            // Si le joueur freine (B1..EB) ET que la vitesse est sous la limite (ou si la vitesse est normale)
+            if (is_braking_cmd_ || !ats_warning_) {
+                ats_warning_ = false;
+                ats_warning_timer_ = 0.0;
+            }
+        }
+    } else {
+        ats_warning_ = false;
+        ats_warning_timer_ = 0.0;
     }
     // ATS actif => traction coupée + freinage d'urgence, quelle que soit la consigne.
     // Si l'ATS est ISOLÉ (mode Arcade), la surveillance reste active (ats_active_ se

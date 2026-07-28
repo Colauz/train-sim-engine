@@ -46,10 +46,11 @@ public:
     // MÉMORISE la consigne du conducteur. Elle n'est appliquée qu'en update(), APRÈS le KVB
     // — c'est ce qui permet au KVB de la court-circuiter (couper la traction, forcer
     // l'urgence) sans que l'app ait à le savoir.
-    void set_controls(double throttle, double brake, bool emergency = false) {
+    void set_controls(double throttle, double brake, bool emergency = false, bool is_braking = false) {
         throttle_cmd_ = throttle;
         brake_cmd_ = brake;
         emergency_cmd_ = emergency;
+        is_braking_cmd_ = is_braking || brake > 0.0 || emergency;
     }
     void set_adhesion_scale(double scale) { loco_.set_adhesion_scale(scale); }
 
@@ -65,14 +66,21 @@ public:
     // Bogies Jacobs (0..N), pour les dessiner.
     [[nodiscard]] const std::vector<Bogie>& jacobs_bogies() const { return jacobs_; }
 
-    // --- ATS japonais (M30) -------------------------------------------------
+    // --- ATS japonais (M30 / M34) -------------------------------------------
     [[nodiscard]] const SpeedLimits& speed_limits() const { return limits_; }
     // Limite applicable à la position actuelle du train (km/h).
     [[nodiscard]] double current_limit_kmh() const { return current_limit_kmh_; }
-    // true tant que l'ATS force le freinage d'urgence (dépassement > marge, non résorbé).
+    // true tant que l'ATS est en phase d'avertissement (survitesse, timer 10s actif).
+    [[nodiscard]] bool ats_warning() const { return ats_warning_; }
+    [[nodiscard]] double ats_warning_timer() const { return ats_warning_timer_; }
+    // true tant que l'ATS force le freinage d'urgence (timer 10s dépassé, non résorbé).
     [[nodiscard]] bool ats_active() const { return ats_active_; }
     // Réarmement de l'ATS d'urgence (M33) : annule le freinage d'urgence ATS une fois le train à l'arrêt.
-    void reset_ats() { ats_active_ = false; }
+    void reset_ats() {
+        ats_active_ = false;
+        ats_warning_ = false;
+        ats_warning_timer_ = 0.0;
+    }
     // Isolation manuelle de l'ATS (mode Arcade). Quand isolé, l'ATS continue de
     // surveiller (ats_active_ se lève), mais il ne court-circuite PLUS la traction et ne
     // force PLUS l'urgence. Le HUD affiche toujours la limite : le pilote sait qu'il triche.
@@ -96,14 +104,17 @@ private:
     std::vector<CarBody> cars_;   // N
     double prev_velocity_ = 0.0;  // pour l'accélération longitudinale (tangage des voitures)
 
-    // --- ATS japonais (M30) ---
+    // --- ATS japonais (M30 / M34) ---
     SpeedLimits limits_;
     // Consigne du conducteur, en attente d'application (cf. set_controls).
     double throttle_cmd_ = 0.0;
     double brake_cmd_ = 0.0;
     bool emergency_cmd_ = false;
+    bool is_braking_cmd_ = false;
     // État courant du contrôle de vitesse.
     double current_limit_kmh_ = 90.0;
+    bool ats_warning_ = false;
+    double ats_warning_timer_ = 0.0;
     bool ats_active_ = false;
     bool ats_isolated_ = false;  // mode Arcade (isolation manuelle)
 };

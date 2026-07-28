@@ -1025,7 +1025,8 @@ struct Application::Impl {
             brake_demand = 1.0;
         }
 
-        consist.set_controls(throttle_demand, brake_demand, emergency_demand);
+        const bool is_braking = (mascon_notch <= MasconNotch::B1);
+        consist.set_controls(throttle_demand, brake_demand, emergency_demand, is_braking);
         // La météo pilote l'adhérence : sec = 1, pluie battante = 0,36 (µ ~ 0,12). C'est
         // ce qui rend le patinage — hors d'atteinte à sec avec ces chiffres — possible
         // sous la pluie au-delà de ~71 % de traction.
@@ -1064,10 +1065,8 @@ struct Application::Impl {
         const WorldPosition nose = wagon.front_bogie().position() + fwd * 8.0;
         audio.set_horn(nose, train_velocity, horn_level * 0.8f);
 
-        // Alarme ATS (M32) : carillon en boucle tant que l'overspeed est actif. Le
-        // freinage d'urgence de l'ATS ramène la vitesse sous la limite => ats_active()
-        // retombe et la boucle se tait (même schéma que le sifflet : volume piloté).
-        audio.set_ats_alarm(consist.ats_active() ? 0.7f : 0.0f);
+        // Alarme ATS (M32 / M34) : carillon en boucle en cas de survitesse (warning) ou d'urgence.
+        audio.set_ats_alarm((consist.ats_active() || consist.ats_warning()) ? 0.7f : 0.0f);
 
         sim_time += dt;
         day_time += dt * day_cycle_speed;
@@ -1168,7 +1167,7 @@ struct Application::Impl {
             lines.emplace_back("IMMOBILISE", green_notice);
         }
 
-        // ATS (M30) : témoin prioritaire.
+        // ATS (M30 / M34) : témoin prioritaire.
         if (consist.ats_isolated()) {
             // Clignotement : sin(t*4) > 0 => visible 50% du temps, ~2 Hz.
             const float blink = 0.65f + 0.35f * std::sin(static_cast<float>(sim_time) * 8.0f);
@@ -1181,6 +1180,11 @@ struct Application::Impl {
             } else {
                 lines.emplace_back("ATS URGENCE", alert);
             }
+        } else if (consist.ats_warning()) {
+            const double remaining = std::max(0.0, 10.0 - consist.ats_warning_timer());
+            const float blink = 0.5f + 0.5f * std::sin(static_cast<float>(sim_time) * 12.0f);
+            const glm::vec4 warn_color{1.0f, 0.55f, 0.10f, blink};
+            lines.emplace_back(std::format("ATS SURVITESSE ({:.1f}S)", remaining), warn_color);
         } else if (brake.emergency()) {
             lines.emplace_back("URGENCE", alert);
         } else if (wagon.slipping()) {
