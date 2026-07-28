@@ -31,17 +31,13 @@ void add_sloped_box(CityGridMeshData& out,
                     const glm::vec3& t0, const glm::vec3& t1, const glm::vec3& t2, const glm::vec3& t3) {
     // Normale supérieure STRICTEMENT orientée vers le haut (0, 1, 0) pour un éclairage uniforme sans artefacts PBR
     const glm::vec3 n_up(0.0f, 1.0f, 0.0f);
-    const glm::vec3 n_front = glm::normalize(glm::cross(t1 - t0, b0 - t0));
     const glm::vec3 n_right = glm::normalize(glm::cross(t2 - t1, b1 - t1));
-    const glm::vec3 n_back  = glm::normalize(glm::cross(t3 - t2, b2 - t2));
     const glm::vec3 n_left  = glm::normalize(glm::cross(t0 - t3, b3 - t3));
 
-    // Dessus
+    // Dessus du trottoir
     add_quad(out, t0, t1, t2, t3, n_up);
-    // Côtés (front, right, back, left)
-    add_quad(out, b0, b1, t1, t0, n_front);
+    // Bordures longitudinales extérieures uniquement (pas de cloisons transversales internes pour éviter les artefacts code-barres)
     add_quad(out, b1, b2, t2, t1, n_right);
-    add_quad(out, b2, b3, t3, t2, n_back);
     add_quad(out, b3, b0, t0, t3, n_left);
 }
 

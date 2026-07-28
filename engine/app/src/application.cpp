@@ -1406,15 +1406,16 @@ struct Application::Impl {
                 const std::uint32_t h3 = hash_u32(h2 ^ 0x85ebca6bu);
                 const std::uint32_t h4 = hash_u32(h3 ^ 0xc2b2ae35u);
 
-                if ((h1 & 0xffffu) > 52428u) {
-                    continue;
-                }
-                const double jx = static_cast<double>((h2 >> 8) & 0xffffu) / 65535.0;
-                const double jz = static_cast<double>((h3 >> 8) & 0xffffu) / 65535.0;
-                const double wx = (static_cast<double>(ci) + jx) * kBuildingCell;
-                const double wz = (static_cast<double>(cj) + jz) * kBuildingCell;
+                // M43 : Repopulation Tokyo Extrême. Tout emplacement de la grille qui est
+                // une PARCELLE (Plot) reçoit un immeuble garanti, centré sur la parcelle.
+                const double wx = (static_cast<double>(ci) + 0.5) * kBuildingCell;
+                const double wz = (static_cast<double>(cj) + 0.5) * kBuildingCell;
 
                 if (std::hypot(wx - wp.x, wz - wp.z) > kBuildingRange) {
+                    continue;
+                }
+
+                if (!city_grid.is_plot(wx, wz)) {
                     continue;
                 }
 
@@ -1422,18 +1423,7 @@ struct Application::Impl {
                 const auto variant =
                     static_cast<std::size_t>(pick < 2u ? 0u : (pick < 6u ? 1u : 2u));
 
-                // M42 : Exclusivité spatiale stricte (Anti-Collision). Vérification de l'empreinte
-                // complète du bâtiment. Si l'un des coins déborde sur une ROUTE ou un TROTTOIR,
-                // l'immeuble est immédiatement annulé.
-                constexpr float kHalfWidths[kBuildingVariants] = {11.0f, 15.0f, 21.0f};
-                constexpr float kHalfDepths[kBuildingVariants] = {11.0f, 15.0f, 11.0f};
-                const double hw = static_cast<double>(kHalfWidths[variant]);
-                const double hd = static_cast<double>(kHalfDepths[variant]);
-                if (!city_grid.is_plot_footprint(wx, wz, hw, hd)) {
-                    continue;
-                }
-
-                // EXCLUSION DU VIADUC : distance physique (M37) toujours en secours
+                // EXCLUSION DU VIADUC : exclusion stricte du couloir de la voie
                 const double d = terrain.distance_to_track(wx, wz);
                 if (d < kBuildingCorridor || std::abs(wz - wp.z) > kBuildingHalfWidth) {
                     continue;
@@ -2257,11 +2247,11 @@ struct Application::Impl {
             const double x_train = wagon.chainage();
             const glm::vec3 world_up(0.0f, 1.0f, 0.0f);
             constexpr double kStationModule = 40.0;
-            constexpr int kStationModules = 8;      // 8 x 40 m = quai de 320 m
+            constexpr int kStationModules = 2;      // M43 : 2 x 40 m = quai de 80 m (gare localisée, voie à ciel ouvert)
             constexpr double kStationSpacing = 1200.0;  // = profil ATS
             const int k_first =
-                static_cast<int>(std::max(0.0, std::floor((x_train - 600.0) / kStationSpacing)));
-            const int k_last = static_cast<int>((x_train + 4000.0) / kStationSpacing);
+                static_cast<int>(std::max(0.0, std::floor((x_train - 400.0) / kStationSpacing)));
+            const int k_last = static_cast<int>((x_train + 800.0) / kStationSpacing);
             for (int k = k_first; k <= k_last; ++k) {
                 for (int i = 0; i < kStationModules; ++i) {
                     const double xc = k * kStationSpacing +
