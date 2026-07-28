@@ -42,6 +42,6 @@ void main() {
     // l'éclairage à chaque oscillation.
     fragNormal = normalize(mat3(object.model) * (rot * inNormal));
     fragTangent = vec4(normalize(mat3(object.model) * (rot * inTangent.xyz)), inTangent.w);
-    fragUV = inUV;
+    fragUV = inUV + instRotationPhase.zw;
     gl_Position = u.proj * u.view * rel;
 }

@@ -28,6 +28,7 @@
 #include "noire/resource/asset_paths.hpp"
 #include "noire/resource/resource_manager.hpp"
 #include "noire/scene/catenary.hpp"
+#include "noire/scene/city_grid.hpp"
 #include "noire/scene/track_mesh.hpp"
 #include "noire/scene/viaduct.hpp"
 #include "noire/scene/terrain_clipmap.hpp"
@@ -464,6 +465,17 @@ struct Application::Impl {
     // Terrain : secours = le sol procédural, remplacé par le splatting dès qu'il est prêt.
     render::MaterialId terrain_material = 0;
 
+    // --- Grille Urbaine & Lampadaires (M37) -----------------------------------
+    resource::ModelHandle streetlamp_model;
+    render::MeshId road_mesh = 0;
+    render::MeshId sidewalk_mesh = 0;
+    render::MaterialId road_material = 0;
+    render::MaterialId sidewalk_material = 0;
+    render::InstanceBufferId streetlamp_instances = 0;
+    std::uint32_t streetlamp_count = 0;
+    WorldPosition city_grid_origin{};
+    WorldPosition streetlamp_origin{};
+
     // Cubes de debug M4, dessinés uniquement en fallback / pendant le chargement.
     render::MeshId bogie_mesh = 0;
     render::MeshId body_mesh = 0;
@@ -736,6 +748,22 @@ struct Application::Impl {
         jacobs_bogie_model = resources.load_model("models/metro_bogie.glb");
         // Gare de départ (M18) : un module répété le long de la voie sur 0-400 m.
         station_model = resources.load_model("models/station.glb");
+        // Lampadaire urbain (M37) : modèle 3D émissif sodium
+        streetlamp_model = resources.load_model("models/streetlamp.glb");
+
+        // Grille Urbaine (M37) : asphalte sombre et trottoirs en béton clair
+        render::MaterialDesc road_desc;
+        road_desc.base_color_factor = glm::vec4(0.14f, 0.15f, 0.17f, 1.0f);
+        road_desc.metallic_factor = 0.05f;
+        road_desc.roughness_factor = 0.85f;
+        road_material = renderer.create_material(road_desc);
+
+        render::MaterialDesc sw_desc;
+        sw_desc.base_color_factor = glm::vec4(0.65f, 0.67f, 0.70f, 1.0f);
+        sw_desc.metallic_factor = 0.0f;
+        sw_desc.roughness_factor = 0.70f;
+        sidewalk_material = renderer.create_material(sw_desc);
+
         // Bâtiments Neo-Tokyo (M31) : trois gabarits, semés par reseed_buildings().
         const char* building_files[kBuildingVariants] = {
             "models/building_a.glb", "models/building_b.glb", "models/building_c.glb"};
@@ -1298,6 +1326,64 @@ struct Application::Impl {
     // Mêmes garanties que la végétation du M11 : semis purement fonction du hash de la
     // cellule, donc déterministe et sans état. Chaque cellule produit au plus UN
     // immeuble, rangé dans la liste de sa variante (tour / immeuble / barre).
+    void reseed_city_grid() {
+        const WorldPosition wp = wagon.body_position();
+        scene::CityGrid grid;
+        const auto road_data = grid.generate_roads(wp, 600.0, kBuildingCell, 32.0);
+        const auto sw_data = grid.generate_sidewalks(wp, 600.0, kBuildingCell, 32.0);
+
+        if (road_mesh != 0) {
+            renderer.destroy_mesh(road_mesh);
+            road_mesh = 0;
+        }
+        if (sidewalk_mesh != 0) {
+            renderer.destroy_mesh(sidewalk_mesh);
+            sidewalk_mesh = 0;
+        }
+
+        if (road_data.valid()) {
+            road_mesh = renderer.create_mesh_indexed(road_data.vertices, road_data.indices);
+        }
+        if (sw_data.valid()) {
+            sidewalk_mesh = renderer.create_mesh_indexed(sw_data.vertices, sw_data.indices);
+        }
+        city_grid_origin = wp;
+    }
+
+    void reseed_streetlamps() {
+        const WorldPosition wp = wagon.body_position();
+        std::vector<render::InstanceData> seeded;
+        const double range = 500.0;
+        const double step = 24.0;
+        const auto count = static_cast<long>(range / step);
+        const long cx0 = static_cast<long>(std::floor(wp.x / step));
+
+        for (long i = cx0 - count; i <= cx0 + count; ++i) {
+            const double wx = static_cast<double>(i) * step;
+            for (float sz : {-16.5f, 16.5f}) {
+                const double wz = wp.z + static_cast<double>(sz);
+                render::InstanceData inst;
+                inst.position_scale = glm::vec4(glm::vec3(glm::dvec3(wx, 0.0, wz) - wp), 1.0f);
+                const float yaw = (sz < 0.0f) ? 1.5708f : -1.5708f;
+                inst.rotation_phase = glm::vec4(yaw, 0.0f, 0.0f, 0.0f);
+                seeded.push_back(inst);
+            }
+        }
+
+        if (streetlamp_instances != 0) {
+            renderer.destroy_instances(streetlamp_instances);
+            streetlamp_instances = 0;
+        }
+        if (!seeded.empty()) {
+            streetlamp_instances = renderer.create_instances(seeded);
+            streetlamp_count = static_cast<std::uint32_t>(seeded.size());
+        } else {
+            streetlamp_count = 0;
+        }
+        streetlamp_origin = wp;
+    }
+
+    // Sème les bâtiments autour du train. Appelé quand le train change de cellule.
     void reseed_buildings() {
         const WorldPosition wp = wagon.body_position();
         std::array<std::vector<render::InstanceData>, kBuildingVariants> seeded;
@@ -1305,17 +1391,16 @@ struct Application::Impl {
         const long cx0 = static_cast<long>(std::floor(wp.x / kBuildingCell));
         const long cz0 = static_cast<long>(std::floor(wp.z / kBuildingCell));
 
+        constexpr float kHalfDiag[kBuildingVariants] = {15.6f, 21.2f, 23.7f};
+
         for (long ci = cx0 - cells; ci <= cx0 + cells; ++ci) {
             for (long cj = cz0 - cells; cj <= cz0 + cells; ++cj) {
-                // Hash de la cellule : 4 tirages indépendants (variante, position,
-                // échelle, lacet).
                 const std::uint32_t h1 = hash_u32(static_cast<std::uint32_t>(ci) * 73856093u ^
                                                   static_cast<std::uint32_t>(cj) * 19349663u);
                 const std::uint32_t h2 = hash_u32(h1 ^ 0x9e3779b9u);
                 const std::uint32_t h3 = hash_u32(h2 ^ 0x85ebca6bu);
                 const std::uint32_t h4 = hash_u32(h3 ^ 0xc2b2ae35u);
-                // Densité : ~80 % des cellules sont bâties — mégalopole dense, le vide
-                // entre les tours est rare (c'est lui qui donne la profondeur).
+
                 if ((h1 & 0xffffu) > 52428u) {
                     continue;
                 }
@@ -1327,30 +1412,31 @@ struct Application::Impl {
                 if (std::hypot(wx - wp.x, wz - wp.z) > kBuildingRange) {
                     continue;
                 }
-                // EXCLUSION DU VIADUC : aucun immeuble ne traverse la ligne. Le couloir
-                // est bien plus large que l'emprise du tablier (±4,6 m) : il dégage les
-                // stations et laisse respirer la rue sous le viaduc.
-                const double d = terrain.distance_to_track(wx, wz);
-                if (d < kBuildingCorridor || std::abs(wz - wp.z) > kBuildingHalfWidth) {
-                    continue;
-                }
 
-                // Variante : 20 % de tours hautes, 40 % d'immeubles, 40 % de barres.
                 const std::uint32_t pick = h4 % 10u;
                 const auto variant =
                     static_cast<std::size_t>(pick < 2u ? 0u : (pick < 6u ? 1u : 2u));
 
+                // EXCLUSION DU VIADUC (M37 Anti-Collision) : aucun immeuble ne traverse la ligne.
+                // Le couloir de sécurité garanti (20 m + demi-diagonale du bâtiment) élimine
+                // tout chevauchement avec le viaduc et laisse respirer le boulevard central.
+                const double d = terrain.distance_to_track(wx, wz);
+                const double min_safe_dist = 20.0 + static_cast<double>(kHalfDiag[variant]);
+                if (d < min_safe_dist || std::abs(wz - wp.z) > kBuildingHalfWidth) {
+                    continue;
+                }
+
                 render::InstanceData inst;
-                // Posé sur le terrain naturel, ENFONCÉ de 4 m : jamais de jour sous la
-                // semelle quand le sol ondule (la base des modèles est à y = 0).
                 const double h = terrain.height(wx, wz) - 4.0;
                 inst.position_scale = glm::vec4(
                     glm::vec3(glm::dvec3(wx, h, wz) - wp),
                     0.75f + 0.65f * (static_cast<float>(h3 & 0xffu) / 255.0f));
-                // Lacet : quarts de tour seulement — une ville en damier. z = 0 : AUCUN
-                // vent, l'instance décide (le pipeline est partagé avec la végétation).
-                inst.rotation_phase =
-                    glm::vec4(static_cast<float>((h4 >> 8) & 3u) * 1.5707963f, 0.0f, 0.0f, 0.0f);
+
+                // Décalage d'UVs unique par bâtiment (M37 anti-clones dans mesh_instanced.vert)
+                const float u_off = static_cast<float>((h2 >> 4) & 0x0fu) * 0.25f;
+                const float v_off = static_cast<float>((h3 >> 4) & 0x0fu) * 0.125f;
+                inst.rotation_phase = glm::vec4(
+                    static_cast<float>((h4 >> 8) & 3u) * 1.5707963f, 0.0f, u_off, v_off);
                 seeded[variant].push_back(inst);
             }
         }
@@ -1364,9 +1450,10 @@ struct Application::Impl {
             building_counts[i] = static_cast<std::uint32_t>(seeded[i].size());
         }
         building_origin = wp;
-        // Conserve les listes CPU : ce sont elles qu'on retestera contre le frustum chaque
-        // frame (les tampons GPU persistants servent la passe d'ombres, non cullée).
         building_lists = std::move(seeded);
+
+        reseed_city_grid();
+        reseed_streetlamps();
     }
 
     // Culling CPU des bâtiments (M15, adapté M31). Reteste les listes complètes contre le
@@ -1910,6 +1997,31 @@ struct Application::Impl {
         if (viaduct_mesh != 0) {
             items.push_back(render::DrawItem{camera.relative_model(viaduct_origin),
                                              viaduct_mesh, viaduct_material});
+        }
+
+        // Grille Urbaine (Routes & Trottoirs M37)
+        if (road_mesh != 0 && road_material != 0) {
+            items.push_back(render::DrawItem{camera.relative_model(city_grid_origin),
+                                             road_mesh, road_material});
+        }
+        if (sidewalk_mesh != 0 && sidewalk_material != 0) {
+            items.push_back(render::DrawItem{camera.relative_model(city_grid_origin),
+                                             sidewalk_mesh, sidewalk_material});
+        }
+
+        // Lampadaires Urbains (M37)
+        if (streetlamp_model && streetlamp_model->ready && streetlamp_instances != 0 && streetlamp_count > 0) {
+            const glm::mat4 lamp_m = camera.relative_model(streetlamp_origin);
+            for (const auto& prim : streetlamp_model->primitives) {
+                const render::MaterialId mat = prim.material ? prim.material->id : 0;
+                render::DrawItem item;
+                item.model = lamp_m;
+                item.mesh = prim.mesh;
+                item.material = mat;
+                item.instances = streetlamp_instances;
+                item.instance_count = streetlamp_count;
+                items.push_back(item);
+            }
         }
 
         // Poteaux caténaire (M12) : OPAQUES, donc avec le reste. Un seul draw call pour
