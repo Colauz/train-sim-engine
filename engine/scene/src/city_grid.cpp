@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <algorithm>
+#include <iostream>
 
 namespace noire::scene {
 
@@ -103,10 +104,19 @@ CityGridMeshData CityGrid::generate_roads(const WorldPosition& center, double ra
                     const double wz1 = cell_wz0 + static_cast<double>(sj + 1) * sub_size;
 
                     // Échantillonnage de la hauteur du relief + 0.05m anti-z-fighting
+                    const double terrain_y = height_fn(wx0, wz0);
                     const double wy01 = height_fn(wx0, wz1) + 0.05;
                     const double wy11 = height_fn(wx1, wz1) + 0.05;
                     const double wy10 = height_fn(wx1, wz0) + 0.05;
-                    const double wy00 = height_fn(wx0, wz0) + 0.05;
+                    const double wy00 = terrain_y + 0.05;
+
+                    static int debug_topo_prints = 0;
+                    if (debug_topo_prints < 5) {
+                        std::cout << "[DEBUG TOPO] World X: " << wx0 << " | World Z: " << wz0
+                                  << " | Terrain Y calculé: " << terrain_y
+                                  << " | Route Y calculée: " << wy00 << std::endl;
+                        debug_topo_prints++;
+                    }
 
                     const glm::vec3 p0(static_cast<float>(wx0 - center.x), static_cast<float>(wy01 - center.y), static_cast<float>(wz1 - center.z));
                     const glm::vec3 p1(static_cast<float>(wx1 - center.x), static_cast<float>(wy11 - center.y), static_cast<float>(wz1 - center.z));

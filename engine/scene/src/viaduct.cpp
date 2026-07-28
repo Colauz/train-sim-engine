@@ -178,7 +178,7 @@ RailMeshData generate_viaduct(const TrackSource& track, const Terrain& terrain, 
         extrude(out, frames, guard, uv_period);
     }
 
-    // --- Piles : une boîte par pile, du dessous du tablier jusqu'au sol NATUREL ---
+    // --- Piles (M41) : extrusion dynamique entre terrain.height(X,Z) - 2.0 et le pont/toit ---
     // Grille ABSOLUE de chainage (comme les poteaux caténaire) : deux fenêtres qui se
     // recouvrent replacent les mêmes piles aux mêmes endroits, rien ne saute.
     const long k0 = static_cast<long>(std::ceil(x_start / profile.pillar_spacing));
@@ -188,23 +188,42 @@ RailMeshData generate_viaduct(const TrackSource& track, const Terrain& terrain, 
         glm::dvec3 pos_world;
         glm::dvec3 tangent;
         track.sample(x, pos_world, tangent);
-        // Le sol sous la pile : terrain naturel (height est pure). La pile s'ENFONCE de
-        // pillar_embed sous le sol : ni jour ni flottement quand le relief ondule.
-        const double ground = terrain.height(pos_world.x, pos_world.z) - profile.pillar_embed;
+
+        const glm::vec3 forward = glm::vec3(glm::normalize(tangent));
+        const glm::vec3 right = glm::normalize(glm::cross(forward, world_up));
+
+        // 1. Pile centrale du viaduc : étirée entre (terrain.height - 2.0) et le dessous du tablier
+        const double ground = terrain.height(pos_world.x, pos_world.z) - 2.0;  // M41 : -2.0m enfoui dans le sol
         const double deck_under = pos_world.y + static_cast<double>(bottom);
         const double height = deck_under - ground;
-        if (height < 0.5) {
-            continue;  // le tablier effleure le sol : pas de pile à cet endroit
+        if (height > 0.5) {
+            const glm::vec3 mid = glm::vec3(
+                glm::dvec3(pos_world.x, ground + height * 0.5, pos_world.z) - origin);
+            add_box(out, mid, glm::vec3(1.0f, 0.0f, 0.0f), glm::vec3(0.0f, 0.0f, 1.0f),
+                    glm::vec3(0.0f, 1.0f, 0.0f),
+                    glm::vec3(profile.pillar_half_width, static_cast<float>(height) * 0.5f,
+                              profile.pillar_half_width),
+                    uv_period);
         }
-        // Pile VERTICALE (repère monde) : elle ne suit pas la pente de la voie. Section
-        // carrée => son orientation autour de Y est sans importance.
-        const glm::vec3 mid = glm::vec3(
-            glm::dvec3(pos_world.x, ground + height * 0.5, pos_world.z) - origin);
-        add_box(out, mid, glm::vec3(1.0f, 0.0f, 0.0f), glm::vec3(0.0f, 0.0f, 1.0f),
-                glm::vec3(0.0f, 1.0f, 0.0f),
-                glm::vec3(profile.pillar_half_width, static_cast<float>(height) * 0.5f,
-                          profile.pillar_half_width),
-                uv_period);
+
+        // 2. Piliers de station (M41) : étirés entre (terrain.height - 2.0) et le toit de gare (+7.40m)
+        if (x >= 0.0 && x <= 400.0) {
+            for (const float sign : {-1.0f, 1.0f}) {
+                const double px = pos_world.x + static_cast<double>(sign * 6.10f * right.x);
+                const double pz = pos_world.z + static_cast<double>(sign * 6.10f * right.z);
+                const double st_ground = terrain.height(px, pz) - 2.0;
+                const double st_top = pos_world.y + 7.40;  // jusqu'à l'intrados du toit
+                const double st_height = st_top - st_ground;
+                if (st_height > 0.5) {
+                    const glm::vec3 st_mid = glm::vec3(
+                        glm::dvec3(px, st_ground + st_height * 0.5, pz) - origin);
+                    add_box(out, st_mid, glm::vec3(1.0f, 0.0f, 0.0f), glm::vec3(0.0f, 0.0f, 1.0f),
+                            glm::vec3(0.0f, 1.0f, 0.0f),
+                            glm::vec3(0.35f, static_cast<float>(st_height) * 0.5f, 0.35f),
+                            uv_period);
+                }
+            }
+        }
     }
     return out;
 }
