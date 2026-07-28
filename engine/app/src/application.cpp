@@ -488,10 +488,10 @@ struct Application::Impl {
     bool headlights_on = false;
     bool prev_l_down = false;
 
-    // --- Portes (M21) -------------------------------------------------------
+    // --- Portes (M30.5) -----------------------------------------------------
     // door_t : 0 = fermé, 1 = ouvert. Animation en 2 secondes (0.5/s).
-    // Phase 1 [0..0.3] : sortie latérale de 15 cm (bouchon).
-    // Phase 2 [0.3..1] : coulissement longitudinal de 90 cm.
+    // Phase 1 [0..0.3] : sortie latérale de 10 cm (bouchon).
+    // Phase 2 [0.3..1] : coulissement de 60 cm par vantail (ouverture centrale).
     float door_t = 0.0f;
     bool doors_opening = false;
     bool prev_p_down = false;
@@ -1574,13 +1574,43 @@ struct Application::Impl {
         // physique multi-corps), mais SES BOGIES sont dessinés SÉPARÉMENT — plaqués sur la
         // voie, sans le moindre tangage de caisse. C'est la HIÉRARCHIE ferroviaire correcte :
         // le bogie roule sur le rail, la caisse flotte au-dessus sur ses ressorts.
+        // M30.5 : comme pour les voitures, les 16 DERNIÈRES primitives de la motrice sont
+        // les battants de porte (même convention, même animation).
+        constexpr int kDoorPairs = 8;  // 4 doubles portes par face
+        const float door_t1 = glm::clamp(door_t / 0.3f, 0.0f, 1.0f);
+        const float door_t2 = glm::clamp((door_t - 0.3f) / 0.7f, 0.0f, 1.0f);
+        auto push_car = [&](const resource::ModelHandle& model, const glm::mat4& caisse_m) {
+            const auto& prims = model->primitives;
+            const int n_prims = static_cast<int>(prims.size());
+            const bool has_doors = n_prims >= 2 * kDoorPairs;
+            const auto body_count = static_cast<std::size_t>(
+                has_doors ? n_prims - 2 * kDoorPairs : n_prims);
+            for (std::size_t j = 0; j < body_count; ++j) {
+                const render::MaterialId mat = prims[j].material ? prims[j].material->id : 0;
+                items.push_back(render::DrawItem{caisse_m, prims[j].mesh, mat});
+            }
+            if (has_doors) {
+                for (int d = 0; d < kDoorPairs; ++d) {
+                    const float sx = (d < 4) ? +1.0f : -1.0f;  // flanc droit / gauche
+                    for (int leaf = 0; leaf < 2; ++leaf) {
+                        const float sz = (leaf == 0) ? -1.0f : +1.0f;  // A : -z, B : +z
+                        const glm::mat4 door_local = glm::translate(
+                            glm::mat4(1.0f),
+                            glm::vec3(sx * 0.10f * door_t1, 0.0f, sz * 0.60f * door_t2));
+                        const auto prim_idx = static_cast<std::size_t>(
+                            n_prims - 2 * kDoorPairs + 2 * d + leaf);
+                        const render::MaterialId mat =
+                            prims[prim_idx].material ? prims[prim_idx].material->id : 0;
+                        items.push_back(
+                            render::DrawItem{caisse_m * door_local, prims[prim_idx].mesh, mat});
+                    }
+                }
+            }
+        };
         if (train_model && train_model->ready) {
             const glm::mat4 caisse_m = camera.relative_model(wagon.body_position()) *
                                        wagon.body_orientation() * kLocoTransform.matrix();
-            for (const resource::Model::Primitive& prim : train_model->primitives) {
-                const render::MaterialId mat = prim.material ? prim.material->id : 0;
-                items.push_back(render::DrawItem{caisse_m, prim.mesh, mat});
-            }
+            push_car(train_model, caisse_m);
             // Helper pour dessiner un bogie (châssis + 2 essieux animés en rotation)
             auto draw_bogie = [&](const physics::Bogie& b) {
                 const glm::mat4 m = camera.relative_model(b.position()) * b.orientation() *
@@ -1631,50 +1661,14 @@ struct Application::Impl {
         }
 
         // Voitures (M30 — métro E235) : chaque caisse est posée par la cinématique
-        // inverse de ses bogies Jacobs. Les 16 DERNIÈRES primitives sont les battants
-        // de porte : 8 embrasures (0-3 flanc droit x>0, 4-7 flanc gauche), paire =
-        // vantail A puis B. Chaque battant reçoit sa matrice propre (bouchon latéral
-        // puis coulissement) au lieu de la matrice caisse commune.
+        // inverse de ses bogies Jacobs. Même convention portes que la motrice
+        // (16 dernières primitives = battants), même animation.
         if (voiture_model && voiture_model->ready) {
-            const auto& prims = voiture_model->primitives;
-            const int n_prims = static_cast<int>(prims.size());
-            constexpr int kDoorPairs = 8;  // 4 doubles portes par face
-            // Animation portes : deux phases.
-            // Phase 1 [door_t 0..0.3] : bouchon latéral de 10 cm (sortie de la coque).
-            // Phase 2 [door_t 0.3..1] : coulissement de 60 cm par vantail (les deux
-            // vantaux d'une paire s'écartent en sens opposés — porte à ouverture centrale).
-            const float t1 = glm::clamp(door_t / 0.3f, 0.0f, 1.0f);
-            const float t2 = glm::clamp((door_t - 0.3f) / 0.7f, 0.0f, 1.0f);
-            const bool has_doors = n_prims >= 2 * kDoorPairs;
-            const auto body_count = static_cast<std::size_t>(
-                has_doors ? n_prims - 2 * kDoorPairs : n_prims);
             for (int i = 0; i < consist.car_count(); ++i) {
                 const physics::CarBody& car = consist.car(i);
                 const glm::mat4 caisse_m = camera.relative_model(car.position()) *
                                            car.orientation() * kCarTransform.matrix();
-                // Coque + intérieur : toutes les primitives sauf les battants.
-                for (std::size_t j = 0; j < body_count; ++j) {
-                    const render::MaterialId mat =
-                        prims[j].material ? prims[j].material->id : 0;
-                    items.push_back(render::DrawItem{caisse_m, prims[j].mesh, mat});
-                }
-                if (has_doors) {
-                    for (int d = 0; d < kDoorPairs; ++d) {
-                        const float sx = (d < 4) ? +1.0f : -1.0f;  // flanc droit / gauche
-                        for (int leaf = 0; leaf < 2; ++leaf) {
-                            const float sz = (leaf == 0) ? -1.0f : +1.0f;  // A : -z, B : +z
-                            const glm::mat4 door_local = glm::translate(
-                                glm::mat4(1.0f),
-                                glm::vec3(sx * 0.10f * t1, 0.0f, sz * 0.60f * t2));
-                            const auto prim_idx = static_cast<std::size_t>(
-                                n_prims - 2 * kDoorPairs + 2 * d + leaf);
-                            const render::MaterialId mat =
-                                prims[prim_idx].material ? prims[prim_idx].material->id : 0;
-                            items.push_back(
-                                render::DrawItem{caisse_m * door_local, prims[prim_idx].mesh, mat});
-                        }
-                    }
-                }
+                push_car(voiture_model, caisse_m);
             }
         }
         // Bogies Jacobs (M16) : l'organe PARTAGÉ, dessiné une fois à chaque articulation.

@@ -84,8 +84,8 @@ MATERIALS = [
 ]
 MAT_ACIER, MAT_GLASS, MAT_BANDE, MAT_JUPE, MAT_INTERIOR = 0, 1, 2, 3, 4
 MAT_BENCH, MAT_PUPITRE, MAT_ECRAN, MAT_COMMANDE, MAT_PHARE = 5, 6, 7, 8, 9
-# 10..25 : portes — 16 exemplaires du MÊME matériau, car chaque battant est une
-# part séparée (une part = une primitive = un slot matériau).
+# 10..25 : portes — 16 slots pour que chaque battant soit une part (= une
+# primitive) séparée ; write_glb les DÉDUPLIQUE en un seul matériau glTF.
 for _ in range(16):
     MATERIALS.append({"name": "porte", "factor": [0.72, 0.74, 0.77, 1.0],
                       "metallic": 0.90, "roughness": 0.38})
@@ -96,17 +96,22 @@ MATERIALS.append({"name": "essieu", "factor": [0.55, 0.55, 0.56, 1.0], "metallic
 MATERIALS.append({"name": "essieu", "factor": [0.55, 0.55, 0.56, 1.0], "metallic": 1.0, "roughness": 0.30})
 MAT_BOGIE, MAT_AXLE_A, MAT_AXLE_B = 26, 27, 28
 
-# Embrasures de portes (z0, z1, y0, y1) — une face, l'autre est symétrique.
+# Embrasures de portes (z0, z1, y0, y1). La motrice décale sa 1re porte vers
+# l'arrière (la cloison de cabine occupe z = -8.0).
 DOORWAYS = [(zc - DOOR_HALF, zc + DOOR_HALF, DOOR_Y0, DOOR_Y1) for zc in DOOR_CENTERS]
+MOTRICE_CENTERS = (-6.5, -2.5, 2.5, 7.5)
+MOTRICE_DOORWAYS = [(zc - DOOR_HALF, zc + DOOR_HALF, DOOR_Y0, DOOR_Y1)
+                    for zc in MOTRICE_CENTERS]
 
 # Baies vitrées latérales : une fenêtre entre chaque paire de portes et aux bouts.
-def side_openings():
+def side_openings(doorways=DOORWAYS):
     """Ouvertures d'un mur latéral : portes + fenêtres entre les portes."""
-    openings = list(DOORWAYS)
-    spans = [(Z_HEAD + 0.5, DOOR_CENTERS[0] - DOOR_HALF)]
-    for a, b in zip(DOOR_CENTERS, DOOR_CENTERS[1:]):
+    openings = list(doorways)
+    centers = [0.5 * (d[0] + d[1]) for d in doorways]
+    spans = [(Z_HEAD + 0.5, centers[0] - DOOR_HALF)]
+    for a, b in zip(centers, centers[1:]):
         spans.append((a + DOOR_HALF, b - DOOR_HALF))
-    spans.append((DOOR_CENTERS[-1] + DOOR_HALF, Z_TAIL - 0.5))
+    spans.append((centers[-1] + DOOR_HALF, Z_TAIL - 0.5))
     for za, zb in spans:
         if zb - za > 0.3:
             openings.append((za + 0.15, zb - 0.15, WIN_SILL, WIN_LINTEL))
@@ -114,7 +119,9 @@ def side_openings():
 
 
 OPENINGS = side_openings()
+MOTRICE_OPENINGS = side_openings(MOTRICE_DOORWAYS)
 WINDOWS = [o for o in OPENINGS if o[2] == WIN_SILL]
+MOTRICE_WINDOWS = [o for o in MOTRICE_OPENINGS if o[2] == WIN_SILL]
 
 
 # --- Algèbre --------------------------------------------------------------------
@@ -194,76 +201,94 @@ def wall_with_openings(part, xa, xb, z0, z1, y0, y1, openings):
 # CAISSE COMMUNE (motrice et voiture)
 # ==============================================================================
 def build_floor(parts):
-    """Plancher + jupe d'équipement sous caisse."""
-    parts[MAT_JUPE].add_box(-HALF_W, BODY_BOT - 0.15, Z_HEAD + 0.2,
-                            HALF_W, IN_FLOOR, Z_TAIL - 0.2)
+    """Plancher + jupe d'équipement sous caisse. Jupe rentrée de 5 mm sur les
+    côtés et abaissée de 5 mm sous le plancher : aucune face coplanaire avec
+    les murs ou le bas des dalles (anti z-fighting, M30.5)."""
+    parts[MAT_JUPE].add_box(-HALF_W + 0.005, BODY_BOT - 0.15, Z_HEAD + 0.2,
+                            HALF_W - 0.005, IN_FLOOR - 0.005, Z_TAIL - 0.2)
     parts[MAT_JUPE].add_box(-HALF_W + 0.10, RAIL + 0.35, Z_HEAD + 1.2,
-                            HALF_W - 0.10, BODY_BOT - 0.15, Z_TAIL - 1.2)
+                            HALF_W - 0.10, BODY_BOT - 0.14, Z_TAIL - 1.2)
 
 
-def build_side_walls(parts):
+def build_side_walls(parts, openings=OPENINGS, windows=WINDOWS):
     """Murs latéraux avec fenêtres et portes DÉCOUPÉES, verre dans les baies."""
     for side in (-1.0, 1.0):
         xa, xb = sorted((side * HALF_W, side * (HALF_W - WALL)))
         wall_with_openings(parts[MAT_ACIER], xa, xb, Z_HEAD, Z_TAIL,
-                           BODY_BOT, ROOF_Y, OPENINGS)
-        for (z0, z1, y0, y1) in WINDOWS:
+                           BODY_BOT, ROOF_Y, openings)
+        for (z0, z1, y0, y1) in windows:
             parts[MAT_GLASS].add_box(xa - 0.005, y0, z0, xb + 0.005, y1, z1,
                                      top=False, bot=False, front=False, back=False)
-        # Bande verte Yamanote plaquée sous le bandeau vitré.
-        x0, x1 = sorted((side * HALF_W, side * (HALF_W + 0.012)))
+        # Bande verte Yamanote plaquée : décalée de 2 mm HORS du plan du mur
+        # (sa face interne ne doit pas être coplanaire avec la tôle — M30.5).
+        x0, x1 = sorted((side * (HALF_W + 0.002), side * (HALF_W + 0.014)))
         parts[MAT_BANDE].add_box(x0, WIN_SILL - 0.22, Z_HEAD + 0.3,
                                  x1, WIN_SILL - 0.04, Z_TAIL - 0.3)
 
 
 def build_roof(parts):
-    """Toit plat indépendant + climatiseurs."""
+    """Toit plat indépendant + climatiseurs (enfoncés de 5 mm, pas coplanaires)."""
     parts[MAT_ACIER].add_box(-HALF_W, ROOF_Y, Z_HEAD, HALF_W, ROOF_Y + 0.10, Z_TAIL)
     for zc in (-5.0, 0.0, 5.0):
-        parts[MAT_JUPE].add_box(-0.80, ROOF_Y + 0.10, zc - 1.2, 0.80, ROOF_Y + 0.38, zc + 1.2)
+        parts[MAT_JUPE].add_box(-0.80, ROOF_Y + 0.095, zc - 1.2, 0.80, ROOF_Y + 0.38, zc + 1.2)
 
 
-def build_interior(parts):
+def build_interior(parts, centers=DOOR_CENTERS):
     """Sol, plafond, et BANQUETTES LONGITUDINALES le long des murs (grand espace
-    vide au centre — c'est un métro)."""
-    parts[MAT_INTERIOR].add_box(-HALF_W + WALL, IN_FLOOR - 0.02, Z_HEAD + 0.1,
-                                HALF_W - WALL, IN_FLOOR, Z_TAIL - 0.1)
-    parts[MAT_INTERIOR].add_box(-HALF_W + WALL, IN_CEIL, Z_HEAD + 0.1,
-                                HALF_W - WALL, IN_CEIL + 0.05, Z_TAIL - 0.1)
+    vide au centre — c'est un métro). Tout panneau est rentré de 5 mm sous le
+    plan des murs : aucune face coplanaire (M30.5)."""
+    inner = HALF_W - WALL - 0.005
+    slab = inner - 0.005  # sol/plafond rentrés de 5 mm sous les banquettes (M30.5)
+    parts[MAT_INTERIOR].add_box(-slab, IN_FLOOR - 0.015, Z_HEAD + 0.1,
+                                slab, IN_FLOOR + 0.005, Z_TAIL - 0.1)
+    parts[MAT_INTERIOR].add_box(-slab, IN_CEIL, Z_HEAD + 0.1,
+                                slab, IN_CEIL + 0.05, Z_TAIL - 0.1)
     # Banquettes : assise à 45 cm du sol, adossée au mur, entre les portes.
-    spans = [(Z_HEAD + 0.3, DOOR_CENTERS[0] - DOOR_HALF)]
-    for a, b in zip(DOOR_CENTERS, DOOR_CENTERS[1:]):
+    spans = [(Z_HEAD + 0.3, centers[0] - DOOR_HALF)]
+    for a, b in zip(centers, centers[1:]):
         spans.append((a + DOOR_HALF, b - DOOR_HALF))
-    spans.append((DOOR_CENTERS[-1] + DOOR_HALF, Z_TAIL - 0.3))
+    spans.append((centers[-1] + DOOR_HALF, Z_TAIL - 0.3))
     for side in (-1.0, 1.0):
-        x_wall = side * (HALF_W - WALL)
-        x_edge = side * (HALF_W - WALL - 0.45)
+        x_wall = side * (inner - 0.010)  # 5 mm sous la dalle, 15 mm du mur (M30.5)
+        x_edge = side * (inner - 0.45)
         xa, xb = sorted((x_wall, x_edge))
         for za, zb in spans:
             if zb - za < 0.4:
                 continue
-            parts[MAT_BENCH].add_box(xa, IN_FLOOR, za + 0.1, xb, IN_FLOOR + 0.45, zb - 0.1)
+            # Assise enterrée de 8 mm dans la dalle de sol : sa face de fond ne
+            # coïncide ni avec la cloison (-10 mm) ni avec le pupitre (-12 mm).
+            parts[MAT_BENCH].add_box(xa, IN_FLOOR - 0.008, za + 0.1, xb, IN_FLOOR + 0.45, zb - 0.1)
             # dossier contre le mur
             xd0, xd1 = sorted((x_wall, x_wall - side * 0.12))
             parts[MAT_BENCH].add_box(xd0, IN_FLOOR + 0.45, za + 0.1,
                                      xd1, IN_FLOOR + 0.95, zb - 0.1)
     # Barres verticales au centre de chaque embrasure (poteaux d'accès).
-    for zc in DOOR_CENTERS:
+    for zc in centers:
         parts[MAT_INTERIOR].add_box(-0.03, IN_FLOOR, zc - 0.03, 0.03, IN_CEIL, zc + 0.03)
 
 
 def build_end_face(parts, zend, with_windshield):
-    """Face d'extrémité. Motrice : ÉNORME trou carré de pare-brise + phares."""
-    z0, z1 = sorted((zend, zend + (0.10 if zend < 0 else -0.10)))
+    """Face d'extrémité, plaquée 10 cm VERS L'EXTÉRIEUR de la caisse : sa face
+    intérieure (z = zend) est dos-à-dos avec les faces de bout des murs et du
+    toit (normales opposées, jamais rasterisées ensemble) au lieu d'être
+    coplanaire avec elles (anti z-fighting, M30.5). Les faces latérales et
+    supérieures des boîtes sont SUPPRIMÉES quand elles tomberaient pile dans le
+    plan des murs latéraux ou du toit. Motrice : ÉNORME trou carré de pare-brise."""
+    z0, z1 = sorted((zend, zend + (-0.10 if zend < 0 else 0.10)))
     if not with_windshield:
-        parts[MAT_ACIER].add_box(-HALF_W, BODY_BOT, z0, HALF_W, ROOF_Y, z1)
+        parts[MAT_ACIER].add_box(-HALF_W, BODY_BOT, z0, HALF_W, ROOF_Y, z1,
+                                 top=False, left=False, right=False)
         return
     # Piliers latéraux, bande basse, bande haute : le trou est RÉEL.
-    parts[MAT_ACIER].add_box(-HALF_W, BODY_BOT, z0, -WS_X, ROOF_Y, z1)
-    parts[MAT_ACIER].add_box(WS_X, BODY_BOT, z0, HALF_W, ROOF_Y, z1)
-    parts[MAT_ACIER].add_box(-WS_X, BODY_BOT, z0, WS_X, WS_Y0, z1)
-    parts[MAT_ACIER].add_box(-WS_X, WS_Y1, z0, WS_X, ROOF_Y, z1)
-    # Verre du pare-brise, à fleur de la face (z = zend).
+    parts[MAT_ACIER].add_box(-HALF_W, BODY_BOT, z0, -WS_X, ROOF_Y, z1,
+                             top=False, left=False)
+    parts[MAT_ACIER].add_box(WS_X, BODY_BOT, z0, HALF_W, ROOF_Y, z1,
+                             top=False, right=False)
+    parts[MAT_ACIER].add_box(-WS_X, BODY_BOT, z0, WS_X, WS_Y0, z1,
+                             left=False, right=False)
+    parts[MAT_ACIER].add_box(-WS_X, WS_Y1, z0, WS_X, ROOF_Y, z1,
+                             top=False, left=False, right=False)
+    # Verre du pare-brise, à fleur de la face (z = zend), décalé de ±10 mm.
     parts[MAT_GLASS].add_box(-WS_X, WS_Y0, zend - 0.01, WS_X, WS_Y1, zend + 0.01,
                              top=False, bot=False, left=False, right=False)
     # Phares : deux blocs sur les piliers, HORS de l'ouverture (|x| > WS_X).
@@ -272,35 +297,22 @@ def build_end_face(parts, zend, with_windshield):
                                  sx * 1.34 + 0.10, WS_Y0 + 0.30, zend + 0.01)
 
 
-def build_static_doors(parts):
-    """Battants FERMÉS affleurants (motrice : portes voyageurs derrière la cabine,
-    jamais animées par l'app)."""
-    for side in (-1.0, 1.0):
-        x_out = side * (HALF_W - 0.004)
-        x_in = side * (HALF_W - 0.084)
-        xa, xb = sorted((x_out, x_in))
-        for (z0, z1, y0, y1) in DOORWAYS:
-            zc = 0.5 * (z0 + z1)
-            parts[MAT_ACIER].add_box(xa, y0 + 0.004, z0 + 0.004, xb, y1 - 0.004, zc)
-            parts[MAT_ACIER].add_box(xa, y0 + 0.004, zc, xb, y1 - 0.004, z1 - 0.004)
-
-
-# ==============================================================================
-# MOTRICE — cabine + pupitre japonais (T-handle) + siège
-# ==============================================================================
 def build_cab(parts):
     """Cabine : cloison, pupitre avec manipulateur T à gauche, écrans, siège.
     Le volume entre le sol (y=-1.00), le plafond (y=1.10), la face avant et la
     cloison (z=-8.0) est VIDE — seule la vitre du pare-brise ferme l'avant."""
-    # Cloison arrière de cabine (avec une petite fenêtre de vigilance).
-    parts[MAT_INTERIOR].add_box(-HALF_W + WALL, IN_FLOOR, Z_CLOISON,
-                                HALF_W - WALL, IN_CEIL, Z_CLOISON + 0.08)
-    # Pupitre : console posée sur le sol, sous le pare-brise.
-    parts[MAT_PUPITRE].add_box(-1.10, IN_FLOOR, -9.65, 1.10, -0.30, -8.95)
-    # Panneau d'instruments incliné, face au conducteur.
+    # Cloison arrière de cabine, rentrée de 5 mm sous le plan des murs (M30.5),
+    # enterrée de 10 mm dans la dalle de sol (face de fond hors des plans -8/-12 mm).
+    parts[MAT_INTERIOR].add_box(-HALF_W + WALL + 0.005, IN_FLOOR - 0.010, Z_CLOISON,
+                                HALF_W - WALL - 0.005, IN_CEIL, Z_CLOISON + 0.08)
+    # Pupitre : console posée sur le sol, sous le pare-brise (fond enterré de 12 mm).
+    parts[MAT_PUPITRE].add_box(-1.10, IN_FLOOR - 0.012, -9.65, 1.10, -0.30, -8.95)
+    # Panneau d'instruments incliné, face au conducteur (faces cachées omises :
+    # le fond du panneau serait coplanaire avec le dessus de la console, M30.5).
     quad_orient(parts[MAT_PUPITRE], (-1.05, -0.30, -8.98), (1.05, -0.30, -8.98),
                 (1.05, -0.02, -9.22), (-1.05, -0.02, -9.22), (0.0, 0.7, 0.7))
-    parts[MAT_PUPITRE].add_box(-1.05, -0.30, -9.22, 1.05, -0.02, -8.98, top=False)
+    parts[MAT_PUPITRE].add_box(-1.05, -0.30, -9.22, 1.05, -0.02, -8.98,
+                               top=False, bot=False)
     # Deux écrans de conduite (vitesse / ATS) sur le panneau.
     for x0, x1 in ((-0.45, -0.10), (0.10, 0.45)):
         parts[MAT_ECRAN].add_box(x0, -0.24, -9.13, x1, -0.06, -9.09)
@@ -314,30 +326,44 @@ def build_cab(parts):
     parts[MAT_BENCH].add_box(-0.26, -0.45, -8.27, 0.26, 0.15, -8.17)         # dossier
 
 
-def build_motrice(out):
-    parts = [Part() for _ in MATERIALS]
-    build_floor(parts)
-    build_side_walls(parts)
-    build_roof(parts)
-    build_end_face(parts, Z_HEAD, with_windshield=True)
-    build_end_face(parts, Z_TAIL, with_windshield=False)
-    build_interior(parts)
-    build_static_doors(parts)
-    build_cab(parts)
-    write_glb(out, parts, "E235_motrice")
-
-
-# ==============================================================================
-# VOITURE — 4 doubles portes par face, battants = 16 dernières primitives
-# ==============================================================================
 def build_door_leaf(part, side, z0, z1):
-    """Un vantail coulissant, AFFLEURANT fermé (rentré de 4 mm)."""
+    """Un vantail coulissant, AFFLEURANT fermé (rentré de 4 mm, et 4 mm de jour
+    au milieu de la paire : aucune face coplanaire, M30.5)."""
     x_out = side * (HALF_W - 0.004)
     x_in = side * (HALF_W - 0.084)
     part.add_box(min(x_out, x_in), DOOR_Y0 + 0.004, z0 + 0.004,
                  max(x_out, x_in), DOOR_Y1 - 0.004, z1 - 0.004)
 
 
+def build_door_parts(parts, doorways):
+    """LES 16 DERNIÈRES PARTS du GLB : battants. Embrasures 0-3 = flanc droit
+    (x>0), 4-7 = flanc gauche ; paire = vantail A (coulisse vers -z) puis B
+    (vers +z). Convention INDEX que l'app C++ anime (pas de lookup par nom)."""
+    for d in range(8):
+        side = 1.0 if d < 4 else -1.0
+        z0, z1, _, _ = doorways[d % 4]
+        zc = 0.5 * (z0 + z1)
+        build_door_leaf(parts[MAT_DOOR0 + 2 * d], side, z0, zc)       # vantail A
+        build_door_leaf(parts[MAT_DOOR0 + 2 * d + 1], side, zc, z1)   # vantail B
+
+
+def build_motrice(out):
+    parts = [Part() for _ in MATERIALS]
+    build_floor(parts)
+    build_side_walls(parts, MOTRICE_OPENINGS, MOTRICE_WINDOWS)
+    build_roof(parts)
+    build_end_face(parts, Z_HEAD, with_windshield=True)
+    build_end_face(parts, Z_TAIL, with_windshield=False)
+    build_interior(parts, MOTRICE_CENTERS)
+    build_cab(parts)
+    # Portes de la motrice ANIMÉES elles aussi (M30.5) : 16 dernières primitives.
+    build_door_parts(parts, MOTRICE_DOORWAYS)
+    write_glb(out, parts, "E235_motrice")
+
+
+# ==============================================================================
+# VOITURE — 4 doubles portes par face, battants = 16 dernières primitives
+# ==============================================================================
 def build_voiture(out):
     parts = [Part() for _ in MATERIALS]
     build_floor(parts)
@@ -346,14 +372,7 @@ def build_voiture(out):
     build_end_face(parts, Z_HEAD, with_windshield=False)
     build_end_face(parts, Z_TAIL, with_windshield=False)
     build_interior(parts)
-    # LES 16 DERNIÈRES PARTS : battants. Embrasures 0-3 = flanc droit (x>0),
-    # 4-7 = flanc gauche ; paire = vantail A (coulisse vers -z) puis B (vers +z).
-    for d in range(8):
-        side = 1.0 if d < 4 else -1.0
-        z0, z1, _, _ = DOORWAYS[d % 4]
-        zc = 0.5 * (z0 + z1)
-        build_door_leaf(parts[MAT_DOOR0 + 2 * d], side, z0, zc)       # vantail A
-        build_door_leaf(parts[MAT_DOOR0 + 2 * d + 1], side, zc, z1)   # vantail B
+    build_door_parts(parts, DOORWAYS)
     write_glb(out, parts, "E235_voiture")
 
 
@@ -471,20 +490,32 @@ def write_glb(path, parts, node_name):
                                  "byteLength": len(part_blocks[slot][k]), "target": targets[k]})
         primitives.append({"attributes": {"POSITION": base, "NORMAL": base + 1,
                                           "TEXCOORD_0": base + 2, "TANGENT": base + 3},
-                           "indices": base + 4, "material": slot})
-    materials = []
-    for mat_idx, _ in used:
+                           "indices": base + 4, "material": mat_idx})
+    # Matériaux DÉDUPLIQUÉS : les 16 battants de porte partagent UN matériau
+    # (le pool de descriptor sets du renderer est limité à 64 — M30.5).
+    # L'animation repose sur les indices de PRIMITIVES, pas sur les matériaux.
+    materials, mat_remap = [], {}
+
+    def mat_slot(mat_idx):
         mat_def = MATERIALS[mat_idx]
-        m = {"name": mat_def["name"],
-             "pbrMetallicRoughness": {"baseColorFactor": mat_def["factor"],
-                                      "metallicFactor": mat_def["metallic"],
-                                      "roughnessFactor": mat_def["roughness"]}}
-        if mat_def.get("blend"):
-            m["alphaMode"] = "BLEND"
-            m["doubleSided"] = True
-        elif mat_def.get("doubleSided"):
-            m["doubleSided"] = True
-        materials.append(m)
+        key = (mat_def["name"], tuple(mat_def["factor"]), mat_def["metallic"],
+               mat_def["roughness"], mat_def.get("blend"), mat_def.get("doubleSided"))
+        if key not in mat_remap:
+            mat_remap[key] = len(materials)
+            m = {"name": mat_def["name"],
+                 "pbrMetallicRoughness": {"baseColorFactor": mat_def["factor"],
+                                          "metallicFactor": mat_def["metallic"],
+                                          "roughnessFactor": mat_def["roughness"]}}
+            if mat_def.get("blend"):
+                m["alphaMode"] = "BLEND"
+                m["doubleSided"] = True
+            elif mat_def.get("doubleSided"):
+                m["doubleSided"] = True
+            materials.append(m)
+        return mat_remap[key]
+
+    for prim in primitives:
+        prim["material"] = mat_slot(prim["material"])
 
     gltf = {"asset": {"version": "2.0", "generator": "noire-metro-e235 (CC0)"},
             "scene": 0, "scenes": [{"nodes": [0]}], "nodes": [{"mesh": 0, "name": node_name}],
