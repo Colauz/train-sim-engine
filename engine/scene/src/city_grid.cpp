@@ -32,14 +32,10 @@ inline int emod(long a, int m) {
 
 }  // namespace
 
-CityGrid::CityGrid(double cell_size, int road_period, double corridor_half_w)
-    : cell_size_(cell_size), road_period_(road_period), corridor_half_w_(corridor_half_w) {}
+CityGrid::CityGrid(double cell_size, int road_period)
+    : cell_size_(cell_size), road_period_(road_period) {}
 
 CellRole CityGrid::cell_role(long ci, long cj) const {
-    const double cz_center = (static_cast<double>(cj) + 0.5) * cell_size_;
-    if (std::abs(cz_center) < corridor_half_w_) {
-        return CellRole::Corridor;
-    }
     if (emod(ci, road_period_) == 0 || emod(cj, road_period_) == 0) {
         return CellRole::Road;
     }
@@ -62,12 +58,14 @@ bool CityGrid::is_plot_footprint(double wx, double wz, double half_w, double hal
 }
 
 // ---------------------------------------------------------------------------
-// Routes (M44) : un quad d'asphalte plat par cellule ROUTE, à terrain + 0,05 m.
-// Plus d'autotiling, plus de marges, plus de marquages : la cellule entière est
-// chaussée. Subdivision 4x4 uniquement pour épouser le relief sans Z-fighting.
+// Routes (M44/M46) : un quad d'asphalte plat par cellule ROUTE, à terrain + 0,05 m.
+// Subdivision 4x4 pour épouser le relief — et pour CONTOURNER LES PILIERS : tout
+// sous-quad dont la boîte touche l'empreinte d'un pilier est omis (ÉTAPE 2 du
+// pipeline M46 : une route passe sous le viaduc, jamais à travers le béton).
 // ---------------------------------------------------------------------------
 CityGridMeshData CityGrid::generate_roads(const WorldPosition& center, double range,
-                                           const HeightSampler& height_fn) const {
+                                           const HeightSampler& height_fn,
+                                           const std::vector<PillarBox>& pillars) const {
     CityGridMeshData out;
 
     const long ci_min = static_cast<long>(std::floor((center.x - range) / cell_size_));
@@ -76,6 +74,16 @@ CityGridMeshData CityGrid::generate_roads(const WorldPosition& center, double ra
     const long cj_max = static_cast<long>(std::floor((center.z + range) / cell_size_));
 
     constexpr int patch_div = 4;
+
+    auto hits_pillar = [&](double wx0, double wz0, double wx1, double wz1) {
+        for (const PillarBox& p : pillars) {
+            if (wx0 < p.x + p.half && wx1 > p.x - p.half &&
+                wz0 < p.z + p.half && wz1 > p.z - p.half) {
+                return true;
+            }
+        }
+        return false;
+    };
 
     for (long ci = ci_min; ci <= ci_max; ++ci) {
         for (long cj = cj_min; cj <= cj_max; ++cj) {
@@ -93,6 +101,10 @@ CityGridMeshData CityGrid::generate_roads(const WorldPosition& center, double ra
                     const double wx1 = wx0 + dx;
                     const double wz0 = cell_wz0 + static_cast<double>(j) * dx;
                     const double wz1 = wz0 + dx;
+
+                    if (hits_pillar(wx0, wz0, wx1, wz1)) {
+                        continue;  // la chaussée s'arrête autour du pilier
+                    }
 
                     const double wy01 = height_fn(wx0, wz1) + 0.05;
                     const double wy11 = height_fn(wx1, wz1) + 0.05;

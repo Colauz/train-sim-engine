@@ -466,7 +466,7 @@ struct Application::Impl {
     render::MaterialId terrain_material = 0;
 
     // --- Grille Urbaine & Lampadaires (M37 / M38) -----------------------------
-    scene::CityGrid city_grid{30.0, 3, 15.0};  // M44 : cellule 30m, 1 route / 3, corridor voie ±15m
+    scene::CityGrid city_grid{30.0, 3};  // M44/M46 : cellule 30 m, 1 route / 3
     resource::ModelHandle streetlamp_model;
     render::MeshId road_mesh = 0;
     render::MaterialId road_material = 0;
@@ -1315,19 +1315,46 @@ struct Application::Impl {
         return hud;
     }
 
-    // Sème les bâtiments autour du train. Appelé quand le train change de cellule.
-    // Mêmes garanties que la végétation du M11 : semis purement fonction du hash de la
-    // cellule, donc déterministe et sans état. Chaque cellule produit au plus UN
-    // immeuble, rangé dans la liste de sa variante (tour / immeuble / barre).
+    // M46 — Pipeline de génération en ordre strict (cadastre virtuel) :
+    //   ÉTAPE 1 : la voie et ses piliers occupent le sol en premier (collecte des
+    //             empreintes de piliers sur la fenêtre de génération) ;
+    //   ÉTAPE 2 : les routes ensuite — autorisées sous le viaduc, mais les quads qui
+    //             toucheraient un pilier sont omis (cf. CityGrid::generate_roads) ;
+    //   ÉTAPE 3 : les immeubles enfin, seulement là où le sol est encore VIDE
+    //             (cf. reseed_buildings : distance à la voie + empreinte bornée).
     void reseed_city_grid() {
         const WorldPosition wp = wagon.body_position();
         WorldPosition grid_center = wp;
         grid_center.y = 0.0;  // Origine Y monde = 0.0 pour aligner avec terrain.height()
 
+        // ÉTAPE 1 : piliers du viaduc. Grille ABSOLUE de chainage (comme generate_viaduct)
+        // => deux fenêtres qui se recouvrent trouvent les mêmes piliers, rien ne saute.
+        // Marge de 1 m autour du fût : la chaussée ne frôle jamais le béton.
+        constexpr double kRoadRange = 600.0;
+        std::vector<scene::PillarBox> pillars;
+        {
+            const double c = wagon.chainage();
+            const double s0 = c - kRoadRange - 400.0;  // marge pour les courbes
+            const double s1 = c + kRoadRange + 400.0;
+            const long k0 = static_cast<long>(std::ceil(s0 / viaduct_profile.pillar_spacing));
+            const long k1 = static_cast<long>(std::floor(s1 / viaduct_profile.pillar_spacing));
+            for (long k = k0; k <= k1; ++k) {
+                glm::dvec3 pos, tangent;
+                track.sample(static_cast<double>(k) * viaduct_profile.pillar_spacing, pos, tangent);
+                if (std::abs(pos.x - wp.x) > kRoadRange + 30.0 ||
+                    std::abs(pos.z - wp.z) > kRoadRange + 30.0) {
+                    continue;  // hors fenêtre : inutile de le tester sur chaque quad
+                }
+                pillars.push_back({pos.x, pos.z,
+                                   static_cast<double>(viaduct_profile.pillar_half_width) + 1.0});
+            }
+        }
+
+        // ÉTAPE 2 : le réseau routier, percé autour des piliers.
         const auto sampler = [this](double wx, double wz) {
             return terrain.height(wx, wz);
         };
-        const auto road_data = city_grid.generate_roads(grid_center, 600.0, sampler);
+        const auto road_data = city_grid.generate_roads(grid_center, kRoadRange, sampler, pillars);
 
         if (road_mesh != 0) {
             renderer.destroy_mesh(road_mesh);
@@ -1410,10 +1437,18 @@ struct Application::Impl {
                 // M44 : hauteur d'immeuble voulue entre 20 et 150 m. L'échelle
                 // d'instance ramène le gabarit du modèle (tour 95 m, block 48 m,
                 // slab 26 m — gen_building.py) exactement à cette hauteur.
+                // M46 — BOUNDING BOX STRICTE : l'empreinte horizontale à l'échelle ne
+                // doit JAMAIS dépasser 26 m (cellule 30 m moins un padding de 2 m de
+                // chaque côté). L'échelle est donc bornée par le gabarit au sol du
+                // modèle : les immeubles ne se touchent plus ni ne débordent sur la
+                // route (tour ≤ 112 m, block ≤ 41 m, slab ≤ 16 m de haut effective).
                 constexpr float kModelHeights[kBuildingVariants] = {95.0f, 48.0f, 26.0f};
+                constexpr float kModelFootprints[kBuildingVariants] = {22.0f, 30.0f, 42.0f};
+                constexpr float kMaxFootprint = 26.0f;  // 30 m de cellule - 2 x 2 m de padding
                 const float desired_h =
                     20.0f + 130.0f * (static_cast<float>(h3 & 0xffu) / 255.0f);
-                const float scale = desired_h / kModelHeights[variant];
+                const float scale = std::min(desired_h / kModelHeights[variant],
+                                             kMaxFootprint / kModelFootprints[variant]);
 
                 // M45 — CORRIDOR DE SÉCURITÉ ABSOLU : distance euclidienne réelle entre
                 // le centre de l'immeuble et l'axe de la voie (point le plus proche sur
