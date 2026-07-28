@@ -157,10 +157,10 @@ constexpr double kCatenaryStep = 200.0;
 constexpr double kViaductRange = 3500.0;
 constexpr double kViaductStep = 250.0;
 
-constexpr double kBuildingCell = 48.0;        // une cellule de semis, en mètres
+constexpr double kBuildingCell = 30.0;        // une cellule de semis, en mètres (= CityGrid)
 constexpr double kBuildingHalfWidth = 380.0;  // portée latérale de part et d'autre du viaduc
 constexpr double kBuildingRange = 700.0;      // au-delà, une tour de 100 m fond dans la nuit
-constexpr double kBuildingCorridor = 30.0;    // exclusion autour de l'axe du viaduc
+constexpr double kBuildingCorridor = 15.0;    // M44 : exclusion absolue autour de l'axe de la voie
 constexpr int kBuildingVariants = 3;          // tower / block / slab (gen_building.py)
 
 // --- Calibrage des modèles importés (M9) ------------------------------------
@@ -466,12 +466,10 @@ struct Application::Impl {
     render::MaterialId terrain_material = 0;
 
     // --- Grille Urbaine & Lampadaires (M37 / M38) -----------------------------
-    scene::CityGrid city_grid{24.0, 3, 18.0};  // cellule 24m, 1 route / 3, corridor ±18m
+    scene::CityGrid city_grid{30.0, 3, 15.0};  // M44 : cellule 30m, 1 route / 3, corridor voie ±15m
     resource::ModelHandle streetlamp_model;
     render::MeshId road_mesh = 0;
-    render::MeshId sidewalk_mesh = 0;
     render::MaterialId road_material = 0;
-    render::MaterialId sidewalk_material = 0;
     render::InstanceBufferId streetlamp_instances = 0;
     std::uint32_t streetlamp_count = 0;
     WorldPosition city_grid_origin{};
@@ -752,18 +750,12 @@ struct Application::Impl {
         // Lampadaire urbain (M37) : modèle 3D émissif sodium
         streetlamp_model = resources.load_model("models/streetlamp.glb");
 
-        // Grille Urbaine (M37) : asphalte sombre et trottoirs en béton clair
+        // Grille Urbaine (M37/M44) : asphalte gris foncé, rien d'autre ne touche le sol.
         render::MaterialDesc road_desc;
         road_desc.base_color_factor = glm::vec4(0.14f, 0.15f, 0.17f, 1.0f);
         road_desc.metallic_factor = 0.05f;
         road_desc.roughness_factor = 0.85f;
         road_material = renderer.create_material(road_desc);
-
-        render::MaterialDesc sw_desc;
-        sw_desc.base_color_factor = glm::vec4(0.65f, 0.67f, 0.70f, 1.0f);
-        sw_desc.metallic_factor = 0.0f;
-        sw_desc.roughness_factor = 0.70f;
-        sidewalk_material = renderer.create_material(sw_desc);
 
         // Bâtiments Neo-Tokyo (M31) : trois gabarits, semés par reseed_buildings().
         const char* building_files[kBuildingVariants] = {
@@ -1336,22 +1328,14 @@ struct Application::Impl {
             return terrain.height(wx, wz);
         };
         const auto road_data = city_grid.generate_roads(grid_center, 600.0, sampler);
-        const auto sw_data = city_grid.generate_sidewalks(grid_center, 600.0, sampler);
 
         if (road_mesh != 0) {
             renderer.destroy_mesh(road_mesh);
             road_mesh = 0;
         }
-        if (sidewalk_mesh != 0) {
-            renderer.destroy_mesh(sidewalk_mesh);
-            sidewalk_mesh = 0;
-        }
 
         if (road_data.valid()) {
             road_mesh = renderer.create_mesh_indexed(road_data.vertices, road_data.indices);
-        }
-        if (sw_data.valid()) {
-            sidewalk_mesh = renderer.create_mesh_indexed(sw_data.vertices, sw_data.indices);
         }
         city_grid_origin = grid_center;
     }
@@ -1431,9 +1415,15 @@ struct Application::Impl {
 
                 render::InstanceData inst;
                 const double h = terrain.height(wx, wz) - 4.0;
+                // M44 : hauteur d'immeuble voulue entre 20 et 150 m. L'échelle
+                // d'instance ramène le gabarit du modèle (tour 95 m, block 48 m,
+                // slab 26 m — gen_building.py) exactement à cette hauteur.
+                constexpr float kModelHeights[kBuildingVariants] = {95.0f, 48.0f, 26.0f};
+                const float desired_h =
+                    20.0f + 130.0f * (static_cast<float>(h3 & 0xffu) / 255.0f);
+                const float scale = desired_h / kModelHeights[variant];
                 inst.position_scale = glm::vec4(
-                    glm::vec3(glm::dvec3(wx, h, wz) - wp),
-                    0.75f + 0.65f * (static_cast<float>(h3 & 0xffu) / 255.0f));
+                    glm::vec3(glm::dvec3(wx, h, wz) - wp), scale);
 
                 // Décalage d'UVs unique par bâtiment (M37 anti-clones)
                 const float u_off = static_cast<float>((h2 >> 4) & 0x0fu) * 0.25f;
@@ -2010,14 +2000,10 @@ struct Application::Impl {
                                              viaduct_mesh, viaduct_material});
         }
 
-        // Grille Urbaine (Routes & Trottoirs M37)
+        // Grille Urbaine (Routes M37, purge M44 : plus de trottoirs)
         if (road_mesh != 0 && road_material != 0) {
             items.push_back(render::DrawItem{camera.relative_model(city_grid_origin),
                                              road_mesh, road_material});
-        }
-        if (sidewalk_mesh != 0 && sidewalk_material != 0) {
-            items.push_back(render::DrawItem{camera.relative_model(city_grid_origin),
-                                             sidewalk_mesh, sidewalk_material});
         }
 
         // Lampadaires Urbains (M37)
@@ -2239,40 +2225,9 @@ struct Application::Impl {
             }
         }
 
-        // Gares (M30 — métro de Tokyo) : une gare tous les 1 200 m, calée sur le
-        // profil ATS (quai = les 300 premiers mètres du cycle, cf. speed_limits.cpp).
-        // Le module est RÉPÉTÉ le long du quai, posé à chaque fois sur la spline avec
-        // l'orientation de la voie — il épouse donc la courbe et la pente.
-        if (station_model && station_model->ready) {
-            const double x_train = wagon.chainage();
-            const glm::vec3 world_up(0.0f, 1.0f, 0.0f);
-            constexpr double kStationModule = 40.0;
-            constexpr int kStationModules = 2;      // M43 : 2 x 40 m = quai de 80 m (gare localisée, voie à ciel ouvert)
-            constexpr double kStationSpacing = 1200.0;  // = profil ATS
-            const int k_first =
-                static_cast<int>(std::max(0.0, std::floor((x_train - 400.0) / kStationSpacing)));
-            const int k_last = static_cast<int>((x_train + 800.0) / kStationSpacing);
-            for (int k = k_first; k <= k_last; ++k) {
-                for (int i = 0; i < kStationModules; ++i) {
-                    const double xc = k * kStationSpacing +
-                                      kStationModule * (static_cast<double>(i) + 0.5);
-                    glm::dvec3 pos, tangent;
-                    track.sample(xc, pos, tangent);
-                    const glm::vec3 forward = glm::vec3(glm::normalize(tangent));
-                    const glm::vec3 right = glm::normalize(glm::cross(forward, world_up));
-                    const glm::vec3 up = glm::cross(right, forward);
-                    glm::mat4 basis(1.0f);
-                    basis[0] = glm::vec4(right, 0.0f);
-                    basis[1] = glm::vec4(up, 0.0f);
-                    basis[2] = glm::vec4(-forward, 0.0f);
-                    const glm::mat4 m = camera.relative_model(pos) * basis;
-                    for (const resource::Model::Primitive& prim : station_model->primitives) {
-                        const render::MaterialId mat = prim.material ? prim.material->id : 0;
-                        items.push_back(render::DrawItem{m, prim.mesh, mat});
-                    }
-                }
-            }
-        }
+        // Gares (M44) : NON DESSINÉES. Le reboot du world generator impose un ciel
+        // totalement dégagé au-dessus du train ; les toits reviendront plus tard,
+        // spécifiquement pour les objets « Gare ».
 
         // LES CÂBLES EN DERNIER, et ce n'est pas un détail : ils sont MÉLANGÉS et n'écrivent
         // pas la profondeur. Tout ce qui est opaque doit donc déjà avoir posé la sienne,

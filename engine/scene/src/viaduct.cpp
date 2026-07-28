@@ -166,19 +166,7 @@ RailMeshData generate_viaduct(const TrackSource& track, const Terrain& terrain, 
     };
     extrude(out, frames, deck, uv_period);
 
-    // Garde-corps en rive : ils cachent la tranche du ballast et donnent l'échelle.
-    const float gt = profile.guard_thickness;
-    const float gh = top + profile.guard_height;
-    for (const float sign : {-1.0f, 1.0f}) {
-        const float s0 = sign * (hw - gt);
-        const float s1 = sign * hw;
-        const std::vector<P2> guard = {
-            {s0, top}, {s1, top}, {s1, gh}, {s0, gh},
-        };
-        extrude(out, frames, guard, uv_period);
-    }
-
-    // --- Piles (M41) : extrusion dynamique entre terrain.height(X,Z) - 2.0 et le pont/toit ---
+    // --- Piles (M41/M44) : extrusion dynamique entre terrain.height(X,Z) - 2.0 et le pont ---
     // Grille ABSOLUE de chainage (comme les poteaux caténaire) : deux fenêtres qui se
     // recouvrent replacent les mêmes piles aux mêmes endroits, rien ne saute.
     const long k0 = static_cast<long>(std::ceil(x_start / profile.pillar_spacing));

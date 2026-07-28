@@ -17,14 +17,6 @@ enum class CellRole : std::uint8_t {
     Corridor  // zone d'exclusion du viaduc
 };
 
-// Masque binaire d'autotiling pour les connexions routières (N, S, E, W)
-namespace RoadBitmask {
-    constexpr uint8_t North = 1 << 0;  // 1
-    constexpr uint8_t South = 1 << 1;  // 2
-    constexpr uint8_t East  = 1 << 2;  // 4
-    constexpr uint8_t West  = 1 << 3;  // 8
-}
-
 struct CityGridMeshData {
     std::vector<render::MeshVertex> vertices;
     std::vector<std::uint32_t> indices;
@@ -45,17 +37,13 @@ public:
                       double corridor_half_w = 18.0);
 
     [[nodiscard]] CellRole cell_role(long ci, long cj) const;
-    [[nodiscard]] uint8_t road_bitmask(long ci, long cj) const;
 
-    // Génère les maillages d'asphalte autotilés et subdivisés adaptant le relief.
+    // Génère les quads d'asphalte plats : un patch pleine cellule par cellule ROUTE,
+    // posé à terrain + 0,05 m (anti Z-fighting). Rien d'autre ne touche le sol (M44).
     [[nodiscard]] CityGridMeshData generate_roads(const WorldPosition& center, double range,
                                                  const HeightSampler& height_fn) const;
 
-    // Génère les trottoirs surélevés sans chevauchement avec normales orientées vers le haut.
-    [[nodiscard]] CityGridMeshData generate_sidewalks(const WorldPosition& center, double range,
-                                                     const HeightSampler& height_fn) const;
-
-    // Positionne les lampadaires aux bordures exactes des trottoirs.
+    // Positionne les lampadaires aux bordures des routes.
     [[nodiscard]] std::vector<LampPost> generate_lamppost_positions(const WorldPosition& center,
                                                                     double range,
                                                                     const HeightSampler& height_fn) const;

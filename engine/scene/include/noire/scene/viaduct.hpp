@@ -24,8 +24,6 @@ struct ViaductProfile {
     double pillar_spacing = 35.0; // entraxe des piles, sur grille ABSOLUE de chainage
     float pillar_half_width = 1.6f;  // section du fût (pile-box)
     float pillar_embed = 4.0f;    // la pile s'enfonce sous le terrain (jamais de jour)
-    float guard_height = 1.10f;   // garde-corps béton en rive du tablier
-    float guard_thickness = 0.25f;
 };
 
 // Engendre le viaduc sur la plage de chainage [x_start, x_end]. Sommets exprimés
