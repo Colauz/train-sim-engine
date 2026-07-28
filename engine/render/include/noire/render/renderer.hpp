@@ -660,7 +660,8 @@ private:
     std::uint64_t frame_index_ = 0;
 
     // Couleur de fond = couleur du brouillard (mise à jour depuis les uniforms).
-    glm::vec3 background_color_{0.01f, 0.01f, 0.03f};
+    // M39 : nuit étoilée bleu très sombre plutôt que noir pur.
+    glm::vec3 background_color_{0.02f, 0.02f, 0.06f};
 
     // Chronométrage GPU : 2 timestamps (début/fin du command buffer) par frame en vol.
     // On relit ceux du slot courant APRÈS son fence — donc les valeurs datent de

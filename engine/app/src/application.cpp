@@ -1347,7 +1347,11 @@ struct Application::Impl {
         if (sw_data.valid()) {
             sidewalk_mesh = renderer.create_mesh_indexed(sw_data.vertices, sw_data.indices);
         }
+        // M39 : l'origine des routes est au SOL (Y=0), pas sur le viaduc. Si on
+        // copie wp tel quel, wp.y ≈ 10 m (hauteur du tablier) et les routes
+        // flottent dans les airs. On ne conserve que les coordonnées XZ.
         city_grid_origin = wp;
+        city_grid_origin.y = 0.0;
     }
 
     // --- Lampadaires (M38) : aux frontières ROUTE ↔ PARCELLE -----------------
@@ -1839,7 +1843,15 @@ struct Application::Impl {
         // seule la densité (.a) pilote encore le brouillard.
         const glm::vec3 fog_dry(0.28f, 0.45f, 0.78f);
         const glm::vec3 fog_wet(0.55f, 0.57f, 0.60f);
-        const glm::vec3 fog_color = glm::mix(fog_dry, fog_wet, wetness);
+        // M39 : la couleur du brouillard est atténuée la nuit pour ne pas créer
+        // un halo bleu vif derrière les immeubles en pleine nuit. Le facteur nuit
+        // est calculé plus bas (day_angle) mais on a besoin de day_time ici.
+        const auto pre_day_angle = static_cast<float>(
+            (day_time / 86400.0) * 2.0 * glm::pi<double>() - glm::half_pi<double>());
+        const float pre_night = glm::clamp(-std::sin(pre_day_angle) * 3.0f, 0.0f, 1.0f);
+        const glm::vec3 fog_night(0.02f, 0.02f, 0.06f);  // nuit étoilée, bleu très sombre
+        const glm::vec3 fog_color = glm::mix(
+            glm::mix(fog_dry, fog_wet, wetness), fog_night, pre_night);
         // Densité BAISSÉE au M9 (0.0006 -> 0.00008) : à 0.0006, le brouillard atteignait
         // 95 % dès 5 km — les 10 km de voie chargée étaient purement invisibles. À
         // 0.00008 l'horizon reste à ~55 % de voile à 10 km : brumeux mais lisible.
