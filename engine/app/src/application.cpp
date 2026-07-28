@@ -1418,16 +1418,20 @@ struct Application::Impl {
                     continue;
                 }
 
-                // M38 : l'immeuble ne peut apparaître QUE sur une cellule PARCELLE du
-                // damier urbain. Si la cellule est une ROUTE ou dans le CORRIDOR du
-                // viaduc, on l'annule.
-                if (!city_grid.is_plot(wx, wz)) {
-                    continue;
-                }
-
                 const std::uint32_t pick = h4 % 10u;
                 const auto variant =
                     static_cast<std::size_t>(pick < 2u ? 0u : (pick < 6u ? 1u : 2u));
+
+                // M42 : Exclusivité spatiale stricte (Anti-Collision). Vérification de l'empreinte
+                // complète du bâtiment. Si l'un des coins déborde sur une ROUTE ou un TROTTOIR,
+                // l'immeuble est immédiatement annulé.
+                constexpr float kHalfWidths[kBuildingVariants] = {11.0f, 15.0f, 21.0f};
+                constexpr float kHalfDepths[kBuildingVariants] = {11.0f, 15.0f, 11.0f};
+                const double hw = static_cast<double>(kHalfWidths[variant]);
+                const double hd = static_cast<double>(kHalfDepths[variant]);
+                if (!city_grid.is_plot_footprint(wx, wz, hw, hd)) {
+                    continue;
+                }
 
                 // EXCLUSION DU VIADUC : distance physique (M37) toujours en secours
                 const double d = terrain.distance_to_track(wx, wz);

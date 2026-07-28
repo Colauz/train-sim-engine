@@ -9,7 +9,6 @@
 
 namespace noire::scene {
 
-// Sampling function for terrain elevation at world coordinates (wx, wz).
 using HeightSampler = std::function<double(double, double)>;
 
 enum class CellRole : std::uint8_t {
@@ -17,6 +16,14 @@ enum class CellRole : std::uint8_t {
     Plot,
     Corridor  // zone d'exclusion du viaduc
 };
+
+// Masque binaire d'autotiling pour les connexions routières (N, S, E, W)
+namespace RoadBitmask {
+    constexpr uint8_t North = 1 << 0;  // 1
+    constexpr uint8_t South = 1 << 1;  // 2
+    constexpr uint8_t East  = 1 << 2;  // 4
+    constexpr uint8_t West  = 1 << 3;  // 8
+}
 
 struct CityGridMeshData {
     std::vector<render::MeshVertex> vertices;
@@ -34,29 +41,30 @@ struct LampPost {
 
 class CityGrid {
 public:
-    // cell_size : côté d'une cellule en mètres (par ex. 24 m).
-    // road_period : une colonne/rangée sur N est une route (par ex. 3 => 1 route, 2 parcelles).
-    // corridor_half_w : demi-largeur du boulevard central (zone d'exclusion du viaduc).
     explicit CityGrid(double cell_size = 24.0, int road_period = 3,
                       double corridor_half_w = 18.0);
 
     [[nodiscard]] CellRole cell_role(long ci, long cj) const;
+    [[nodiscard]] uint8_t road_bitmask(long ci, long cj) const;
 
-    // Génère les maillages d'asphalte subdivisés en sub-patches adaptant le relief du terrain.
+    // Génère les maillages d'asphalte autotilés et subdivisés adaptant le relief.
     [[nodiscard]] CityGridMeshData generate_roads(const WorldPosition& center, double range,
                                                  const HeightSampler& height_fn) const;
 
-    // Génère les trottoirs subdivisés aux frontières ROUTE ↔ PARCELLE épousant la hauteur du sol.
+    // Génère les trottoirs surélevés sans chevauchement avec normales orientées vers le haut.
     [[nodiscard]] CityGridMeshData generate_sidewalks(const WorldPosition& center, double range,
                                                      const HeightSampler& height_fn) const;
 
-    // Retourne les positions 3D des lampadaires avec l'altitude du sol échantillonnée.
+    // Positionne les lampadaires aux bordures exactes des trottoirs.
     [[nodiscard]] std::vector<LampPost> generate_lamppost_positions(const WorldPosition& center,
                                                                     double range,
                                                                     const HeightSampler& height_fn) const;
 
-    // Test : est-ce qu'une position monde (wx, wz) tombe sur une cellule PARCELLE ?
+    // Test d'exclusivité : est-ce qu'une position monde (wx, wz) tombe sur une cellule PARCELLE ?
     [[nodiscard]] bool is_plot(double wx, double wz) const;
+
+    // Test d'exclusivité d'empreinte (footprint) complète pour un bâtiment.
+    [[nodiscard]] bool is_plot_footprint(double wx, double wz, double half_w, double half_d) const;
 
     [[nodiscard]] double cell_size() const { return cell_size_; }
 

@@ -29,8 +29,8 @@ void add_quad(CityGridMeshData& out, const glm::vec3& p0, const glm::vec3& p1,
 void add_sloped_box(CityGridMeshData& out,
                     const glm::vec3& b0, const glm::vec3& b1, const glm::vec3& b2, const glm::vec3& b3,
                     const glm::vec3& t0, const glm::vec3& t1, const glm::vec3& t2, const glm::vec3& t3) {
-    // b0..b3 = coins de la base, t0..t3 = coins du dessus
-    const glm::vec3 n_up = glm::normalize(glm::cross(t2 - t0, t1 - t0));
+    // Normale supérieure STRICTEMENT orientée vers le haut (0, 1, 0) pour un éclairage uniforme sans artefacts PBR
+    const glm::vec3 n_up(0.0f, 1.0f, 0.0f);
     const glm::vec3 n_front = glm::normalize(glm::cross(t1 - t0, b0 - t0));
     const glm::vec3 n_right = glm::normalize(glm::cross(t2 - t1, b1 - t1));
     const glm::vec3 n_back  = glm::normalize(glm::cross(t3 - t2, b2 - t2));
@@ -66,14 +66,35 @@ CellRole CityGrid::cell_role(long ci, long cj) const {
     return CellRole::Plot;
 }
 
+uint8_t CityGrid::road_bitmask(long ci, long cj) const {
+    if (cell_role(ci, cj) != CellRole::Road) {
+        return 0;
+    }
+    uint8_t mask = 0;
+    if (cell_role(ci, cj + 1) == CellRole::Road) mask |= RoadBitmask::North;
+    if (cell_role(ci, cj - 1) == CellRole::Road) mask |= RoadBitmask::South;
+    if (cell_role(ci + 1, cj) == CellRole::Road) mask |= RoadBitmask::East;
+    if (cell_role(ci - 1, cj) == CellRole::Road) mask |= RoadBitmask::West;
+    return mask;
+}
+
 bool CityGrid::is_plot(double wx, double wz) const {
     const long ci = static_cast<long>(std::floor(wx / cell_size_));
     const long cj = static_cast<long>(std::floor(wz / cell_size_));
     return cell_role(ci, cj) == CellRole::Plot;
 }
 
+bool CityGrid::is_plot_footprint(double wx, double wz, double half_w, double half_d) const {
+    if (!is_plot(wx, wz)) return false;
+    if (!is_plot(wx - half_w, wz - half_d)) return false;
+    if (!is_plot(wx + half_w, wz - half_d)) return false;
+    if (!is_plot(wx + half_w, wz + half_d)) return false;
+    if (!is_plot(wx - half_w, wz + half_d)) return false;
+    return true;
+}
+
 // ---------------------------------------------------------------------------
-// Routes subdivisées adaptant l'altitude du terrain
+// Smart Routing / Autotiling des Routes
 // ---------------------------------------------------------------------------
 CityGridMeshData CityGrid::generate_roads(const WorldPosition& center, double range,
                                            const HeightSampler& height_fn) const {
@@ -84,8 +105,52 @@ CityGridMeshData CityGrid::generate_roads(const WorldPosition& center, double ra
     const long cj_min = static_cast<long>(std::floor((center.z - range) / cell_size_));
     const long cj_max = static_cast<long>(std::floor((center.z + range) / cell_size_));
 
-    const int subdiv = 6;  // Subdivise chaque cellule de 24m en 6x6 dalles de 4m
+    const int subdiv = 6;
     const double sub_size = cell_size_ / static_cast<double>(subdiv);
+    const double margin = 4.0;  // Largeur de trottoir réservée (chaussée de 16m)
+
+    auto emit_road_patch = [&](double rx0, double rx1, double rz0, double rz1) {
+        const int patch_div = 4;
+        const double dx = (rx1 - rx0) / static_cast<double>(patch_div);
+        const double dz = (rz1 - rz0) / static_cast<double>(patch_div);
+
+        for (int i = 0; i < patch_div; ++i) {
+            for (int j = 0; j < patch_div; ++j) {
+                const double wx0 = rx0 + static_cast<double>(i) * dx;
+                const double wx1 = rx0 + static_cast<double>(i + 1) * dx;
+                const double wz0 = rz0 + static_cast<double>(j) * dz;
+                const double wz1 = rz0 + static_cast<double>(j + 1) * dz;
+
+                const double terrain_y = height_fn(wx0, wz0);
+                const double wy01 = height_fn(wx0, wz1) + 0.05;
+                const double wy11 = height_fn(wx1, wz1) + 0.05;
+                const double wy10 = height_fn(wx1, wz0) + 0.05;
+                const double wy00 = terrain_y + 0.05;
+
+                static int debug_topo_prints = 0;
+                if (debug_topo_prints < 5) {
+                    std::cout << "[DEBUG TOPO] World X: " << wx0 << " | World Z: " << wz0
+                              << " | Terrain Y calculé: " << terrain_y
+                              << " | Route Y calculée: " << wy00 << std::endl;
+                    debug_topo_prints++;
+                }
+
+                const glm::vec3 p0(static_cast<float>(wx0 - center.x), static_cast<float>(wy01 - center.y), static_cast<float>(wz1 - center.z));
+                const glm::vec3 p1(static_cast<float>(wx1 - center.x), static_cast<float>(wy11 - center.y), static_cast<float>(wz1 - center.z));
+                const glm::vec3 p2(static_cast<float>(wx1 - center.x), static_cast<float>(wy10 - center.y), static_cast<float>(wz0 - center.z));
+                const glm::vec3 p3(static_cast<float>(wx0 - center.x), static_cast<float>(wy00 - center.y), static_cast<float>(wz0 - center.z));
+
+                glm::vec3 normal = glm::cross(p2 - p0, p1 - p0);
+                if (glm::length(normal) > 1e-4f) {
+                    normal = glm::normalize(normal);
+                } else {
+                    normal = glm::vec3(0.0f, 1.0f, 0.0f);
+                }
+
+                add_quad(out, p0, p1, p2, p3, normal);
+            }
+        }
+    };
 
     for (long ci = ci_min; ci <= ci_max; ++ci) {
         for (long cj = cj_min; cj <= cj_max; ++cj) {
@@ -93,45 +158,40 @@ CityGridMeshData CityGrid::generate_roads(const WorldPosition& center, double ra
                 continue;
             }
 
+            const uint8_t mask = road_bitmask(ci, cj);
             const double cell_wx0 = static_cast<double>(ci) * cell_size_;
             const double cell_wz0 = static_cast<double>(cj) * cell_size_;
+            const double cell_wx1 = cell_wx0 + cell_size_;
+            const double cell_wz1 = cell_wz0 + cell_size_;
 
-            for (int si = 0; si < subdiv; ++si) {
-                for (int sj = 0; sj < subdiv; ++sj) {
-                    const double wx0 = cell_wx0 + static_cast<double>(si) * sub_size;
-                    const double wx1 = cell_wx0 + static_cast<double>(si + 1) * sub_size;
-                    const double wz0 = cell_wz0 + static_cast<double>(sj) * sub_size;
-                    const double wz1 = cell_wz0 + static_cast<double>(sj + 1) * sub_size;
+            const bool is_n = (mask & RoadBitmask::North) != 0;
+            const bool is_s = (mask & RoadBitmask::South) != 0;
+            const bool is_e = (mask & RoadBitmask::East) != 0;
+            const bool is_w = (mask & RoadBitmask::West) != 0;
 
-                    // Échantillonnage de la hauteur du relief + 0.05m anti-z-fighting
-                    const double terrain_y = height_fn(wx0, wz0);
-                    const double wy01 = height_fn(wx0, wz1) + 0.05;
-                    const double wy11 = height_fn(wx1, wz1) + 0.05;
-                    const double wy10 = height_fn(wx1, wz0) + 0.05;
-                    const double wy00 = terrain_y + 0.05;
+            const int conn_count = (is_n ? 1 : 0) + (is_s ? 1 : 0) + (is_e ? 1 : 0) + (is_w ? 1 : 0);
 
-                    static int debug_topo_prints = 0;
-                    if (debug_topo_prints < 5) {
-                        std::cout << "[DEBUG TOPO] World X: " << wx0 << " | World Z: " << wz0
-                                  << " | Terrain Y calculé: " << terrain_y
-                                  << " | Route Y calculée: " << wy00 << std::endl;
-                        debug_topo_prints++;
-                    }
-
-                    const glm::vec3 p0(static_cast<float>(wx0 - center.x), static_cast<float>(wy01 - center.y), static_cast<float>(wz1 - center.z));
-                    const glm::vec3 p1(static_cast<float>(wx1 - center.x), static_cast<float>(wy11 - center.y), static_cast<float>(wz1 - center.z));
-                    const glm::vec3 p2(static_cast<float>(wx1 - center.x), static_cast<float>(wy10 - center.y), static_cast<float>(wz0 - center.z));
-                    const glm::vec3 p3(static_cast<float>(wx0 - center.x), static_cast<float>(wy00 - center.y), static_cast<float>(wz0 - center.z));
-
-                    glm::vec3 normal = glm::cross(p2 - p0, p1 - p0);
-                    if (glm::length(normal) > 1e-4f) {
-                        normal = glm::normalize(normal);
-                    } else {
-                        normal = glm::vec3(0.0f, 1.0f, 0.0f);
-                    }
-
-                    add_quad(out, p0, p1, p2, p3, normal);
+            // Carrefours (3 ou 4 voies) ou intersections
+            if (conn_count >= 3 || (is_n && is_s && is_e && is_w)) {
+                emit_road_patch(cell_wx0, cell_wx1, cell_wz0, cell_wz1);
+            }
+            // Ligne droite Nord-Sud
+            else if (is_n || is_s) {
+                if (is_e) { // Virage / T-Junction
+                    emit_road_patch(cell_wx0 + margin, cell_wx1, cell_wz0, cell_wz1);
+                } else if (is_w) {
+                    emit_road_patch(cell_wx0, cell_wx1 - margin, cell_wz0, cell_wz1);
+                } else {
+                    emit_road_patch(cell_wx0 + margin, cell_wx1 - margin, cell_wz0, cell_wz1);
                 }
+            }
+            // Ligne droite Est-Ouest
+            else if (is_e || is_w) {
+                emit_road_patch(cell_wx0, cell_wx1, cell_wz0 + margin, cell_wz1 - margin);
+            }
+            // Par défaut
+            else {
+                emit_road_patch(cell_wx0 + margin, cell_wx1 - margin, cell_wz0 + margin, cell_wz1 - margin);
             }
         }
     }
@@ -139,13 +199,13 @@ CityGridMeshData CityGrid::generate_roads(const WorldPosition& center, double ra
 }
 
 // ---------------------------------------------------------------------------
-// Trottoirs surélevés subdivisés épousant le relief
+// Trottoirs ajustés sans chevauchement avec normales supérieures (0,1,0)
 // ---------------------------------------------------------------------------
 CityGridMeshData CityGrid::generate_sidewalks(const WorldPosition& center, double range,
                                                const HeightSampler& height_fn) const {
     CityGridMeshData out;
-    const double sw_w = 2.0;       // largeur du trottoir (2m)
-    const double sw_h = 0.15;      // hauteur surélevée (15cm)
+    const double sw_w = 4.0;       // Largeur du trottoir (4m)
+    const double sw_h = 0.15;      // Surélévation du trottoir (15cm)
     const int subdiv = 6;
     const double sub_size = cell_size_ / static_cast<double>(subdiv);
 
@@ -226,14 +286,14 @@ CityGridMeshData CityGrid::generate_sidewalks(const WorldPosition& center, doubl
 }
 
 // ---------------------------------------------------------------------------
-// Positionnement 3D des lampadaires avec l'altitude du relief
+// Alignement des lampadaires sur les bordures
 // ---------------------------------------------------------------------------
 std::vector<LampPost> CityGrid::generate_lamppost_positions(const WorldPosition& center,
                                                              double range,
                                                              const HeightSampler& height_fn) const {
     std::vector<LampPost> posts;
     const double half = cell_size_ * 0.5;
-    const double sw_offset = 1.0;
+    const double sw_offset = 2.0;  // Au milieu du trottoir de 4m
 
     const long ci_min = static_cast<long>(std::floor((center.x - range) / cell_size_));
     const long ci_max = static_cast<long>(std::floor((center.x + range) / cell_size_));
@@ -249,7 +309,7 @@ std::vector<LampPost> CityGrid::generate_lamppost_positions(const WorldPosition&
             const double cz = (static_cast<double>(cj) + 0.5) * cell_size_;
 
             auto add_post = [&](double wx, double wz, float yaw) {
-                const double wy = height_fn(wx, wz) + 0.20;  // sur le trottoir
+                const double wy = height_fn(wx, wz) + 0.20;
                 posts.push_back({wx, wy, wz, yaw});
             };
 
