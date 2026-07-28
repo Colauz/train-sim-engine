@@ -1329,8 +1329,11 @@ struct Application::Impl {
     // immeuble, rangé dans la liste de sa variante (tour / immeuble / barre).
     void reseed_city_grid() {
         const WorldPosition wp = wagon.body_position();
-        const auto road_data = city_grid.generate_roads(wp, 600.0);
-        const auto sw_data = city_grid.generate_sidewalks(wp, 600.0);
+        const auto sampler = [this](double wx, double wz) {
+            return terrain.height(wx, wz);
+        };
+        const auto road_data = city_grid.generate_roads(wp, 600.0, sampler);
+        const auto sw_data = city_grid.generate_sidewalks(wp, 600.0, sampler);
 
         if (road_mesh != 0) {
             renderer.destroy_mesh(road_mesh);
@@ -1347,24 +1350,26 @@ struct Application::Impl {
         if (sw_data.valid()) {
             sidewalk_mesh = renderer.create_mesh_indexed(sw_data.vertices, sw_data.indices);
         }
-        // M39 : l'origine des routes est au SOL (Y=0), pas sur le viaduc. Si on
-        // copie wp tel quel, wp.y ≈ 10 m (hauteur du tablier) et les routes
-        // flottent dans les airs. On ne conserve que les coordonnées XZ.
+        // M39 / M40 : l'origine des routes est au SOL (Y=0), pas sur le viaduc.
+        // Les sommets intègrent directement l'altitude terrain.height(wx, wz) + 0.05.
         city_grid_origin = wp;
         city_grid_origin.y = 0.0;
     }
 
-    // --- Lampadaires (M38) : aux frontières ROUTE ↔ PARCELLE -----------------
+    // --- Lampadaires (M38 / M40) : aux frontières ROUTE ↔ PARCELLE sur le relief ---
     void reseed_streetlamps() {
         const WorldPosition wp = wagon.body_position();
-        const auto posts = city_grid.generate_lamppost_positions(wp, 500.0);
+        const auto sampler = [this](double wx, double wz) {
+            return terrain.height(wx, wz);
+        };
+        const auto posts = city_grid.generate_lamppost_positions(wp, 500.0, sampler);
 
         std::vector<render::InstanceData> seeded;
         seeded.reserve(posts.size());
         for (const auto& lp : posts) {
             render::InstanceData inst;
             inst.position_scale = glm::vec4(
-                glm::vec3(glm::dvec3(lp.wx, 0.0, lp.wz) - wp), 1.0f);
+                glm::vec3(glm::dvec3(lp.wx, lp.wy, lp.wz) - wp), 1.0f);
             inst.rotation_phase = glm::vec4(lp.yaw, 0.0f, 0.0f, 0.0f);
             seeded.push_back(inst);
         }
