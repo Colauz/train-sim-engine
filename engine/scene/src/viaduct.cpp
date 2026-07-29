@@ -197,4 +197,80 @@ RailMeshData generate_viaduct(const TrackSource& track, const Terrain& terrain, 
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// Gare aérienne (M47) : quais + verrière localisée, ailleurs la ligne est à ciel
+// ouvert. Réutilise les mêmes helpers (frames, extrude, add_box) que le viaduc.
+// ---------------------------------------------------------------------------
+RailMeshData generate_station(const TrackSource& track, double s_center,
+                              const WorldPosition& origin, const StationProfile& profile) {
+    RailMeshData out;
+    const double s0 = s_center - profile.length * 0.5;
+    const double s1 = s_center + profile.length * 0.5;
+    const glm::vec3 world_up(0.0f, 1.0f, 0.0f);
+    const float uv_period = 4.0f;
+
+    const int count = std::max(2, static_cast<int>(std::ceil((s1 - s0) / profile.step)) + 1);
+    std::vector<Frame> frames;
+    frames.reserve(static_cast<std::size_t>(count));
+    for (int i = 0; i < count; ++i) {
+        const double s = s0 + (static_cast<double>(i) / (count - 1)) * (s1 - s0);
+        glm::dvec3 pos_world;
+        glm::dvec3 tangent;
+        track.sample(s, pos_world, tangent);
+        Frame f;
+        f.center = glm::vec3(pos_world - origin);
+        const glm::vec3 forward = glm::vec3(glm::normalize(tangent));
+        f.right = glm::normalize(glm::cross(forward, world_up));
+        f.up = glm::normalize(glm::cross(f.right, forward));
+        f.u = static_cast<float>((s - s0) / uv_period);
+        frames.push_back(f);
+    }
+
+    // Quais : caissons fermés de part et d'autre du tablier, dessus à +1,10 m.
+    const float in = profile.platform_inner;
+    const float out_w = profile.platform_outer;
+    const float top = profile.platform_top;
+    const float bottom = -0.80f;  // affleure le dessus du tablier
+    for (const float sign : {-1.0f, 1.0f}) {
+        const float a = sign * in, b = sign * out_w;
+        const std::vector<P2> platform = {
+            {a, bottom}, {b, bottom}, {b, top}, {a, top},
+        };
+        extrude(out, frames, platform, uv_period);
+    }
+
+    // Verrière : dalle plane au-dessus des deux quais, sur la longueur de la gare
+    // SEULEMENT — jamais au-delà.
+    const float roof = profile.roof_y;
+    const std::vector<P2> canopy = {
+        {-out_w, roof}, {out_w, roof}, {out_w, roof + profile.roof_thickness},
+        {-out_w, roof + profile.roof_thickness},
+    };
+    extrude(out, frames, canopy, uv_period);
+
+    // Colonnes de verrière : en rive extérieure des quais, grille régulière.
+    const long k0 = static_cast<long>(std::ceil(s0 / profile.column_spacing));
+    const long k1 = static_cast<long>(std::floor(s1 / profile.column_spacing));
+    for (long k = k0; k <= k1; ++k) {
+        const double s = static_cast<double>(k) * profile.column_spacing;
+        glm::dvec3 pos_world;
+        glm::dvec3 tangent;
+        track.sample(s, pos_world, tangent);
+        const glm::vec3 forward = glm::vec3(glm::normalize(tangent));
+        const glm::vec3 right = glm::normalize(glm::cross(forward, world_up));
+
+        for (const float sign : {-1.0f, 1.0f}) {
+            const glm::vec3 base = glm::vec3(pos_world - origin) +
+                                   right * (sign * (out_w - profile.column_half));
+            const double h = static_cast<double>(roof) - static_cast<double>(top);
+            const glm::vec3 mid = base + glm::vec3(0.0f, top + static_cast<float>(h) * 0.5f, 0.0f);
+            add_box(out, mid, right, forward, glm::vec3(0.0f, 1.0f, 0.0f),
+                    glm::vec3(profile.column_half, static_cast<float>(h) * 0.5f,
+                              profile.column_half),
+                    uv_period);
+        }
+    }
+    return out;
+}
+
 }  // namespace noire::scene

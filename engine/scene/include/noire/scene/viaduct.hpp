@@ -35,4 +35,25 @@ struct ViaductProfile {
                                             const WorldPosition& origin,
                                             const ViaductProfile& profile = {});
 
+// M47 — Gare aérienne (le reste de la ligne reste à ciel ouvert). Engendre, centré
+// sur le chainage `s_center` : deux quais latéraux (plateformes à +1,10 m au-dessus
+// du plan de roulement, soit ~10,5 m au-dessus du sol), une verrière de `length`
+// mètres de long UNIQUEMENT au-dessus des quais, et ses colonnes. Mêmes conventions
+// que generate_viaduct (plan de roulement = 0, origine flottante, fonction pure).
+struct StationProfile {
+    double length = 150.0;      // longueur des quais et de la verrière (m)
+    double step = 10.0;         // pas de tessellation le long de la voie (m)
+    float platform_inner = 4.6f;  // bord de quai = rive du tablier
+    float platform_outer = 8.0f;  // rive extérieure du quai (3,4 m de large)
+    float platform_top = 1.10f;   // dessus du quai au-dessus du plan de roulement
+    float roof_y = 5.5f;        // intrados de la verrière
+    float roof_thickness = 0.35f;
+    float column_half = 0.18f;  // section des colonnes de verrière
+    double column_spacing = 15.0;
+};
+
+[[nodiscard]] RailMeshData generate_station(const TrackSource& track, double s_center,
+                                            const WorldPosition& origin,
+                                            const StationProfile& profile = {});
+
 }  // namespace noire::scene
