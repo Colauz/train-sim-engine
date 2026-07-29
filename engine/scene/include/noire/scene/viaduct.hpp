@@ -46,22 +46,26 @@ struct StationProfile {
     float platform_inner = 4.6f;  // bord de quai = rive du tablier
     float platform_outer = 8.0f;  // rive extérieure du quai (3,4 m de large)
     float platform_top = 1.10f;   // dessus du quai au-dessus du plan de roulement
-    float roof_y = 5.5f;        // intrados de la verrière
+    float roof_y = 8.0f;        // M49 : intrados REHAUSSÉ — la verrière englobe la
+                                // caténaire et le pantographe, elle ne les coupe plus
     float roof_thickness = 0.35f;
     float column_half = 0.18f;  // section des colonnes de verrière
     double column_spacing = 15.0;
-    // M48 — Façades de quai (platform screen doors) : bande vitrée continue le long
-    // du bord de quai + cadres réguliers ; et panneaux d'affichage suspendus.
+    // M48 — Façades de quai (platform screen doors) : panneaux vitrés alternés le
+    // long du quai — un fixe, un MOBILE (il coulisse avec les portes de la rame,
+    // M49) — cadres opaques réguliers ; et panneaux d'affichage suspendus.
     float psd_height = 1.8f;      // hauteur vitrée au-dessus du quai
     float psd_offset = 0.25f;     // retrait du vitrage depuis le bord de quai
     double sign_spacing = 25.0;   // entraxe des panneaux suspendus
 };
 
-// Trois maillages, trois matériaux : le béton (fusionné au viaduc), le vitrage des
-// façades de quai (BLEND, dessiné après les opaques) et la signalétique (émissif).
+// Quatre maillages : le béton (fusionné au viaduc), le vitrage FIXE des façades de
+// quai (BLEND), les panneaux vitrés MOBILES (BLEND, coulissent avec les portes de la
+// rame via une translation du DrawItem) et la signalétique (émissif).
 struct StationMeshes {
     RailMeshData concrete;
     RailMeshData glass;
+    RailMeshData psd_doors;
     RailMeshData signs;
 };
 

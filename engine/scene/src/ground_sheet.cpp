@@ -9,7 +9,9 @@ RailMeshData generate_ground_sheet(const HeightSampler& height_fn,
     RailMeshData out;
     const glm::vec3 n(0.0f, 1.0f, 0.0f);  // normale verticale : éclairage uniforme
     const glm::vec4 tangent(1.0f, 0.0f, 0.0f, 1.0f);
-    constexpr double lift = 0.02;
+    // M49 : 10 cm au-dessus du terrain. À 2 cm, l'herbe transperçait la nappe par
+    // endroits et le Z-fighting dessinait un damier gris/vert très laid.
+    constexpr double lift = 0.10;
 
     const long i_min = static_cast<long>(std::floor((center.x - range) / cell));
     const long i_max = static_cast<long>(std::floor((center.x + range) / cell));

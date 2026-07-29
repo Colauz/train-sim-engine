@@ -15,6 +15,6 @@ using HeightSampler = std::function<double(double, double)>;
 // la ville est UNE dalle, les immeubles poussent dessus. Fonction PURE.
 [[nodiscard]] RailMeshData generate_ground_sheet(const HeightSampler& height_fn,
                                                  const WorldPosition& center,
-                                                 double range, double cell = 25.0);
+                                                 double range, double cell = 50.0);
 
 }  // namespace noire::scene

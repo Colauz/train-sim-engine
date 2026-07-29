@@ -473,6 +473,9 @@ struct Application::Impl {
     render::MeshId psd_mesh = 0;
     render::MeshId psd_uploading = 0;
     render::MaterialId psd_material = 0;      // verre BLEND
+    render::MeshId psd_door_mesh = 0;         // panneaux vitrés MOBILES (M49)
+    render::MeshId psd_door_uploading = 0;
+    float psd_t = 0.0f;                       // 0 = fermé, 1 = ouvert (synchro portes)
     render::MeshId station_sign_mesh = 0;
     render::MeshId station_sign_uploading = 0;
     render::MaterialId station_sign_material = 0;  // émissif
@@ -1132,6 +1135,23 @@ struct Application::Impl {
         const float door_dir = doors_opening ? 1.0f : -1.0f;
         door_t = glm::clamp(door_t + static_cast<float>(dt) * door_speed * door_dir, 0.0f, 1.0f);
 
+        // M49 — Synchronisation des façades de quai (PSD) : elles ne s'ouvrent QUE si
+        // la rame est à l'arrêt ET alignée sur la gare la plus proche (gares tous les
+        // 2 km ; la fenêtre de ±30 m correspond à un quai de 150 m moins la rame).
+        // Sinon elles restent closes, même si les portes de la rame bougent.
+        {
+            constexpr double kStationSpacing = 2000.0;
+            const double nearest =
+                std::round(wagon.chainage() / kStationSpacing) * kStationSpacing;
+            const bool aligned = std::abs(wagon.chainage() - nearest) <= 30.0;
+            const bool stopped =
+                std::abs(wagon.speed()) <= 0.01 || consist.immobilized();
+            const bool psd_open = doors_opening && stopped && aligned;
+            const float psd_dir = psd_open ? 1.0f : -1.0f;
+            psd_t = glm::clamp(psd_t + static_cast<float>(dt) * door_speed * psd_dir,
+                               0.0f, 1.0f);
+        }
+
         if (++telemetry_ticks % 120 == 0) {
             std::uint32_t total = 0, visible = 0;
             for (int v = 0; v < kBuildingVariants; ++v) {
@@ -1340,7 +1360,9 @@ struct Application::Impl {
         const auto sampler = [this](double wx, double wz) {
             return terrain.height(wx, wz);
         };
-        auto ground = scene::generate_ground_sheet(sampler, grid_center, 800.0);
+        // M49 : portée très large (2,5 km) — UNE nappe unifiée qui couvre toute la
+        // ville visible, fini le patchwork gris/vert aux frontières.
+        auto ground = scene::generate_ground_sheet(sampler, grid_center, 2500.0);
 
         if (road_mesh != 0) {
             renderer.destroy_mesh(road_mesh);
@@ -1573,6 +1595,7 @@ struct Application::Impl {
     void update_viaduct() {
         if (viaduct_uploading != 0 && renderer.is_mesh_ready(viaduct_uploading) &&
             (psd_uploading == 0 || renderer.is_mesh_ready(psd_uploading)) &&
+            (psd_door_uploading == 0 || renderer.is_mesh_ready(psd_door_uploading)) &&
             (station_sign_uploading == 0 || renderer.is_mesh_ready(station_sign_uploading))) {
             if (viaduct_mesh != 0) {
                 renderer.destroy_mesh(viaduct_mesh);
@@ -1586,6 +1609,11 @@ struct Application::Impl {
             }
             psd_mesh = psd_uploading;
             psd_uploading = 0;
+            if (psd_door_mesh != 0) {
+                renderer.destroy_mesh(psd_door_mesh);
+            }
+            psd_door_mesh = psd_door_uploading;
+            psd_door_uploading = 0;
             if (station_sign_mesh != 0) {
                 renderer.destroy_mesh(station_sign_mesh);
             }
@@ -1610,7 +1638,7 @@ struct Application::Impl {
         // viaduc (même matériau, même fenêtre, grille absolue) ; le verre et la
         // signalétique ont leurs maillages/matériaux dédiés, téléversés ensemble.
         constexpr double kStationSpacing = 2000.0;
-        scene::RailMeshData psd_all, signs_all;
+        scene::RailMeshData psd_all, psd_door_all, signs_all;
         const long g0 = static_cast<long>(std::ceil((center - kViaductRange) / kStationSpacing));
         const long g1 = static_cast<long>(std::floor((center + kViaductRange) / kStationSpacing));
         for (long g = g0; g <= g1; ++g) {
@@ -1627,12 +1655,17 @@ struct Application::Impl {
             };
             append(deck, st.concrete);
             append(psd_all, st.glass);
+            append(psd_door_all, st.psd_doors);
             append(signs_all, st.signs);
         }
 
         const render::MeshId fresh = renderer.create_mesh_indexed(deck.vertices, deck.indices);
         const render::MeshId fresh_psd =
             psd_all.empty() ? 0 : renderer.create_mesh_indexed(psd_all.vertices, psd_all.indices);
+        const render::MeshId fresh_psd_door =
+            psd_door_all.empty()
+                ? 0
+                : renderer.create_mesh_indexed(psd_door_all.vertices, psd_door_all.indices);
         const render::MeshId fresh_signs = signs_all.empty()
                                                ? 0
                                                : renderer.create_mesh_indexed(signs_all.vertices,
@@ -1642,6 +1675,7 @@ struct Application::Impl {
             viaduct_uploading_origin = origin;
             viaduct_snap = snap;
             psd_uploading = fresh_psd;
+            psd_door_uploading = fresh_psd_door;
             station_sign_uploading = fresh_signs;
         }
     }
@@ -2287,6 +2321,22 @@ struct Application::Impl {
         if (psd_mesh != 0 && psd_material != 0) {
             items.push_back(render::DrawItem{camera.relative_model(viaduct_origin),
                                              psd_mesh, psd_material});
+        }
+        // Panneaux vitrés MOBILES (M49) : coulissent le long du quai, synchronisés
+        // sur les portes de la rame (psd_t). La translation suit la tangente de la
+        // voie à la gare la plus proche.
+        if (psd_door_mesh != 0 && psd_material != 0) {
+            glm::mat4 m = camera.relative_model(viaduct_origin);
+            if (psd_t > 0.0f) {
+                constexpr double kStationSpacing = 2000.0;
+                const double nearest =
+                    std::round(wagon.chainage() / kStationSpacing) * kStationSpacing;
+                glm::dvec3 pos, tangent;
+                track.sample(nearest, pos, tangent);
+                const glm::vec3 slide = glm::vec3(glm::normalize(tangent)) * (1.2f * psd_t);
+                m = m * glm::translate(glm::mat4(1.0f), slide);
+            }
+            items.push_back(render::DrawItem{m, psd_door_mesh, psd_material});
         }
 
         render::Hud hud = build_hud();

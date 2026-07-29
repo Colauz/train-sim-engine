@@ -272,20 +272,31 @@ StationMeshes generate_station(const TrackSource& track, double s_center,
         }
     }
 
-    // M48 — Façades de quai (platform screen doors, style Tokyo) : bande VITRÉE
-    // continue le long du bord de chaque quai (elle s'aligne avec la rame quelle que
-    // soit sa position d'arrêt), cadres opaques réguliers tous les 2,5 m.
+    // M48/M49 — Façades de quai (platform screen doors, style Tokyo) : panneaux
+    // vitrés ALTERNÉS sur la trame de 2,5 m — un fixe, un mobile. Le panneau mobile
+    // est décalé de 4 cm vers le quai : en coulissant (translation du DrawItem, côté
+    // app) il passe devant le fixe sans jamais le toucher (zéro Z-fighting).
     const float psd = profile.platform_inner + profile.psd_offset;
-    for (const float sign : {-1.0f, 1.0f}) {
-        const float a = sign * psd;
-        const float b = sign * (psd + 0.06f);  // vitrage de 6 cm
-        const std::vector<P2> glass_band = {
-            {a, top}, {b, top}, {b, top + profile.psd_height}, {a, top + profile.psd_height},
-        };
-        extrude(meshes.glass, frames, glass_band, uv_period);
-    }
     const long f0 = static_cast<long>(std::ceil(s0 / 2.5));
     const long f1 = static_cast<long>(std::floor(s1 / 2.5));
+    for (long k = f0; k < f1; ++k) {
+        const double s = (static_cast<double>(k) + 0.5) * 2.5;
+        glm::dvec3 pos_world;
+        glm::dvec3 tangent;
+        track.sample(s, pos_world, tangent);
+        const glm::vec3 forward = glm::vec3(glm::normalize(tangent));
+        const glm::vec3 right = glm::normalize(glm::cross(forward, world_up));
+        const bool is_door = (k % 2 != 0);
+        for (const float sign : {-1.0f, 1.0f}) {
+            const float lateral = sign * (psd + 0.03f) + (is_door ? sign * 0.04f : 0.0f);
+            const glm::vec3 mid = glm::vec3(pos_world - origin) + right * lateral +
+                                  glm::vec3(0.0f, top + profile.psd_height * 0.5f, 0.0f);
+            add_box(is_door ? meshes.psd_doors : meshes.glass, mid, right, forward,
+                    glm::vec3(0.0f, 1.0f, 0.0f),
+                    glm::vec3(0.03f, profile.psd_height * 0.5f, 1.2f), uv_period);
+        }
+    }
+    // Cadres opaques aux jointures de la trame.
     for (long k = f0; k <= f1; ++k) {
         const double s = static_cast<double>(k) * 2.5;
         glm::dvec3 pos_world;
@@ -319,6 +330,31 @@ StationMeshes generate_station(const TrackSource& track, double s_center,
             add_box(meshes.signs, mid, right, forward, glm::vec3(0.0f, 1.0f, 0.0f),
                     glm::vec3(0.60f, 0.25f, 0.06f), uv_period);
         }
+    }
+
+    // M49 — Repère d'arrêt (stop marker) : losange blanc lumineux face au train
+    // entrant, planté à l'extrémité AVAIL du quai (sens +chainage) au droit du quai
+    // de droite. La cabine s'aligne sur lui : toutes les portes sont alors sur le
+    // quai. C'est un carré de 80 cm tourné de 45° (d'où le losange), matériau
+    // émissif comme la signalétique.
+    {
+        const double s_mark = s1 - 3.0;  // 3 m de retrait depuis l'extrémité du quai
+        glm::dvec3 pos_world;
+        glm::dvec3 tangent;
+        track.sample(s_mark, pos_world, tangent);
+        const glm::vec3 forward = glm::vec3(glm::normalize(tangent));
+        const glm::vec3 right = glm::normalize(glm::cross(forward, world_up));
+        const float k = 0.70710678f;  // cos/sin 45°
+        const glm::vec3 diag_r = (right + glm::vec3(0.0f, 1.0f, 0.0f)) * k;
+        const glm::vec3 diag_u = (glm::vec3(0.0f, 1.0f, 0.0f) - right) * k;
+        const glm::vec3 mid = glm::vec3(pos_world - origin) +
+                              right * ((in + out_w) * 0.5f) +
+                              glm::vec3(0.0f, top + 1.2f, 0.0f);
+        // Le mât du repère part dans le béton, le losange dans la signalétique.
+        add_box(out, mid - glm::vec3(0.0f, 0.6f, 0.0f), right, forward,
+                glm::vec3(0.0f, 1.0f, 0.0f), glm::vec3(0.04f, 0.6f, 0.04f), uv_period);
+        add_box(meshes.signs, mid, diag_r, forward, diag_u,
+                glm::vec3(0.40f, 0.40f, 0.02f), uv_period);
     }
     return meshes;
 }
