@@ -1,6 +1,6 @@
 add_library(noire_scene
-    src/avenue.cpp
     src/catenary.cpp
+    src/ground_sheet.cpp
     src/track_mesh.cpp
     src/viaduct.cpp
     src/world_streamer.cpp

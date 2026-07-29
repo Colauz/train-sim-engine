@@ -28,7 +28,7 @@
 #include "noire/resource/asset_paths.hpp"
 #include "noire/resource/resource_manager.hpp"
 #include "noire/scene/catenary.hpp"
-#include "noire/scene/avenue.hpp"
+#include "noire/scene/ground_sheet.hpp"
 #include "noire/scene/track_mesh.hpp"
 #include "noire/scene/viaduct.hpp"
 #include "noire/scene/terrain_clipmap.hpp"
@@ -464,18 +464,18 @@ struct Application::Impl {
     // Terrain : secours = le sol procédural, remplacé par le splatting dès qu'il est prêt.
     render::MaterialId terrain_material = 0;
 
-    // --- Avenue Centrale, trottoirs & lampadaires (M47) -----------------------
-    resource::ModelHandle streetlamp_model;
-    render::MeshId road_mesh = 0;
+    // --- Sol urbain (M48) : une nappe de béton, c'est tout ---------------------
+    render::MeshId road_mesh = 0;       // nappe de sol (nom historique)
     render::MaterialId road_material = 0;
-    render::MeshId sidewalk_mesh = 0;
-    render::MaterialId sidewalk_material = 0;
-    render::InstanceBufferId streetlamp_instances = 0;
-    std::uint32_t streetlamp_count = 0;
     WorldPosition city_grid_origin{};
-    WorldPosition streetlamp_origin{};
-    std::vector<scene::LampPost> avenue_lamps;      // semés avec l'avenue
-    std::vector<scene::CrossStreet> cross_streets;  // exclusion des immeubles
+
+    // --- Gares (M48) : façades de quai vitrées + signalétique émissive ---------
+    render::MeshId psd_mesh = 0;
+    render::MeshId psd_uploading = 0;
+    render::MaterialId psd_material = 0;      // verre BLEND
+    render::MeshId station_sign_mesh = 0;
+    render::MeshId station_sign_uploading = 0;
+    render::MaterialId station_sign_material = 0;  // émissif
 
     // Cubes de debug M4, dessinés uniquement en fallback / pendant le chargement.
     render::MeshId bogie_mesh = 0;
@@ -747,21 +747,29 @@ struct Application::Impl {
         // et bogie, générés par le même script.
         voiture_model = resources.load_model("models/metro_voiture.glb");
         jacobs_bogie_model = resources.load_model("models/metro_bogie.glb");
-        // Lampadaire urbain (M37) : modèle 3D émissif sodium
-        streetlamp_model = resources.load_model("models/streetlamp.glb");
 
-        // Grille Urbaine (M47) : asphalte gris foncé et trottoirs en béton clair.
+        // Sol urbain (M48) : nappe de béton gris foncé.
         render::MaterialDesc road_desc;
         road_desc.base_color_factor = glm::vec4(0.14f, 0.15f, 0.17f, 1.0f);
         road_desc.metallic_factor = 0.05f;
         road_desc.roughness_factor = 0.85f;
         road_material = renderer.create_material(road_desc);
 
-        render::MaterialDesc sw_desc;
-        sw_desc.base_color_factor = glm::vec4(0.65f, 0.67f, 0.70f, 1.0f);
-        sw_desc.metallic_factor = 0.0f;
-        sw_desc.roughness_factor = 0.70f;
-        sidewalk_material = renderer.create_material(sw_desc);
+        // Gares (M48) : verre des façades de quai (BLEND, après les opaques) et
+        // signalétique suspendue émissive (panneau blanc chaud HDR).
+        render::MaterialDesc psd_desc;
+        psd_desc.base_color_factor = glm::vec4(0.55f, 0.70f, 0.80f, 0.30f);
+        psd_desc.metallic_factor = 0.0f;
+        psd_desc.roughness_factor = 0.10f;
+        psd_desc.transparent = true;
+        psd_material = renderer.create_material(psd_desc);
+
+        render::MaterialDesc sign_desc;
+        sign_desc.base_color_factor = glm::vec4(0.06f, 0.07f, 0.08f, 1.0f);
+        sign_desc.emissive_factor = glm::vec3(2.5f, 2.2f, 1.6f);  // blanc chaud HDR
+        sign_desc.metallic_factor = 0.0f;
+        sign_desc.roughness_factor = 0.6f;
+        station_sign_material = renderer.create_material(sign_desc);
 
         // Bâtiments Neo-Tokyo (M31) : trois gabarits, semés par reseed_buildings().
         const char* building_files[kBuildingVariants] = {
@@ -1321,81 +1329,32 @@ struct Application::Impl {
         return hud;
     }
 
-    // M47 — Urbanisme structuré autour du viaduc : une Grande Avenue de 20 m suit
-    // EXACTEMENT la voie (les piliers sont plantés dans son bitume), des rues
-    // perpendiculaires régulières forment les carrefours, et des trottoirs en béton
-    // clair surélevés de 15 cm longent toutes les chaussées.
+    // M48 — Sol urbain : UNE nappe de béton gris foncé qui épouse le terrain.
+    // Décision de game design : plus de routes, trottoirs, lampadaires ni
+    // intersections — le focus est sur le train, les gares et les immeubles.
     void reseed_city_grid() {
         const WorldPosition wp = wagon.body_position();
         WorldPosition grid_center = wp;
         grid_center.y = 0.0;  // Origine Y monde = 0.0 pour aligner avec terrain.height()
 
-        constexpr double kRoadRange = 600.0;
         const auto sampler = [this](double wx, double wz) {
             return terrain.height(wx, wz);
         };
-        const double c = wagon.chainage();
-        scene::AvenueData avenue =
-            scene::generate_avenue(track, sampler, c - kRoadRange, c + kRoadRange,
-                                   grid_center);
+        auto ground = scene::generate_ground_sheet(sampler, grid_center, 800.0);
 
         if (road_mesh != 0) {
             renderer.destroy_mesh(road_mesh);
             road_mesh = 0;
         }
-        if (sidewalk_mesh != 0) {
-            renderer.destroy_mesh(sidewalk_mesh);
-            sidewalk_mesh = 0;
+        if (!ground.empty()) {
+            road_mesh = renderer.create_mesh_indexed(ground.vertices, ground.indices);
         }
-
-        if (avenue.roadway.valid()) {
-            road_mesh =
-                renderer.create_mesh_indexed(avenue.roadway.vertices, avenue.roadway.indices);
-        }
-        if (avenue.sidewalks.valid()) {
-            sidewalk_mesh = renderer.create_mesh_indexed(avenue.sidewalks.vertices,
-                                                         avenue.sidewalks.indices);
-        }
-        avenue_lamps = std::move(avenue.lamps);
-        cross_streets = std::move(avenue.cross);
         city_grid_origin = grid_center;
     }
 
-    // --- Lampadaires (M47) : positions régulières semées avec l'avenue -----------
-    void reseed_streetlamps() {
-        const WorldPosition wp = wagon.body_position();
-        WorldPosition lamp_center = wp;
-        lamp_center.y = 0.0;
-
-        std::vector<render::InstanceData> seeded;
-        seeded.reserve(avenue_lamps.size());
-        for (const auto& lp : avenue_lamps) {
-            render::InstanceData inst;
-            inst.position_scale = glm::vec4(
-                glm::vec3(glm::dvec3(lp.wx, lp.wy, lp.wz) - lamp_center), 1.0f);
-            inst.rotation_phase = glm::vec4(lp.yaw, 0.0f, 0.0f, 0.0f);
-            seeded.push_back(inst);
-        }
-
-        if (streetlamp_instances != 0) {
-            renderer.destroy_instances(streetlamp_instances);
-            streetlamp_instances = 0;
-        }
-        if (!seeded.empty()) {
-            streetlamp_instances = renderer.create_instances(seeded);
-            streetlamp_count = static_cast<std::uint32_t>(seeded.size());
-        } else {
-            streetlamp_count = 0;
-        }
-        streetlamp_origin = lamp_center;
-    }
-
-    // --- Bâtiments (M47) : hyper-densité autour de l'avenue --------------------
+    // --- Bâtiments (M47/M48) : hyper-densité sur la nappe de béton --------------
     void reseed_buildings() {
-        // L'avenue d'abord : les rues perpendiculaires (cross_streets) et les
-        // lampadaires doivent être connus AVANT le semis des immeubles.
-        reseed_city_grid();
-        reseed_streetlamps();
+        reseed_city_grid();  // la nappe de sol suit le train
 
         const WorldPosition wp = wagon.body_position();
         std::array<std::vector<render::InstanceData>, kBuildingVariants> seeded;
@@ -1411,33 +1370,14 @@ struct Application::Impl {
                 const std::uint32_t h3 = hash_u32(h2 ^ 0x85ebca6bu);
                 const std::uint32_t h4 = hash_u32(h3 ^ 0xc2b2ae35u);
 
-                // M47 : chaque cellule de 30 m est candidate au bâti ; les exclusions
-                // (rues perpendiculaires, corridor de la voie) sont testées plus bas.
+                // M48 : chaque cellule de 30 m est candidate au bâti ; seul le
+                // corridor de sécurité de la voie est exclu (testé plus bas).
                 const double wx = (static_cast<double>(ci) + 0.5) * kBuildingCell;
                 const double wz = (static_cast<double>(cj) + 0.5) * kBuildingCell;
 
                 if (std::hypot(wx - wp.x, wz - wp.z) > kBuildingRange) {
                     continue;
                 }
-
-                // M47 — La ville s'organise autour de l'avenue : plus de grille de
-                // rôles, chaque cellule est bâtissable SAUF si elle empiète sur une
-                // rue perpendiculaire (chaussée + trottoirs + marge) ou sur le
-                // corridor de la voie (testé plus bas, par bâtiment).
-                auto on_cross_street = [](const std::vector<scene::CrossStreet>& streets,
-                                          double px, double pz, double margin) {
-                    for (const auto& cs : streets) {
-                        const double dx = px - cs.point.x, dz = pz - cs.point.z;
-                        const double rx = cs.right.x, rz = cs.right.z;
-                        const double t = dx * rx + dz * rz;    // le long de la rue
-                        const double u = dx * (-rz) + dz * rx; // en travers
-                        if (std::abs(t) < cs.half_length + margin &&
-                            std::abs(u) < cs.half_width + margin) {
-                            return true;
-                        }
-                    }
-                    return false;
-                };
 
                 // M47 — HYPER-DENSITÉ Tokyo : une cellule sur deux est subdivisée en
                 // 4 sous-parcelles de tours hautes et étroites quasi jointives (pas
@@ -1481,15 +1421,10 @@ struct Application::Impl {
                         20.0f + 130.0f * (static_cast<float>(sh & 0xffu) / 255.0f);
                     const float scale = std::min(desired_h / kModelHeights[variant],
                                                  sub.max_foot / kModelFootprints[variant]);
-                    const float half_foot = 0.5f * kModelFootprints[variant] * scale;
-
-                    if (on_cross_street(cross_streets, px, pz, half_foot)) {
-                        continue;
-                    }
 
                     // M45 — CORRIDOR DE SÉCURITÉ ABSOLU : distance euclidienne réelle
                     // à l'axe de la voie, empreinte comprise. Aucun mur ne traverse
-                    // ni le viaduc ni l'avenue qui le longe.
+                    // le viaduc.
                     const double clearance =
                         kBuildingCorridor + static_cast<double>(kHalfDiag[variant]) * scale;
                     if (terrain.distance_to_track(px, pz) < clearance ||
@@ -1636,7 +1571,9 @@ struct Application::Impl {
     // caténaire (create_mesh_indexed est asynchrone : on ne substitue qu'un maillage
     // prêt), mêmes grilles ABSOLUES (piles au chainage fixe : rien ne saute).
     void update_viaduct() {
-        if (viaduct_uploading != 0 && renderer.is_mesh_ready(viaduct_uploading)) {
+        if (viaduct_uploading != 0 && renderer.is_mesh_ready(viaduct_uploading) &&
+            (psd_uploading == 0 || renderer.is_mesh_ready(psd_uploading)) &&
+            (station_sign_uploading == 0 || renderer.is_mesh_ready(station_sign_uploading))) {
             if (viaduct_mesh != 0) {
                 renderer.destroy_mesh(viaduct_mesh);
             }
@@ -1644,6 +1581,16 @@ struct Application::Impl {
             viaduct_origin = viaduct_uploading_origin;
             viaduct_uploading = 0;
             viaduct_valid = true;
+            if (psd_mesh != 0) {
+                renderer.destroy_mesh(psd_mesh);
+            }
+            psd_mesh = psd_uploading;
+            psd_uploading = 0;
+            if (station_sign_mesh != 0) {
+                renderer.destroy_mesh(station_sign_mesh);
+            }
+            station_sign_mesh = station_sign_uploading;
+            station_sign_uploading = 0;
         }
         const long snap = std::lround(wagon.chainage() / kViaductStep);
         if (viaduct_uploading != 0 || (viaduct_valid && snap == viaduct_snap)) {
@@ -1658,29 +1605,44 @@ struct Application::Impl {
             track, terrain, center - kViaductRange, center + kViaductRange, origin,
             viaduct_profile);
 
-        // Gares aériennes (M47) : tous les 2 km, quais + verrière de 150 m. Leur
-        // maillage est FUSIONNÉ avec celui du viaduc (même matériau béton, même
-        // fenêtre de génération, grille absolue => rien ne saute).
+        // Gares aériennes (M47/M48) : tous les 2 km, quais + verrière de 150 m +
+        // façades de quai vitrées + signalétique. Le béton est FUSIONNÉ avec le
+        // viaduc (même matériau, même fenêtre, grille absolue) ; le verre et la
+        // signalétique ont leurs maillages/matériaux dédiés, téléversés ensemble.
         constexpr double kStationSpacing = 2000.0;
+        scene::RailMeshData psd_all, signs_all;
         const long g0 = static_cast<long>(std::ceil((center - kViaductRange) / kStationSpacing));
         const long g1 = static_cast<long>(std::floor((center + kViaductRange) / kStationSpacing));
         for (long g = g0; g <= g1; ++g) {
-            scene::RailMeshData station = scene::generate_station(
+            scene::StationMeshes st = scene::generate_station(
                 track, static_cast<double>(g) * kStationSpacing, origin);
-            const auto base = static_cast<std::uint32_t>(deck.vertices.size());
-            deck.vertices.insert(deck.vertices.end(), station.vertices.begin(),
-                                 station.vertices.end());
-            deck.indices.reserve(deck.indices.size() + station.indices.size());
-            for (const std::uint32_t idx : station.indices) {
-                deck.indices.push_back(base + idx);
-            }
+            const auto append = [](scene::RailMeshData& dst, scene::RailMeshData& src) {
+                const auto base = static_cast<std::uint32_t>(dst.vertices.size());
+                dst.vertices.insert(dst.vertices.end(), src.vertices.begin(),
+                                    src.vertices.end());
+                dst.indices.reserve(dst.indices.size() + src.indices.size());
+                for (const std::uint32_t idx : src.indices) {
+                    dst.indices.push_back(base + idx);
+                }
+            };
+            append(deck, st.concrete);
+            append(psd_all, st.glass);
+            append(signs_all, st.signs);
         }
 
         const render::MeshId fresh = renderer.create_mesh_indexed(deck.vertices, deck.indices);
+        const render::MeshId fresh_psd =
+            psd_all.empty() ? 0 : renderer.create_mesh_indexed(psd_all.vertices, psd_all.indices);
+        const render::MeshId fresh_signs = signs_all.empty()
+                                               ? 0
+                                               : renderer.create_mesh_indexed(signs_all.vertices,
+                                                                              signs_all.indices);
         if (fresh != 0) {
             viaduct_uploading = fresh;
             viaduct_uploading_origin = origin;
             viaduct_snap = snap;
+            psd_uploading = fresh_psd;
+            station_sign_uploading = fresh_signs;
         }
     }
 
@@ -2093,29 +2055,16 @@ struct Application::Impl {
                                              viaduct_mesh, viaduct_material});
         }
 
-        // Grille Urbaine (Avenue & Trottoirs M47)
+        // Sol urbain (M48) : nappe de béton.
         if (road_mesh != 0 && road_material != 0) {
             items.push_back(render::DrawItem{camera.relative_model(city_grid_origin),
                                              road_mesh, road_material});
         }
-        if (sidewalk_mesh != 0 && sidewalk_material != 0) {
-            items.push_back(render::DrawItem{camera.relative_model(city_grid_origin),
-                                             sidewalk_mesh, sidewalk_material});
-        }
 
-        // Lampadaires Urbains (M37)
-        if (streetlamp_model && streetlamp_model->ready && streetlamp_instances != 0 && streetlamp_count > 0) {
-            const glm::mat4 lamp_m = camera.relative_model(streetlamp_origin);
-            for (const auto& prim : streetlamp_model->primitives) {
-                const render::MaterialId mat = prim.material ? prim.material->id : 0;
-                render::DrawItem item;
-                item.model = lamp_m;
-                item.mesh = prim.mesh;
-                item.material = mat;
-                item.instances = streetlamp_instances;
-                item.instance_count = streetlamp_count;
-                items.push_back(item);
-            }
+        // Signalétique des gares (M48) : panneaux suspendus émissifs, opaques.
+        if (station_sign_mesh != 0 && station_sign_material != 0) {
+            items.push_back(render::DrawItem{camera.relative_model(viaduct_origin),
+                                             station_sign_mesh, station_sign_material});
         }
 
         // Poteaux caténaire (M12) : OPAQUES, donc avec le reste. Un seul draw call pour
@@ -2331,6 +2280,13 @@ struct Application::Impl {
         if (catenary_mesh != 0) {
             items.push_back(render::DrawItem{camera.relative_model(catenary_origin),
                                              catenary_mesh, wire_material});
+        }
+
+        // Façades de quai vitrées (M48) : TRANSPARENTES, donc elles aussi après les
+        // opaques — même discipline que les câbles.
+        if (psd_mesh != 0 && psd_material != 0) {
+            items.push_back(render::DrawItem{camera.relative_model(viaduct_origin),
+                                             psd_mesh, psd_material});
         }
 
         render::Hud hud = build_hud();

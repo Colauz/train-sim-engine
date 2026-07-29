@@ -20,9 +20,7 @@ Terrain::height moins quelques mètres d'enfoncement. Aucune dépendance externe
 (struct/json/zlib/math/random de la stdlib)."""
 import struct, json, zlib, math, sys, random
 
-TEX = 256             # côté des textures (px)
 CELL_M = 3.0          # une cellule de fenêtre = 3 m (colonne) x 3 m (étage)
-COLS, FLOORS = 4, 8   # la texture tuile 4 colonnes x 8 étages (répétée)
 
 VARIANTS = {
     "tower": (22.0, 95.0, 22.0),
@@ -30,8 +28,29 @@ VARIANTS = {
     "slab":  (42.0, 26.0, 22.0),
 }
 
-# Samplers : REPEAT (10497) — la grille de fenêtres se répète sur toute la façade.
+# La texture couvre UNE FAÇADE ENTIÈRE : grille complète de cellules ~3 m x 3 m, chaque
+# cellule tirée indépendamment — plus aucun motif répété à l'intérieur d'une façade.
+# UVs en 0..1 (les façades étroites ne parcourent qu'une fraction de la largeur, les
+# fenêtres restent carrées en mètres). REPEAT est conservé pour que l'offset UV par
+# instance du moteur varie le tirage d'un immeuble à l'autre.
 SAMPLER = {"magFilter": 9729, "minFilter": 9729, "wrapS": 10497, "wrapT": 10497}
+
+
+def grid_of(sx, sy, sz):
+    """(cols_x, cols_z, floors) : nombre de cellules de CELL_M m par façade."""
+    return (max(1, round(sx / CELL_M)),
+            max(1, round(sz / CELL_M)),
+            max(1, round(sy / CELL_M)))
+
+
+def tex_size(cols_max, floors):
+    """Dimensions de texture (puissances de deux, ~8-16 px par cellule)."""
+    def pot(n):
+        p = 8
+        while p < n:
+            p *= 2
+        return p
+    return pot(cols_max * 8), pot(floors * 8)
 
 
 def png_encode(w, h, rgba):
@@ -48,21 +67,21 @@ def png_encode(w, h, rgba):
     return sig + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(bytes(raw), 9)) + chunk(b"IEND", b"")
 
 
-def make_facades(seed):
-    """Deux textures TEX x TEX : (base color, émissive). La tuile fait COLS x FLOORS
-    cellules ; chaque cellule est une fenêtre entourée de béton. Semis figé : le modèle
-    doit être reproductible à l'identique."""
+def make_facades(seed, cols_max, floors, tex_w, tex_h):
+    """Deux textures tex_w x tex_h : (base color, émissive). La grille fait cols_max x
+    floors cellules couvrant la façade entière ; chaque cellule est une fenêtre entourée
+    de béton, tirée indépendamment. Semis figé : reproductible à l'identique."""
     rnd = random.Random(seed)
-    base = bytearray(TEX * TEX * 4)
-    emis = bytearray(TEX * TEX * 4)
-    cw, ch = TEX // COLS, TEX // FLOORS  # taille d'une cellule en px
+    base = bytearray(tex_w * tex_h * 4)
+    emis = bytearray(tex_w * tex_h * 4)
+    cw, ch = tex_w // cols_max, tex_h // floors  # taille d'une cellule en px
 
     # Quelles cellules sont allumées, et de quelle couleur. Décision PAR CELLULE :
-    # ~45 % de fenêtres allumées, majoritairement blanc chaud/froid, 8 % de néons.
+    # ~40 % de fenêtres allumées, majoritairement blanc chaud/froid, 8 % de néons.
     lit = {}
-    for c in range(COLS):
-        for f in range(FLOORS):
-            if rnd.random() < 0.45:
+    for c in range(cols_max):
+        for f in range(floors):
+            if rnd.random() < 0.40:
                 r = rnd.random()
                 if r < 0.04:
                     color = (40, 255, 240)    # néon cyan
@@ -75,9 +94,9 @@ def make_facades(seed):
                 lit[(c, f)] = color
 
     # Béton de façade : gris-bleu sombre, légèrement nuancé par bandes d'étage.
-    for y in range(TEX):
-        for x in range(TEX):
-            o = (y * TEX + x) * 4
+    for y in range(tex_h):
+        for x in range(tex_w):
+            o = (y * tex_w + x) * 4
             shade = 0.9 + 0.2 * ((y // ch) % 2)
             base[o] = min(255, int(34 * shade))
             base[o + 1] = min(255, int(37 * shade))
@@ -86,14 +105,14 @@ def make_facades(seed):
 
     # Les fenêtres : rectangle centré dans la cellule (marges = l'embrasure béton).
     mx, my = int(cw * 0.18), int(ch * 0.22)
-    for c in range(COLS):
-        for f in range(FLOORS):
+    for c in range(cols_max):
+        for f in range(floors):
             x0, x1 = c * cw + mx, (c + 1) * cw - mx
             y0, y1 = f * ch + my, (f + 1) * ch - my
             glow = lit.get((c, f))
             for y in range(y0, y1):
                 for x in range(x0, x1):
-                    o = (y * TEX + x) * 4
+                    o = (y * tex_w + x) * 4
                     # Fenêtre éteinte : vitre sombre à peine plus claire que le béton.
                     base[o], base[o + 1], base[o + 2] = 22, 26, 34
                     if glow:
@@ -104,7 +123,7 @@ def make_facades(seed):
                         base[o + 2] = min(255, glow[2] // 3)
                         emis[o], emis[o + 1], emis[o + 2] = glow
                         emis[o + 3] = 255
-    return png_encode(TEX, TEX, bytes(base)), png_encode(TEX, TEX, bytes(emis))
+    return png_encode(tex_w, tex_h, bytes(base)), png_encode(tex_w, tex_h, bytes(emis))
 
 
 class Part:
@@ -112,21 +131,26 @@ class Part:
         self.positions, self.normals, self.uvs, self.tangents, self.indices = [], [], [], [], []
 
 
-def build_tower(part, sx, sy, sz):
-    """Parallélépipède posé sur y=0, centré en x/z. UV en MÈTRES / CELL_M sur les façades
-    (la grille de fenêtres garde son échelle quelle que soit la variante) ; toit et
-    semelle rabattus sur le texel béton (0,0) — fenêtres sur un toit, jamais."""
+def build_tower(part, sx, sy, sz, cols_max, floors):
+    """Parallélépipède posé sur y=0, centré en x/z. UV en 0..1 sur les façades : la
+    texture couvre une façade ENTIÈRE (cols_max x floors cellules) ; une façade plus
+    étroite que cols_max cellules n'en parcourt qu'une fraction, les fenêtres gardant
+    leur échelle de CELL_M m. Toit et semelle rabattus sur le texel béton (0,0) —
+    fenêtres sur un toit, jamais."""
     hx, hz = sx / 2.0, sz / 2.0
+    cols_x, cols_z, _ = grid_of(sx, sy, sz)
+    span_u = cols_max * CELL_M   # largeur en mètres de la grille complète
+    span_v = floors * CELL_M     # hauteur en mètres de la grille complète
     # (normale, coins (x,y,z) des 4 sommets CCW vus de l'extérieur, axes u/v pour les UV)
     faces = [
         ((0, 0, 1),  [(-hx, 0, hz), (hx, 0, hz), (hx, sy, hz), (-hx, sy, hz)],
-         lambda p: ((p[0] + hx) / CELL_M, p[1] / CELL_M)),
+         lambda p: ((p[0] + hx) / span_u * (cols_x * CELL_M / sx), p[1] / span_v)),
         ((0, 0, -1), [(hx, 0, -hz), (-hx, 0, -hz), (-hx, sy, -hz), (hx, sy, -hz)],
-         lambda p: ((p[0] + hx) / CELL_M, p[1] / CELL_M)),
+         lambda p: ((p[0] + hx) / span_u * (cols_x * CELL_M / sx), p[1] / span_v)),
         ((1, 0, 0),  [(hx, 0, hz), (hx, 0, -hz), (hx, sy, -hz), (hx, sy, hz)],
-         lambda p: ((p[2] + hz) / CELL_M, p[1] / CELL_M)),
+         lambda p: ((p[2] + hz) / span_u * (cols_z * CELL_M / sz), p[1] / span_v)),
         ((-1, 0, 0), [(-hx, 0, -hz), (-hx, 0, hz), (-hx, sy, hz), (-hx, sy, -hz)],
-         lambda p: ((p[2] + hz) / CELL_M, p[1] / CELL_M)),
+         lambda p: ((p[2] + hz) / span_u * (cols_z * CELL_M / sz), p[1] / span_v)),
         ((0, 1, 0),  [(-hx, sy, hz), (hx, sy, hz), (hx, sy, -hz), (-hx, sy, -hz)],
          lambda p: (0.0, 0.0)),
         ((0, -1, 0), [(-hx, 0, -hz), (hx, 0, -hz), (hx, 0, hz), (-hx, 0, hz)],
@@ -147,7 +171,7 @@ def align4(n):
     return (n + 3) & ~3
 
 
-def write_glb(path, part, images, variant):
+def write_glb(path, part, images, variant, tex_w, tex_h):
     geom = (b"".join(struct.pack("<fff", *v) for v in part.positions),
             b"".join(struct.pack("<fff", *v) for v in part.normals),
             b"".join(struct.pack("<ff", *v) for v in part.uvs),
@@ -219,20 +243,34 @@ def write_glb(path, part, images, variant):
         f.write(bin_pad)
     sx, sy, sz = VARIANTS[variant]
     print(f"{path} : {variant} {sx:.0f}x{sy:.0f}x{sz:.0f} m — {len(part.positions)} sommets, "
-          f"2 textures {TEX}x{TEX} ({glb_len} o)")
+          f"2 textures {tex_w}x{tex_h} ({glb_len} o)")
 
 
 def build(variant, out):
+    sx, sy, sz = VARIANTS[variant]
+    cols_x, cols_z, floors = grid_of(sx, sy, sz)
+    cols_max = max(cols_x, cols_z)
+    tex_w, tex_h = tex_size(cols_max, floors)
     part = Part()
-    build_tower(part, *VARIANTS[variant])
+    build_tower(part, sx, sy, sz, cols_max, floors)
     # Graine par variante : deux gabarits n'ont pas la même carte de fenêtres allumées.
     seed = {"tower": 20260728, "block": 20260729, "slab": 20260730}[variant]
-    base_png, emis_png = make_facades(seed)
-    write_glb(out, part, (base_png, emis_png), variant)
+    base_png, emis_png = make_facades(seed, cols_max, floors, tex_w, tex_h)
+    write_glb(out, part, (base_png, emis_png), variant, tex_w, tex_h)
 
 
 if __name__ == "__main__":
-    out = sys.argv[1] if len(sys.argv) > 1 else "building.glb"
+    if len(sys.argv) == 1:
+        # Sans argument : régénère les trois variantes utilisées par le moteur.
+        import os
+        models = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "..", "assets", "models")
+        for variant, name in (("tower", "building_a.glb"),
+                              ("block", "building_b.glb"),
+                              ("slab", "building_c.glb")):
+            build(variant, os.path.join(models, name))
+        sys.exit(0)
+    out = sys.argv[1]
     variant = sys.argv[2] if len(sys.argv) > 2 else "tower"
     if variant not in VARIANTS:
         sys.exit(f"variante inconnue : {variant} (attendu : {', '.join(VARIANTS)})")

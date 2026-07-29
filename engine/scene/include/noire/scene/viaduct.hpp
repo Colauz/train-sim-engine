@@ -50,10 +50,23 @@ struct StationProfile {
     float roof_thickness = 0.35f;
     float column_half = 0.18f;  // section des colonnes de verrière
     double column_spacing = 15.0;
+    // M48 — Façades de quai (platform screen doors) : bande vitrée continue le long
+    // du bord de quai + cadres réguliers ; et panneaux d'affichage suspendus.
+    float psd_height = 1.8f;      // hauteur vitrée au-dessus du quai
+    float psd_offset = 0.25f;     // retrait du vitrage depuis le bord de quai
+    double sign_spacing = 25.0;   // entraxe des panneaux suspendus
 };
 
-[[nodiscard]] RailMeshData generate_station(const TrackSource& track, double s_center,
-                                            const WorldPosition& origin,
-                                            const StationProfile& profile = {});
+// Trois maillages, trois matériaux : le béton (fusionné au viaduc), le vitrage des
+// façades de quai (BLEND, dessiné après les opaques) et la signalétique (émissif).
+struct StationMeshes {
+    RailMeshData concrete;
+    RailMeshData glass;
+    RailMeshData signs;
+};
+
+[[nodiscard]] StationMeshes generate_station(const TrackSource& track, double s_center,
+                                             const WorldPosition& origin,
+                                             const StationProfile& profile = {});
 
 }  // namespace noire::scene

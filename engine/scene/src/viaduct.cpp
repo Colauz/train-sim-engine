@@ -198,12 +198,13 @@ RailMeshData generate_viaduct(const TrackSource& track, const Terrain& terrain, 
 }
 
 // ---------------------------------------------------------------------------
-// Gare aérienne (M47) : quais + verrière localisée, ailleurs la ligne est à ciel
-// ouvert. Réutilise les mêmes helpers (frames, extrude, add_box) que le viaduc.
+// Gare aérienne (M47/M48) : quais + verrière localisée + façades de quai vitrées +
+// signalétique suspendue. Ailleurs la ligne est à ciel ouvert.
 // ---------------------------------------------------------------------------
-RailMeshData generate_station(const TrackSource& track, double s_center,
-                              const WorldPosition& origin, const StationProfile& profile) {
-    RailMeshData out;
+StationMeshes generate_station(const TrackSource& track, double s_center,
+                               const WorldPosition& origin, const StationProfile& profile) {
+    StationMeshes meshes;
+    RailMeshData& out = meshes.concrete;
     const double s0 = s_center - profile.length * 0.5;
     const double s1 = s_center + profile.length * 0.5;
     const glm::vec3 world_up(0.0f, 1.0f, 0.0f);
@@ -270,7 +271,56 @@ RailMeshData generate_station(const TrackSource& track, double s_center,
                     uv_period);
         }
     }
-    return out;
+
+    // M48 — Façades de quai (platform screen doors, style Tokyo) : bande VITRÉE
+    // continue le long du bord de chaque quai (elle s'aligne avec la rame quelle que
+    // soit sa position d'arrêt), cadres opaques réguliers tous les 2,5 m.
+    const float psd = profile.platform_inner + profile.psd_offset;
+    for (const float sign : {-1.0f, 1.0f}) {
+        const float a = sign * psd;
+        const float b = sign * (psd + 0.06f);  // vitrage de 6 cm
+        const std::vector<P2> glass_band = {
+            {a, top}, {b, top}, {b, top + profile.psd_height}, {a, top + profile.psd_height},
+        };
+        extrude(meshes.glass, frames, glass_band, uv_period);
+    }
+    const long f0 = static_cast<long>(std::ceil(s0 / 2.5));
+    const long f1 = static_cast<long>(std::floor(s1 / 2.5));
+    for (long k = f0; k <= f1; ++k) {
+        const double s = static_cast<double>(k) * 2.5;
+        glm::dvec3 pos_world;
+        glm::dvec3 tangent;
+        track.sample(s, pos_world, tangent);
+        const glm::vec3 forward = glm::vec3(glm::normalize(tangent));
+        const glm::vec3 right = glm::normalize(glm::cross(forward, world_up));
+        for (const float sign : {-1.0f, 1.0f}) {
+            const glm::vec3 mid = glm::vec3(pos_world - origin) +
+                                  right * (sign * (psd + 0.03f)) +
+                                  glm::vec3(0.0f, top + profile.psd_height * 0.5f, 0.0f);
+            add_box(out, mid, right, forward, glm::vec3(0.0f, 1.0f, 0.0f),
+                    glm::vec3(0.08f, profile.psd_height * 0.5f, 0.08f), uv_period);
+        }
+    }
+
+    // M48 — Panneaux d'affichage suspendus sous la verrière, au-dessus de chaque quai.
+    const long p0 = static_cast<long>(std::ceil(s0 / profile.sign_spacing));
+    const long p1 = static_cast<long>(std::floor(s1 / profile.sign_spacing));
+    for (long k = p0; k <= p1; ++k) {
+        const double s = static_cast<double>(k) * profile.sign_spacing;
+        glm::dvec3 pos_world;
+        glm::dvec3 tangent;
+        track.sample(s, pos_world, tangent);
+        const glm::vec3 forward = glm::vec3(glm::normalize(tangent));
+        const glm::vec3 right = glm::normalize(glm::cross(forward, world_up));
+        for (const float sign : {-1.0f, 1.0f}) {
+            const glm::vec3 mid = glm::vec3(pos_world - origin) +
+                                  right * (sign * ((in + out_w) * 0.5f)) +
+                                  glm::vec3(0.0f, roof - 0.75f, 0.0f);
+            add_box(meshes.signs, mid, right, forward, glm::vec3(0.0f, 1.0f, 0.0f),
+                    glm::vec3(0.60f, 0.25f, 0.06f), uv_period);
+        }
+    }
+    return meshes;
 }
 
 }  // namespace noire::scene

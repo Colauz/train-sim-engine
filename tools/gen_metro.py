@@ -20,6 +20,12 @@ Trois fichiers :
 Intérieur de métro : BANQUETTES LONGITUDINALES le long des murs, grand espace
 vide au centre, vrai sol, vrai plafond.
 
+M48 : 2 boîtiers de climatisation gris clair sur chaque toit, pantographe en
+losange sur la motrice, phares blancs et feux rouges ÉMISSIFS HDR aux DEUX
+extrémités de la motrice (rame réversible). Toute cette géométrie vit dans des
+parts dont le matériau précède MAT_DOOR0 : les 32 battants de porte restent les
+32 DERNIÈRES primitives, et les 2 essieux les 2 dernières du bogie.
+
 Carrosserie : ACIER INOXYDABLE BROSSÉ (métallique) + bande verte Yamanote.
 
 Repère caisse : x = droite, y = haut, z = arrière ; rail à y = -2.20.
@@ -79,27 +85,37 @@ MATERIALS = [
     {"name": "ecran", "factor": [0.05, 0.15, 0.30, 1.0], "metallic": 0.0, "roughness": 0.10},
     # 8: commande — manipulateur / boutons
     {"name": "commande", "factor": [0.75, 0.20, 0.15, 1.0], "metallic": 0.40, "roughness": 0.35},
-    # 9: phare — bloc optique avant, blanc chaud quasi émissif
-    {"name": "phare", "factor": [1.0, 0.95, 0.80, 1.0], "metallic": 0.0, "roughness": 0.20},
+    # 9: phare — bloc optique avant, blanc chaud ÉMISSIF HDR (M48, facteur > 1 :
+    # le loader accepte les valeurs hors spec, cf. asset_types.hpp)
+    {"name": "phare", "factor": [1.0, 0.95, 0.80, 1.0], "metallic": 0.0, "roughness": 0.20,
+     "emissive": [4.0, 3.8, 3.2]},
+    # 10: feu_ar — feu rouge arrière ÉMISSIF HDR (M48)
+    {"name": "feu_ar", "factor": [0.30, 0.02, 0.02, 1.0], "metallic": 0.0, "roughness": 0.30,
+     "emissive": [4.0, 0.10, 0.05]},
+    # 11: clim — boîtiers de climatisation de toit, gris clair mat (M48)
+    {"name": "clim", "factor": [0.70, 0.71, 0.72, 1.0], "metallic": 0.05, "roughness": 0.80},
+    # 12: panto — pantographe, acier sombre métallique (M48)
+    {"name": "panto", "factor": [0.10, 0.10, 0.11, 1.0], "metallic": 0.85, "roughness": 0.40},
 ]
 MAT_ACIER, MAT_GLASS, MAT_BANDE, MAT_JUPE, MAT_INTERIOR = 0, 1, 2, 3, 4
 MAT_BENCH, MAT_PUPITRE, MAT_ECRAN, MAT_COMMANDE, MAT_PHARE = 5, 6, 7, 8, 9
-# 10..25 : portes — 16 slots pour que chaque battant soit une part (= une
+MAT_FEU_AR, MAT_CLIM, MAT_PANTO = 10, 11, 12
+# 13..28 : portes — 16 slots pour que chaque battant soit une part (= une
 # primitive) séparée ; write_glb les DÉDUPLIQUE en un seul matériau glTF.
 for _ in range(16):
     MATERIALS.append({"name": "porte", "factor": [0.72, 0.74, 0.77, 1.0],
                       "metallic": 0.90, "roughness": 0.38})
-MAT_DOOR0 = 10
-# 26..41 : bande verte sur les 16 battants de porte (M36)
+MAT_DOOR0 = 13
+# 29..44 : bande verte sur les 16 battants de porte (M36)
 for _ in range(16):
     MATERIALS.append({"name": "bande", "factor": [0.42, 0.73, 0.35, 1.0],
                       "metallic": 0.20, "roughness": 0.40})
-MAT_DOOR_BANDE0 = 26
-# 42..44 : bogie + 2 essieux (parts séparées, les 3 dernières du GLB bogie).
+MAT_DOOR_BANDE0 = 29
+# 45..47 : bogie + 2 essieux (parts séparées, les 3 dernières du GLB bogie).
 MATERIALS.append({"name": "bogie", "factor": [0.09, 0.09, 0.10, 1.0], "metallic": 0.0, "roughness": 0.65})
 MATERIALS.append({"name": "essieu", "factor": [0.55, 0.55, 0.56, 1.0], "metallic": 1.0, "roughness": 0.30})
 MATERIALS.append({"name": "essieu", "factor": [0.55, 0.55, 0.56, 1.0], "metallic": 1.0, "roughness": 0.30})
-MAT_BOGIE, MAT_AXLE_A, MAT_AXLE_B = 42, 43, 44
+MAT_BOGIE, MAT_AXLE_A, MAT_AXLE_B = 45, 46, 47
 
 # Embrasures de portes (z0, z1, y0, y1). La motrice décale sa 1re porte vers
 # l'arrière (la cloison de cabine occupe z = -8.0).
@@ -240,10 +256,64 @@ def build_side_walls(parts, openings=OPENINGS, windows=WINDOWS, doorways=DOORWAY
 
 
 def build_roof(parts):
-    """Toit plat indépendant + climatiseurs (enfoncés de 5 mm, pas coplanaires)."""
+    """Toit plat indépendant + 2 BOÎTIERS DE CLIMATISATION gris clair (M48 :
+    2.5 x 0.4 x 1.5 m, répartis le long de l'axe, enfoncés de 5 mm dans le toit,
+    pas coplanaires)."""
     parts[MAT_ACIER].add_box(-HALF_W, ROOF_Y, Z_HEAD, HALF_W, ROOF_Y + 0.10, Z_TAIL)
-    for zc in (-5.0, 0.0, 5.0):
-        parts[MAT_JUPE].add_box(-0.80, ROOF_Y + 0.095, zc - 1.2, 0.80, ROOF_Y + 0.38, zc + 1.2)
+    for zc in (-4.0, 4.0):
+        parts[MAT_CLIM].add_box(-0.75, ROOF_Y + 0.095, zc - 1.25, 0.75, ROOF_Y + 0.50, zc + 1.25)
+
+
+def add_bar(part, a, b, w):
+    """Barre cylindrique approchée (prisme carré de section w) entre deux points.
+    Utilisée pour le pantographe (M48)."""
+    d = norm(sub(b, a))
+    ref = (0.0, 1.0, 0.0) if abs(d[1]) < 0.9 else (1.0, 0.0, 0.0)
+    u = mul(norm(cross(d, ref)), w * 0.5)
+    v = mul(norm(cross(d, norm(cross(d, ref)))), w * 0.5)
+    a0 = (a[0] - u[0] - v[0], a[1] - u[1] - v[1], a[2] - u[2] - v[2])
+    a1 = (a[0] + u[0] - v[0], a[1] + u[1] - v[1], a[2] + u[2] - v[2])
+    a2 = (a[0] + u[0] + v[0], a[1] + u[1] + v[1], a[2] + u[2] + v[2])
+    a3 = (a[0] - u[0] + v[0], a[1] - u[1] + v[1], a[2] - u[2] + v[2])
+    b0 = (b[0] - u[0] - v[0], b[1] - u[1] - v[1], b[2] - u[2] - v[2])
+    b1 = (b[0] + u[0] - v[0], b[1] + u[1] - v[1], b[2] + u[2] - v[2])
+    b2 = (b[0] + u[0] + v[0], b[1] + u[1] + v[1], b[2] + u[2] + v[2])
+    b3 = (b[0] - u[0] + v[0], b[1] - u[1] + v[1], b[2] - u[2] + v[2])
+    part.add_quad(a0, a1, b1, b0)  # face -v
+    part.add_quad(a1, a2, b2, b1)  # face +u
+    part.add_quad(a2, a3, b3, b2)  # face +v
+    part.add_quad(a3, a0, b0, b3)  # face -u
+    quad_orient(part, a3, a2, a1, a0, mul(d, -1.0))
+    quad_orient(part, b1, b2, b3, b0, d)
+
+
+def build_pantograph(parts):
+    """Pantographe simple sur le toit de la motrice (M48) : 4 isolateurs, cadre
+    en losange à deux bras parallèles, barre de contact à ~1.0 m au-dessus du
+    toit (toit à ROOF_Y + 0.10). Centré à z = 0, entre les deux climatiseurs."""
+    panto = parts[MAT_PANTO]
+    y_roof = ROOF_Y + 0.10
+    z0, z1 = -1.6, 1.6          # embase le long de l'axe
+    y_mid, y_top, y_bar = y_roof + 0.55, y_roof + 0.92, y_roof + 1.00
+    for sx in (-0.45, 0.45):
+        # Isolateurs (base isolante, gris clair).
+        for sz in (z0, z1):
+            parts[MAT_CLIM].add_box(sx - 0.06, y_roof, sz - 0.06,
+                                    sx + 0.06, y_roof + 0.12, sz + 0.06)
+        # Longeron de base.
+        add_bar(panto, (sx, y_roof + 0.12, z0), (sx, y_roof + 0.12, z1), 0.05)
+        # Bras inférieurs (montent vers l'articulation centrale).
+        add_bar(panto, (sx, y_roof + 0.12, z0), (sx, y_mid, 0.0), 0.045)
+        add_bar(panto, (sx, y_roof + 0.12, z1), (sx, y_mid, 0.0), 0.045)
+        # Bras supérieurs (vers le cadre porte-barre).
+        add_bar(panto, (sx, y_mid, 0.0), (sx, y_top, -0.55), 0.04)
+        add_bar(panto, (sx, y_mid, 0.0), (sx, y_top, 0.55), 0.04)
+        # Cadre supérieur + liaisons verticales à la barre de contact.
+        add_bar(panto, (sx, y_top, -0.55), (sx, y_top, 0.55), 0.04)
+        add_bar(panto, (sx, y_top, 0.0), (sx, y_bar, 0.0), 0.04)
+    # Traverse d'articulation et barre de contact (axe x).
+    add_bar(panto, (-0.45, y_mid, 0.0), (0.45, y_mid, 0.0), 0.04)
+    add_bar(panto, (-0.70, y_bar, 0.0), (0.70, y_bar, 0.0), 0.05)
 
 
 def build_interior(parts, centers=DOOR_CENTERS):
@@ -304,10 +374,24 @@ def build_end_face(parts, zend, with_windshield):
     # Verre du pare-brise, à fleur de la face (z = zend), décalé de ±10 mm.
     parts[MAT_GLASS].add_box(-WS_X, WS_Y0, zend - 0.01, WS_X, WS_Y1, zend + 0.01,
                              top=False, bot=False, left=False, right=False)
-    # Phares : deux blocs sur les piliers, HORS de l'ouverture (|x| > WS_X).
-    for sx in (-1.0, 1.0):
-        parts[MAT_PHARE].add_box(sx * 1.34 - 0.10, WS_Y0 + 0.05, zend - 0.03,
-                                 sx * 1.34 + 0.10, WS_Y0 + 0.30, zend + 0.01)
+
+
+def build_lights(parts):
+    """Feux de la motrice (M48) : rame RÉVERSIBLE — phares blancs ÉMISSIFS HDR +
+    feux rouges émissifs aux DEUX extrémités (kLocoTransform = rotation nulle :
+    la même motrice peut se retrouver en tête quel que soit le sens). Blocs en
+    saillie de 4 cm hors de la face, enterrés de 5 mm dans la plaque d'extrémité
+    (jamais coplanaires, M30.5). Phares HORS de l'ouverture du pare-brise."""
+    for zend in (Z_HEAD, Z_TAIL):
+        if zend < 0.0:
+            lz0, lz1 = zend - 0.14, zend - 0.095
+        else:
+            lz0, lz1 = zend + 0.095, zend + 0.14
+        for sx in (-1.0, 1.0):
+            parts[MAT_PHARE].add_box(sx * 1.34 - 0.10, WS_Y0 + 0.05, lz0,
+                                     sx * 1.34 + 0.10, WS_Y0 + 0.30, lz1)
+            parts[MAT_FEU_AR].add_box(sx * 1.34 - 0.08, WS_Y0 - 0.30, lz0,
+                                      sx * 1.34 + 0.08, WS_Y0 - 0.06, lz1)
 
 
 def build_cab(parts):
@@ -371,8 +455,10 @@ def build_motrice(out):
     build_floor(parts)
     build_side_walls(parts, MOTRICE_OPENINGS, MOTRICE_WINDOWS, MOTRICE_DOORWAYS)
     build_roof(parts)
+    build_pantograph(parts)
     build_end_face(parts, Z_HEAD, with_windshield=True)
     build_end_face(parts, Z_TAIL, with_windshield=False)
+    build_lights(parts)
     build_interior(parts, MOTRICE_CENTERS)
     build_cab(parts)
     # Portes de la motrice ANIMÉES elles aussi (M30.5) : 32 dernières primitives.
@@ -518,13 +604,17 @@ def write_glb(path, parts, node_name):
     def mat_slot(mat_idx):
         mat_def = MATERIALS[mat_idx]
         key = (mat_def["name"], tuple(mat_def["factor"]), mat_def["metallic"],
-               mat_def["roughness"], mat_def.get("blend"), mat_def.get("doubleSided"))
+               mat_def["roughness"], mat_def.get("blend"), mat_def.get("doubleSided"),
+               tuple(mat_def["emissive"]) if mat_def.get("emissive") else None)
         if key not in mat_remap:
             mat_remap[key] = len(materials)
             m = {"name": mat_def["name"],
                  "pbrMetallicRoughness": {"baseColorFactor": mat_def["factor"],
                                           "metallicFactor": mat_def["metallic"],
                                           "roughnessFactor": mat_def["roughness"]}}
+            # Facteur émissif HDR (valeurs > 1 tolérées par le loader, M48).
+            if mat_def.get("emissive"):
+                m["emissiveFactor"] = mat_def["emissive"]
             if mat_def.get("blend"):
                 m["alphaMode"] = "BLEND"
                 m["doubleSided"] = True
