@@ -53,12 +53,19 @@ struct CatenaryProfile {
     float pole_web_half = 0.16f;     // demi-écart entre semelles (l'âme les relie)
     float console_y = 6.70f;         // hauteur de la potence
 
-    // --- Zone de GARE (M19) : sous la verrière, on ne plante PAS de poteaux (ils
-    // percuteraient les quais et le toit). Le porteur y est suspendu à la structure par de
-    // petites attaches, et abaissé à la hauteur de la verrière. Le fil de contact (et son
-    // zigzag) ne change pas. `canopy_end <= canopy_start` => aucune gare (défaut). ---
-    double canopy_start = 0.0;
-    double canopy_end = 0.0;
+    // --- Zones de GARE (M19, corrigé M50) : sous la verrière, on ne plante PAS de poteaux
+    // (ils percuteraient les quais et le toit). Le porteur y est suspendu à la structure par
+    // de petites attaches, et abaissé sous l'intrados. Le fil de contact (et son zigzag) ne
+    // change pas.
+    //
+    // M50 : l'emprise était un INTERVALLE UNIQUE en dur ([0, 400] côté app) alors que les
+    // gares sont PÉRIODIQUES (une tous les 2 km, longueur 150 m) — d'où des mâts plantés en
+    // pleine gare dès la deuxième, et des attaches suspendues à rien entre 75 m et 400 m.
+    // L'emprise est maintenant la même grille absolue que celle du viaduc : tout chainage à
+    // moins de `canopy_half_length` d'un multiple de `canopy_period` est « sous verrière ».
+    // `canopy_period <= 0` => aucune gare (défaut). ---
+    double canopy_period = 0.0;       // entraxe des gares (0 = aucune)
+    double canopy_half_length = 0.0;  // demi-longueur de la verrière
     double canopy_attach_height = 5.35;  // hauteur d'attache du porteur sous la verrière
 };
 

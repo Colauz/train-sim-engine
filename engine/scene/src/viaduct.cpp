@@ -240,14 +240,19 @@ StationMeshes generate_station(const TrackSource& track, double s_center,
         extrude(out, frames, platform, uv_period);
     }
 
-    // Verrière : dalle plane au-dessus des deux quais, sur la longueur de la gare
-    // SEULEMENT — jamais au-delà.
+    // Verrière (M50) : caisson plan STRICTEMENT borné, dans son propre maillage.
+    // Boîte englobante garantie par construction — `frames` ne couvre que
+    // [s_center - 75, s_center + 75] et le profil ne dépasse pas ±roof_half_width :
+    //   Z : 150 m (les quais, pas un mètre de plus)  X : 20 m  Y : +7,20 à +7,55 m.
+    // C'est la fin du « plafond infini » : la dalle ne peut plus s'étendre au-delà
+    // de la gare, ni couper la caténaire, qui passe entièrement dessous.
     const float roof = profile.roof_y;
+    const float rw = profile.roof_half_width;
     const std::vector<P2> canopy = {
-        {-out_w, roof}, {out_w, roof}, {out_w, roof + profile.roof_thickness},
-        {-out_w, roof + profile.roof_thickness},
+        {-rw, roof}, {rw, roof}, {rw, roof + profile.roof_thickness},
+        {-rw, roof + profile.roof_thickness},
     };
-    extrude(out, frames, canopy, uv_period);
+    extrude(meshes.canopy, frames, canopy, uv_period);
 
     // Colonnes de verrière : en rive extérieure des quais, grille régulière.
     const long k0 = static_cast<long>(std::ceil(s0 / profile.column_spacing));
@@ -332,11 +337,15 @@ StationMeshes generate_station(const TrackSource& track, double s_center,
         }
     }
 
-    // M49 — Repère d'arrêt (stop marker) : losange blanc lumineux face au train
-    // entrant, planté à l'extrémité AVAIL du quai (sens +chainage) au droit du quai
-    // de droite. La cabine s'aligne sur lui : toutes les portes sont alors sur le
-    // quai. C'est un carré de 80 cm tourné de 45° (d'où le losange), matériau
-    // émissif comme la signalétique.
+    // M49/M50 — Repère d'arrêt (stop marker). Il faisait la taille d'un immeuble
+    // en M49 ; il est ramené aux cotes RÉELLES d'un panneau de quai :
+    //   0,5 m x 0,5 m de plaque, 0,1 m d'épaisseur (demi-cotes 0,25/0,25/0,05),
+    //   carré tourné de 45° (le losange japonais), matériau émissif,
+    //   plaqué à +2,00 m au-dessus du plan de roulement — 12,0 m au chainage
+    //   nominal, soit la hauteur des yeux du conducteur en cabine (assis à
+    //   +0,25 m dans une caisse dont le plancher est à +1,05 m),
+    //   au bout du quai de droite (3 m de retrait depuis l'extrémité).
+    // L'épaisseur est portée par `forward` : la plaque FAIT FACE au train entrant.
     {
         const double s_mark = s1 - 3.0;  // 3 m de retrait depuis l'extrémité du quai
         glm::dvec3 pos_world;
@@ -349,12 +358,12 @@ StationMeshes generate_station(const TrackSource& track, double s_center,
         const glm::vec3 diag_u = (glm::vec3(0.0f, 1.0f, 0.0f) - right) * k;
         const glm::vec3 mid = glm::vec3(pos_world - origin) +
                               right * ((in + out_w) * 0.5f) +
-                              glm::vec3(0.0f, top + 1.2f, 0.0f);
-        // Le mât du repère part dans le béton, le losange dans la signalétique.
-        add_box(out, mid - glm::vec3(0.0f, 0.6f, 0.0f), right, forward,
-                glm::vec3(0.0f, 1.0f, 0.0f), glm::vec3(0.04f, 0.6f, 0.04f), uv_period);
+                              glm::vec3(0.0f, 2.0f, 0.0f);  // Y = 12,0 m absolu
+        // Mât fin (4 cm) du dessus du quai au losange, dans le béton.
+        add_box(out, mid - glm::vec3(0.0f, 0.45f, 0.0f), right, forward,
+                glm::vec3(0.0f, 1.0f, 0.0f), glm::vec3(0.02f, 0.45f, 0.02f), uv_period);
         add_box(meshes.signs, mid, diag_r, forward, diag_u,
-                glm::vec3(0.40f, 0.40f, 0.02f), uv_period);
+                glm::vec3(0.25f, 0.25f, 0.05f), uv_period);  // 0,5 x 0,5 x 0,1 m
     }
     return meshes;
 }

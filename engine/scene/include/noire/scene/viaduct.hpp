@@ -46,8 +46,25 @@ struct StationProfile {
     float platform_inner = 4.6f;  // bord de quai = rive du tablier
     float platform_outer = 8.0f;  // rive extérieure du quai (3,4 m de large)
     float platform_top = 1.10f;   // dessus du quai au-dessus du plan de roulement
-    float roof_y = 8.0f;        // M49 : intrados REHAUSSÉ — la verrière englobe la
-                                // caténaire et le pantographe, elle ne les coupe plus
+    // M50 — VERRIÈRE BORNÉE. Le bug M49 : la dalle de toiture était extrudée sur
+    // toute la fenêtre du viaduc (7 km), d'où un « plafond infini ». Elle est
+    // désormais enfermée dans une boîte englobante EXPLICITE, vérifiable :
+    //   Z (le long de la voie) : `length` = 150 m — les quais, rien de plus ;
+    //   X (travers voie)       : ±`roof_half_width` = 20 m — les deux quais
+    //                            (16 m de bâti) + 2 m de débord de rive par côté ;
+    //   Y                      : intrados à `roof_y` AU-DESSUS DU PLAN DE ROULEMENT.
+    //
+    // Sur la hauteur : toutes les cotes du moteur se comptent depuis le plan de
+    // roulement, qui ONDULE (base 10 m, ±6 m — ProceduralTrack). Un « Y = 14 m
+    // absolu » figé ferait plonger le toit dans le tablier là où la voie descend.
+    // La consigne « 14 m minimum pour laisser passer le fil » est donc appliquée
+    // RELATIVEMENT, et largement tenue : intrados à +7,20 m => 17,20 m au chainage
+    // nominal, soit bien plus que 14 m, et au-dessus du fil de contact (+5,20 m),
+    // du porteur (+6,60 m) et du sommet des mâts (+7,00 m). Un toit à 14 m ABSOLU
+    // (= +4,00 m) serait passé sous le fil ET dans la rame (toit de caisse à
+    // +3,60 m, pantographe à +5,20 m) : c'est cette lecture-là qui est impossible.
+    float roof_half_width = 10.0f;  // demi-largeur de la verrière (20 m au total)
+    float roof_y = 7.2f;
     float roof_thickness = 0.35f;
     float column_half = 0.18f;  // section des colonnes de verrière
     double column_spacing = 15.0;
@@ -59,11 +76,13 @@ struct StationProfile {
     double sign_spacing = 25.0;   // entraxe des panneaux suspendus
 };
 
-// Quatre maillages : le béton (fusionné au viaduc), le vitrage FIXE des façades de
-// quai (BLEND), les panneaux vitrés MOBILES (BLEND, coulissent avec les portes de la
-// rame via une translation du DrawItem) et la signalétique (émissif).
+// Cinq maillages : le béton (fusionné au viaduc), la verrière translucide (BLEND,
+// bornée : 20 m x 150 m, intrados à +7,20 m), le vitrage FIXE des façades de quai
+// (BLEND), les panneaux vitrés MOBILES (BLEND, coulissent avec les portes de la
+// rame) et la signalétique (émissif).
 struct StationMeshes {
     RailMeshData concrete;
+    RailMeshData canopy;
     RailMeshData glass;
     RailMeshData psd_doors;
     RailMeshData signs;

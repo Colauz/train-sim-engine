@@ -157,6 +157,14 @@ constexpr double kCatenaryStep = 200.0;
 constexpr double kViaductRange = 3500.0;
 constexpr double kViaductStep = 250.0;
 
+// Gares aériennes (M47) : une gare tous les 2 km, CENTRÉE sur un multiple exact de
+// l'entraxe. Une seule source de vérité (M50) : le viaduc y pose les quais et la
+// verrière, la caténaire y suspend son porteur au lieu de planter des mâts, et les
+// façades de quai y coulissent. Trois emprises calculées à partir de la MÊME
+// constante — quand elles divergeaient, les poteaux traversaient la gare.
+constexpr double kStationSpacing = 2000.0;
+constexpr double kStationLength = 150.0;  // = StationProfile::length
+
 constexpr double kBuildingCell = 30.0;        // une cellule de semis, en mètres (= CityGrid)
 constexpr double kBuildingHalfWidth = 380.0;  // portée latérale de part et d'autre du viaduc
 constexpr double kBuildingRange = 700.0;      // au-delà, une tour de 100 m fond dans la nuit
@@ -479,6 +487,11 @@ struct Application::Impl {
     render::MeshId station_sign_mesh = 0;
     render::MeshId station_sign_uploading = 0;
     render::MaterialId station_sign_material = 0;  // émissif
+    // Verrière (M50) : maillage DÉDIÉ, borné à 20 x 150 m par gare. Séparé du béton
+    // du viaduc parce qu'il est TRANSLUCIDE — il se dessine avec les transparents.
+    render::MeshId canopy_mesh = 0;
+    render::MeshId canopy_uploading = 0;
+    render::MaterialId canopy_material = 0;   // verre de toiture (BLEND)
 
     // Cubes de debug M4, dessinés uniquement en fallback / pendant le chargement.
     render::MeshId bogie_mesh = 0;
@@ -680,12 +693,24 @@ struct Application::Impl {
         wire_desc.roughness_factor = 0.45f;
         wire_material = renderer.create_material(wire_desc);
 
-        // M19/M31 : la gare occupe le chainage 0-400. Sous son grand toit (intrados à
-        // 7,40 m), la caténaire ne plante PAS de poteaux — ils percuteraient les quais et
-        // le toit ; elle s'y suspend par des attaches, le porteur abaissé sous le toit.
-        catenary_profile.canopy_start = 0.0;
-        catenary_profile.canopy_end = 400.0;
-        catenary_profile.canopy_attach_height = 7.30;  // juste sous le toit (à 7,40 m)
+        // M19/M31/M50 : sous la verrière d'une gare, la caténaire ne plante PAS de
+        // poteaux — ils percuteraient les quais et le toit ; elle s'y suspend par des
+        // attaches, le porteur relevé JUSTE SOUS l'intrados. L'emprise n'est plus un
+        // intervalle en dur : c'est la même grille que les gares du viaduc (une tous
+        // les kStationSpacing, longue de kStationLength), sinon les deux géométries
+        // divergent et les mâts repoussent au milieu des quais.
+        {
+            constexpr scene::StationProfile sp{};
+            static_assert(sp.length == kStationLength,
+                          "L'emprise de gare de la caténaire doit suivre la verrière");
+            catenary_profile.canopy_period = kStationSpacing;
+            catenary_profile.canopy_half_length = kStationLength * 0.5;
+            // L'attache mesure 0,22 m de tige : son sommet affleure alors EXACTEMENT
+            // l'intrados (+7,20 m) sans le percer, et le porteur reste au-dessus du
+            // fil de contact (+5,20 m) même avec sa flèche de 0,70 m à mi-portée.
+            catenary_profile.canopy_attach_height =
+                static_cast<double>(sp.roof_y) - 0.22;
+        }
 
         const scene::RailMeshData pole = scene::generate_pole_mesh(catenary_profile);
         pole_mesh = renderer.create_mesh_indexed(pole.vertices, pole.indices);
@@ -766,6 +791,16 @@ struct Application::Impl {
         psd_desc.roughness_factor = 0.10f;
         psd_desc.transparent = true;
         psd_material = renderer.create_material(psd_desc);
+
+        // Verrière (M50) : verre de toiture gris clair, franchement translucide —
+        // la lumière du jour doit continuer de tomber sur les quais, sans quoi la
+        // gare devient une boîte noire. Même famille que les façades de quai.
+        render::MaterialDesc canopy_desc;
+        canopy_desc.base_color_factor = glm::vec4(0.62f, 0.66f, 0.70f, 0.45f);
+        canopy_desc.metallic_factor = 0.0f;
+        canopy_desc.roughness_factor = 0.18f;
+        canopy_desc.transparent = true;
+        canopy_material = renderer.create_material(canopy_desc);
 
         render::MaterialDesc sign_desc;
         sign_desc.base_color_factor = glm::vec4(0.06f, 0.07f, 0.08f, 1.0f);
@@ -1140,7 +1175,6 @@ struct Application::Impl {
         // 2 km ; la fenêtre de ±30 m correspond à un quai de 150 m moins la rame).
         // Sinon elles restent closes, même si les portes de la rame bougent.
         {
-            constexpr double kStationSpacing = 2000.0;
             const double nearest =
                 std::round(wagon.chainage() / kStationSpacing) * kStationSpacing;
             const bool aligned = std::abs(wagon.chainage() - nearest) <= 30.0;
@@ -1596,7 +1630,8 @@ struct Application::Impl {
         if (viaduct_uploading != 0 && renderer.is_mesh_ready(viaduct_uploading) &&
             (psd_uploading == 0 || renderer.is_mesh_ready(psd_uploading)) &&
             (psd_door_uploading == 0 || renderer.is_mesh_ready(psd_door_uploading)) &&
-            (station_sign_uploading == 0 || renderer.is_mesh_ready(station_sign_uploading))) {
+            (station_sign_uploading == 0 || renderer.is_mesh_ready(station_sign_uploading)) &&
+            (canopy_uploading == 0 || renderer.is_mesh_ready(canopy_uploading))) {
             if (viaduct_mesh != 0) {
                 renderer.destroy_mesh(viaduct_mesh);
             }
@@ -1619,6 +1654,11 @@ struct Application::Impl {
             }
             station_sign_mesh = station_sign_uploading;
             station_sign_uploading = 0;
+            if (canopy_mesh != 0) {
+                renderer.destroy_mesh(canopy_mesh);
+            }
+            canopy_mesh = canopy_uploading;
+            canopy_uploading = 0;
         }
         const long snap = std::lround(wagon.chainage() / kViaductStep);
         if (viaduct_uploading != 0 || (viaduct_valid && snap == viaduct_snap)) {
@@ -1637,8 +1677,7 @@ struct Application::Impl {
         // façades de quai vitrées + signalétique. Le béton est FUSIONNÉ avec le
         // viaduc (même matériau, même fenêtre, grille absolue) ; le verre et la
         // signalétique ont leurs maillages/matériaux dédiés, téléversés ensemble.
-        constexpr double kStationSpacing = 2000.0;
-        scene::RailMeshData psd_all, psd_door_all, signs_all;
+        scene::RailMeshData psd_all, psd_door_all, signs_all, canopy_all;
         const long g0 = static_cast<long>(std::ceil((center - kViaductRange) / kStationSpacing));
         const long g1 = static_cast<long>(std::floor((center + kViaductRange) / kStationSpacing));
         for (long g = g0; g <= g1; ++g) {
@@ -1654,6 +1693,7 @@ struct Application::Impl {
                 }
             };
             append(deck, st.concrete);
+            append(canopy_all, st.canopy);
             append(psd_all, st.glass);
             append(psd_door_all, st.psd_doors);
             append(signs_all, st.signs);
@@ -1670,6 +1710,10 @@ struct Application::Impl {
                                                ? 0
                                                : renderer.create_mesh_indexed(signs_all.vertices,
                                                                               signs_all.indices);
+        const render::MeshId fresh_canopy =
+            canopy_all.empty()
+                ? 0
+                : renderer.create_mesh_indexed(canopy_all.vertices, canopy_all.indices);
         if (fresh != 0) {
             viaduct_uploading = fresh;
             viaduct_uploading_origin = origin;
@@ -1677,6 +1721,7 @@ struct Application::Impl {
             psd_uploading = fresh_psd;
             psd_door_uploading = fresh_psd_door;
             station_sign_uploading = fresh_signs;
+            canopy_uploading = fresh_canopy;
         }
     }
 
@@ -2328,7 +2373,6 @@ struct Application::Impl {
         if (psd_door_mesh != 0 && psd_material != 0) {
             glm::mat4 m = camera.relative_model(viaduct_origin);
             if (psd_t > 0.0f) {
-                constexpr double kStationSpacing = 2000.0;
                 const double nearest =
                     std::round(wagon.chainage() / kStationSpacing) * kStationSpacing;
                 glm::dvec3 pos, tangent;
@@ -2337,6 +2381,13 @@ struct Application::Impl {
                 m = m * glm::translate(glm::mat4(1.0f), slide);
             }
             items.push_back(render::DrawItem{m, psd_door_mesh, psd_material});
+        }
+        // Verrière (M50) : la surface transparente la PLUS HAUTE de la scène, donc la
+        // dernière tirée. Depuis la cabine, tout ce qu'elle recouvre (câbles, façades
+        // de quai, signalétique) est déjà peint quand elle se mélange par-dessus.
+        if (canopy_mesh != 0 && canopy_material != 0) {
+            items.push_back(render::DrawItem{camera.relative_model(viaduct_origin),
+                                             canopy_mesh, canopy_material});
         }
 
         render::Hud hud = build_hud();

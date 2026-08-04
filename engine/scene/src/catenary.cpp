@@ -157,9 +157,16 @@ CatenaryData generate_catenary(const TrackSource& track, double x_start, double 
         return out;
     }
 
-    // Vrai quand un chainage tombe dans l'emprise de la verrière de la gare.
+    // Vrai quand un chainage tombe sous la verrière d'une gare (M50). Grille ABSOLUE et
+    // périodique, identique à celle qui pose les gares côté viaduc : la distance au
+    // multiple de `canopy_period` le plus proche décide, donc TOUTES les gares de la
+    // fenêtre sont couvertes, et elles seules.
     const auto in_canopy = [&](double x) {
-        return p.canopy_end > p.canopy_start && x >= p.canopy_start && x < p.canopy_end;
+        if (p.canopy_period <= 0.0 || p.canopy_half_length <= 0.0) {
+            return false;
+        }
+        const double d = x - std::round(x / p.canopy_period) * p.canopy_period;
+        return std::abs(d) <= p.canopy_half_length;
     };
     // Hauteur d'attache du PORTEUR à un poteau donné : sous la verrière, il est suspendu à la
     // structure (bas) ; ailleurs, il est au sommet de la « hauteur système » habituelle.

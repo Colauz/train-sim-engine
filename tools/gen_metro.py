@@ -20,7 +20,9 @@ Trois fichiers :
 Intérieur de métro : BANQUETTES LONGITUDINALES le long des murs, grand espace
 vide au centre, vrai sol, vrai plafond.
 
-M48 : 2 boîtiers de climatisation gris clair sur chaque toit, pantographe en
+M50 : 1 bloc de climatisation gris clair par voiture (4,0 x 2,0 x 0,4 m, centré
+sur le toit ; décalé à z = +5 sur la motrice, où le pantographe occupe déjà le
+milieu). M48 : pantographe en
 losange sur la motrice, phares blancs et feux rouges ÉMISSIFS HDR aux DEUX
 extrémités de la motrice (rame réversible). Toute cette géométrie vit dans des
 parts dont le matériau précède MAT_DOOR0 : les 32 battants de porte restent les
@@ -56,6 +58,12 @@ WIN_SILL, WIN_LINTEL = 0.05, 0.85
 DOOR_Y0, DOOR_Y1 = -1.00, 0.90
 DOOR_CENTERS = (-7.5, -2.5, 2.5, 7.5)
 DOOR_HALF = 0.65
+
+# Climatisation de toit (M50) : un bloc par voiture, 4,0 x 2,0 x 0,4 m.
+CLIM_HALF_L = 2.0       # 4,0 m dans le sens de la marche
+CLIM_HALF_W = 1.0       # 2,0 m en travers (toit large de 2,95 m)
+CLIM_H = 0.40           # hauteur au-dessus de la tôle de toiture
+CLIM_Z_MOTRICE = 5.0    # décalé vers l'arrière : le pantographe tient le milieu
 
 # Pare-brise de la motrice : énorme trou carré dans la face avant.
 WS_X, WS_Y0, WS_Y1 = 1.20, -0.20, 1.10
@@ -255,13 +263,26 @@ def build_side_walls(parts, openings=OPENINGS, windows=WINDOWS, doorways=DOORWAY
                                      x1, WIN_SILL - 0.04, Z_TAIL - 0.3)
 
 
-def build_roof(parts):
-    """Toit plat indépendant + 2 BOÎTIERS DE CLIMATISATION gris clair (M48 :
-    2.5 x 0.4 x 1.5 m, répartis le long de l'axe, enfoncés de 5 mm dans le toit,
-    pas coplanaires)."""
-    parts[MAT_ACIER].add_box(-HALF_W, ROOF_Y, Z_HEAD, HALF_W, ROOF_Y + 0.10, Z_TAIL)
-    for zc in (-4.0, 4.0):
-        parts[MAT_CLIM].add_box(-0.75, ROOF_Y + 0.095, zc - 1.25, 0.75, ROOF_Y + 0.50, zc + 1.25)
+def build_roof(parts, clim_z=0.0):
+    """Toit plat indépendant + UN BLOC DE CLIMATISATION par voiture (M50).
+
+    Cotes STRICTES : 4,0 m de long (axe z, dans le sens de la marche) x 2,0 m de
+    large (axe x) x 0,4 m de haut. Le bloc est CENTRÉ sur le toit — x = 0, et le
+    toit faisant 2,95 m de large il reste 0,475 m de rive de chaque côté, la
+    caisse ne déborde pas du gabarit.
+
+    Il est enfoncé de 5 mm dans la tôle pour n'être JAMAIS coplanaire avec elle
+    (tools/check_coplanar.py) : les 0,4 m demandés sont ceux qui dépassent du
+    toit, mesurés depuis sa surface supérieure (ROOF_Y + 0.10).
+
+    `clim_z` décale le bloc sur la MOTRICE, dont le milieu de toit est déjà pris
+    par l'embase du pantographe (z de -1,6 à +1,6, cf. build_pantograph) : laissé
+    à z = 0, le climatiseur l'engloberait — exactement le genre d'interpénétration
+    que le M50 corrige ailleurs."""
+    roof_top = ROOF_Y + 0.10
+    parts[MAT_ACIER].add_box(-HALF_W, ROOF_Y, Z_HEAD, HALF_W, roof_top, Z_TAIL)
+    parts[MAT_CLIM].add_box(-CLIM_HALF_W, roof_top - 0.005, clim_z - CLIM_HALF_L,
+                            CLIM_HALF_W, roof_top + CLIM_H, clim_z + CLIM_HALF_L)
 
 
 def add_bar(part, a, b, w):
@@ -454,7 +475,7 @@ def build_motrice(out):
     parts = [Part() for _ in MATERIALS]
     build_floor(parts)
     build_side_walls(parts, MOTRICE_OPENINGS, MOTRICE_WINDOWS, MOTRICE_DOORWAYS)
-    build_roof(parts)
+    build_roof(parts, clim_z=CLIM_Z_MOTRICE)
     build_pantograph(parts)
     build_end_face(parts, Z_HEAD, with_windshield=True)
     build_end_face(parts, Z_TAIL, with_windshield=False)
