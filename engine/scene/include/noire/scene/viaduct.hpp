@@ -38,8 +38,14 @@ struct ViaductProfile {
 // M47 — Gare aérienne (le reste de la ligne reste à ciel ouvert). Engendre, centré
 // sur le chainage `s_center` : deux quais latéraux (plateformes à +1,10 m au-dessus
 // du plan de roulement, soit ~10,5 m au-dessus du sol), une verrière de `length`
-// mètres de long UNIQUEMENT au-dessus des quais, et ses colonnes. Mêmes conventions
+// mètres de long UNIQUEMENT au-dessus des quais, et ses porteurs. Mêmes conventions
 // que generate_viaduct (plan de roulement = 0, origine flottante, fonction pure).
+//
+// SYMÉTRIE (M51) : tout ce qui est latéral — quais, façades de quai, colonnes,
+// piliers, panneaux — est engendré par une boucle sur `sign ∈ {-1, +1}` appliquée
+// aux MÊMES cotes. La gare est donc symétrique par construction, pas par
+// coïncidence : il est impossible de décaler un quai sans décaler l'autre.
+// AUTOPORTANCE (M51) : ses piliers descendent jusqu'au sol unifié (Y = 0 monde).
 struct StationProfile {
     double length = 150.0;      // longueur des quais et de la verrière (m)
     double step = 10.0;         // pas de tessellation le long de la voie (m)
@@ -66,7 +72,10 @@ struct StationProfile {
     float roof_half_width = 10.0f;  // demi-largeur de la verrière (20 m au total)
     float roof_y = 7.2f;
     float roof_thickness = 0.35f;
-    float column_half = 0.18f;  // section des colonnes de verrière
+    float column_half = 0.18f;  // section des colonnes de verrière (au-dessus du quai)
+    // M51 : sous le quai, le même appui devient un PILIER qui descend jusqu'au sol
+    // unifié (Y = 0). Plus trapu : il reprend une vingtaine de mètres de hauteur.
+    float pillar_half = 0.35f;
     double column_spacing = 15.0;
     // M48 — Façades de quai (platform screen doors) : panneaux vitrés alternés le
     // long du quai — un fixe, un MOBILE (il coulisse avec les portes de la rame,

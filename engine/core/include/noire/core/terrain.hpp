@@ -38,7 +38,13 @@ public:
     [[nodiscard]] glm::dvec3 normal(double wx, double wz, double step = 1.0) const;
     // Distance horizontale euclidienne à l'axe de la voie (point le plus proche sur la
     // spline, M45). Sert au semis : aucun bâtiment ne doit empiéter sur le corridor.
-    [[nodiscard]] double distance_to_track(double wx, double wz) const;
+    //
+    // M51 : `out_chainage` reçoit, si fourni, le chainage du point le plus proche —
+    // il est calculé de toute façon, et c'est LUI qui permet de savoir de quelle gare
+    // on est près (les gares sont à des chainages, pas à des coordonnées monde).
+    // Renvoyer les deux évite un second balayage de spline par test d'occupation.
+    [[nodiscard]] double distance_to_track(double wx, double wz,
+                                           double* out_chainage = nullptr) const;
 
     [[nodiscard]] const TerrainConfig& config() const { return config_; }
 

@@ -254,7 +254,18 @@ StationMeshes generate_station(const TrackSource& track, double s_center,
     };
     extrude(meshes.canopy, frames, canopy, uv_period);
 
-    // Colonnes de verrière : en rive extérieure des quais, grille régulière.
+    // Porteurs de la verrière (M51) : la gare est un ÎLOT AUTOPORTANT. Elle ne
+    // s'appuie sur rien d'autre — ni sur les piles du viaduc, ni sur quoi que ce soit
+    // de l'environnement urbain : ses appuis descendent en propre jusqu'au SOL
+    // UNIFIÉ (Y = 0 monde), et rien d'autre ne peut être bâti dans leur emprise
+    // (cf. le corridor sanitaire de 45 m côté app).
+    //
+    // Deux tronçons, à la même verticale — c'est un seul porteur, dimensionné selon
+    // ce qu'il porte :
+    //   * en dessous du quai, un PILIER trapu (0,70 m) qui reprend ~20 m de hauteur
+    //     jusqu'au sol ; il court en rive EXTÉRIEURE des quais, donc à 7,8 m de
+    //     l'axe, très au large du tablier (4,6 m) qu'il ne touche jamais ;
+    //   * au-dessus du quai, la COLONNE fine (0,36 m) qui tient la verrière.
     const long k0 = static_cast<long>(std::ceil(s0 / profile.column_spacing));
     const long k1 = static_cast<long>(std::floor(s1 / profile.column_spacing));
     for (long k = k0; k <= k1; ++k) {
@@ -265,15 +276,29 @@ StationMeshes generate_station(const TrackSource& track, double s_center,
         const glm::vec3 forward = glm::vec3(glm::normalize(tangent));
         const glm::vec3 right = glm::normalize(glm::cross(forward, world_up));
 
+        // Sol unifié, EXPRIMÉ dans le repère local de la gare (0 = plan de roulement,
+        // qui vole à pos_world.y au-dessus du sol). L'embase s'enfonce d'un demi-mètre
+        // sous le plan : jamais de jour entre le pilier et le sol, jamais de face
+        // coplanaire avec lui non plus.
+        const auto ground_local = static_cast<float>(-pos_world.y - 0.5);
+
         for (const float sign : {-1.0f, 1.0f}) {
             const glm::vec3 base = glm::vec3(pos_world - origin) +
                                    right * (sign * (out_w - profile.column_half));
-            const double h = static_cast<double>(roof) - static_cast<double>(top);
-            const glm::vec3 mid = base + glm::vec3(0.0f, top + static_cast<float>(h) * 0.5f, 0.0f);
-            add_box(out, mid, right, forward, glm::vec3(0.0f, 1.0f, 0.0f),
-                    glm::vec3(profile.column_half, static_cast<float>(h) * 0.5f,
-                              profile.column_half),
+            // Colonne : du dessus du quai à l'intrados de la verrière.
+            const float h_col = roof - top;
+            add_box(out, base + glm::vec3(0.0f, top + h_col * 0.5f, 0.0f), right, forward,
+                    glm::vec3(0.0f, 1.0f, 0.0f),
+                    glm::vec3(profile.column_half, h_col * 0.5f, profile.column_half),
                     uv_period);
+            // Pilier : du sol unifié au dessous du quai (-0,80 m, le dessus du tablier).
+            const float h_pil = bottom - ground_local;
+            if (h_pil > 0.5f) {
+                add_box(out, base + glm::vec3(0.0f, ground_local + h_pil * 0.5f, 0.0f), right,
+                        forward, glm::vec3(0.0f, 1.0f, 0.0f),
+                        glm::vec3(profile.pillar_half, h_pil * 0.5f, profile.pillar_half),
+                        uv_period);
+            }
         }
     }
 

@@ -28,10 +28,10 @@
 #include "noire/resource/asset_paths.hpp"
 #include "noire/resource/resource_manager.hpp"
 #include "noire/scene/catenary.hpp"
-#include "noire/scene/ground_sheet.hpp"
+#include "noire/scene/city_layout.hpp"
+#include "noire/scene/ground_plane.hpp"
 #include "noire/scene/track_mesh.hpp"
 #include "noire/scene/viaduct.hpp"
-#include "noire/scene/terrain_clipmap.hpp"
 #include "noire/scene/world_streamer.hpp"
 
 namespace noire {
@@ -115,22 +115,18 @@ void append_box(std::vector<render::MeshVertex>& verts, std::vector<std::uint32_
     }
 }
 
-// --- Sol (M8 étape 2) -------------------------------------------------------
-// Grand plan solide texturé, qui remplace la grille filaire du M2 : c'est lui qui
-// reçoit l'ombre portée du train.
-
-// Doit couvrir le plan lointain de la caméra (10 km depuis le M9) dans toutes les
-// directions, sinon le vide apparaît au-delà.
-// Altitude ABSOLUE du plan de sol. Calée sous le point le plus BAS de la spline
-// (amplitude verticale 6 m) moins la profondeur du ballast : la voie est donc toujours
-// en remblai au-dessus du sol, jamais en tranchée — un simple quad ne saurait pas se
-// percer d'un trou. AVANT le M9, le sol suivait le train (body_y - 3.0) : il divergeait
-// de la voie jusqu'à 12 m au loin, d'où les rails qui flottaient ou s'enterraient.
-constexpr double kGroundLevel = -6.8;
-// Période de répétition de la texture, en mètres. C'est aussi le pas de recentrage du
-// sol, pour que les UV ne glissent pas sous le train. (Sa valeur était grande faute de
-// mipmaps ; le M9 les a activées, elle pourrait donc être réduite.)
-constexpr std::uint32_t kGroundTextureSize = 256;
+// --- Sol unifié (M51) --------------------------------------------------------
+// UN quad, horizontal, à Y = 0, couleur unie. Rien d'autre ne dessine de sol : ni
+// nappe urbaine cellule par cellule, ni geo-clipmap de terrain, ni route, ni
+// trottoir. C'est la condition pour qu'aucun Z-fighting ne soit possible.
+//
+// Demi-côté : il doit dépasser le plan lointain de la caméra (10 km) même quand le
+// train s'est éloigné du dernier ré-ancrage, sinon la rive du monde apparaîtrait.
+// 12 km - 0,5 km de dérive = 11,5 km de marge : la rive est toujours hors champ.
+constexpr double kGroundHalfExtent = 12000.0;
+// Pas de RÉ-ANCRAGE (le maillage, lui, n'est jamais régénéré : on ne bouge que sa
+// matrice modèle). Grossier exprès — la couleur étant unie, rien ne peut « glisser ».
+constexpr double kGroundAnchorStep = 1000.0;
 
 // Couleurs de la voie, portées par le base_color_factor de leur matériau (M8 étape 3).
 // Valeurs LINÉAIRES (la conversion sRGB est matérielle).
@@ -165,11 +161,18 @@ constexpr double kViaductStep = 250.0;
 constexpr double kStationSpacing = 2000.0;
 constexpr double kStationLength = 150.0;  // = StationProfile::length
 
-constexpr double kBuildingCell = 30.0;        // une cellule de semis, en mètres (= CityGrid)
+constexpr double kBuildingCell = 30.0;        // une cellule de semis, en mètres
 constexpr double kBuildingHalfWidth = 380.0;  // portée latérale de part et d'autre du viaduc
 constexpr double kBuildingRange = 700.0;      // au-delà, une tour de 100 m fond dans la nuit
-constexpr double kBuildingCorridor = 20.0;    // M45 : distance minimale centre-immeuble ↔ axe voie
+constexpr double kBuildingPadding = 3.0;      // M51 : vide MINIMAL entre deux bâtiments
 constexpr int kBuildingVariants = 3;          // tower / block / slab (gen_building.py)
+
+// --- M51 : LE CORRIDOR SANITAIRE --------------------------------------------
+// Les deux seules distances qui décident de l'occupation du sol. Elles sont ici, en
+// clair, et nulle part ailleurs : c'est ce qui rend la règle vérifiable. Toute
+// géométrie semée dans le monde passe par is_space_clear(), qui ne connaît qu'elles.
+constexpr double kTrackClearance = 25.0;    // règle 1 : emprise de la voie
+constexpr double kStationClearance = 45.0;  // règle 2 : emprise d'une gare (plus large)
 
 // --- Calibrage des modèles importés (M9) ------------------------------------
 // Un modèle trouvé sur internet n'a JAMAIS la bonne échelle, la bonne orientation ni la
@@ -213,56 +216,6 @@ std::uint32_t hash_u32(std::uint32_t x) {
     x *= 0x846ca68bU;
     x ^= x >> 16;
     return x;
-}
-
-float hash_unit(std::uint32_t x, std::uint32_t y) {
-    return static_cast<float>(hash_u32(x * 374761393U + y * 668265263U)) /
-           static_cast<float>(0xffffffffU);
-}
-
-// Bruit de valeur lissé et RACCORDABLE (indices modulo `cells`) : la texture étant
-// répétée sur tout le sol, une couture serait visible à chaque période.
-float value_noise(float u, float v, std::uint32_t cells) {
-    const float sx = u * static_cast<float>(cells);
-    const float sy = v * static_cast<float>(cells);
-    const auto ix = static_cast<std::uint32_t>(sx);
-    const auto iy = static_cast<std::uint32_t>(sy);
-    const float tx = sx - static_cast<float>(ix);
-    const float ty = sy - static_cast<float>(iy);
-    const float ux = tx * tx * (3.0f - 2.0f * tx);  // lissage cubique (pas d'arêtes)
-    const float uy = ty * ty * (3.0f - 2.0f * ty);
-    const float a = hash_unit(ix % cells, iy % cells);
-    const float b = hash_unit((ix + 1) % cells, iy % cells);
-    const float c = hash_unit(ix % cells, (iy + 1) % cells);
-    const float d = hash_unit((ix + 1) % cells, (iy + 1) % cells);
-    return glm::mix(glm::mix(a, b, ux), glm::mix(c, d, ux), uy);
-}
-
-unsigned char to_srgb_byte(float v) {
-    return static_cast<unsigned char>(std::clamp(v, 0.0f, 1.0f) * 255.0f + 0.5f);
-}
-
-// Sol urbain (M31) : asphalte et béton sombres, 2 octaves de bruit lissé, généré à la
-// volée (aucun asset). La texture est RGBA8 SRGB => les octets écrits ici sont des
-// valeurs sRGB, que le matériel reconvertit en linéaire à l'échantillonnage.
-std::vector<unsigned char> make_ground_pixels(std::uint32_t size) {
-    std::vector<unsigned char> pixels(static_cast<std::size_t>(size) * size * 4u);
-    const glm::vec3 dark{0.15f, 0.15f, 0.16f};    // asphalte
-    const glm::vec3 light{0.30f, 0.30f, 0.31f};   // béton usé
-    for (std::uint32_t y = 0; y < size; ++y) {
-        for (std::uint32_t x = 0; x < size; ++x) {
-            const float u = (static_cast<float>(x) + 0.5f) / static_cast<float>(size);
-            const float v = (static_cast<float>(y) + 0.5f) / static_cast<float>(size);
-            const float n = 0.65f * value_noise(u, v, 4) + 0.35f * value_noise(u, v, 16);
-            const glm::vec3 c = glm::mix(dark, light, n);
-            const std::size_t o = (static_cast<std::size_t>(y) * size + x) * 4u;
-            pixels[o + 0] = to_srgb_byte(c.r);
-            pixels[o + 1] = to_srgb_byte(c.g);
-            pixels[o + 2] = to_srgb_byte(c.b);
-            pixels[o + 3] = 255;
-        }
-    }
-    return pixels;
 }
 
 }  // namespace
@@ -318,10 +271,9 @@ struct Application::Impl {
           window(platform::WindowConfig{config.width, config.height, config.title}),
           engine(EngineConfig{config.simulation_hz, 0}),
           track(kTrackOrigin),
-          terrain(track),
+          terrain(track, make_terrain_config()),
           consist(make_metro_config(), make_consist_config()),
           streamer(track, jobs, make_streamer_config()),
-          clipmap(terrain, jobs, make_clipmap_config()),
           resources(renderer, jobs, asset_paths) {}
 
     static physics::ConsistConfig make_consist_config() {
@@ -334,12 +286,18 @@ struct Application::Impl {
         return cc;
     }
 
-    static scene::ClipmapConfig make_clipmap_config() {
-        scene::ClipmapConfig cc;
-        // Les UV se calent sur l'origine de la voie : fixe, donc la texture ne glisse
-        // jamais, et les valeurs restent petites malgré des coordonnées monde à 7 chiffres.
-        cc.uv_origin = glm::dvec2(kTrackOrigin.x, kTrackOrigin.z);
-        return cc;
+    // M51 — SOL UNIFIÉ, jusque dans le modèle de terrain. Le sol de la ville est UN
+    // plan à Y = 0 ; l'amplitude du relief est donc mise à ZÉRO, ce qui rend
+    // Terrain::height() identiquement nulle. Ce n'est pas cosmétique : c'est ce qui
+    // garantit qu'il n'existe qu'UNE SEULE définition du niveau du sol dans tout le
+    // moteur. Les piles du viaduc s'ancrent à height() - 2 m, les immeubles à
+    // height() : tout retombe sur le plan, et il devient IMPOSSIBLE qu'une géométrie
+    // flotte ou s'enterre parce qu'elle aurait consulté une autre source de vérité.
+    // Terrain reste vivant pour distance_to_track(), coeur du corridor sanitaire.
+    static TerrainConfig make_terrain_config() {
+        TerrainConfig tc;
+        tc.amplitude = 0.0;
+        return tc;
     }
 
     static scene::StreamerConfig make_streamer_config() {
@@ -373,7 +331,6 @@ struct Application::Impl {
     physics::Consist consist;
     physics::Wagon& wagon = consist.loco();
     scene::WorldStreamer streamer;
-    scene::TerrainClipmap clipmap;
 
     audio::AudioEngine audio;
     audio::RailAudio rail_audio;
@@ -396,9 +353,6 @@ struct Application::Impl {
     resource::TextureHandle ballast_arm;
     resource::TextureHandle ballast_nor;
     bool ballast_textured = false;
-    // Splatting du terrain (M11 phase 2) : deux jeux PBR complets, herbe et craie.
-    std::array<resource::TextureHandle, 6> terrain_maps;
-    bool terrain_textured = false;
 
     // Bâtiments (M31) : un tampon d'instances PAR VARIANTE (le pipeline instancié ne
     // connaît qu'une échelle uniforme, la variété des proportions est dans les modèles).
@@ -426,12 +380,12 @@ struct Application::Impl {
     bool hassha_source_applied = false;
     bool ats_source_applied = false;
 
-    // Sol : plan solide texturé (M8 étape 2), il reçoit l'ombre portée du train.
-    // Secours du terrain tant que ses textures Poly Haven ne sont pas arrivées. Le
-    // MAILLAGE plat, lui, est mort avec le clipmap (M11 phase 1) : il était encore
-    // créé sur le GPU sans jamais être dessiné.
-    render::TextureId ground_texture = 0;
+    // Sol unifié (M51) : LE sol du monde. Un quad créé une fois pour toutes, une
+    // couleur unie, une origine ré-ancrée par pas de 1 km. Il reçoit l'ombre portée
+    // du train comme n'importe quelle surface opaque.
+    render::MeshId ground_mesh = 0;
     render::MaterialId ground_material = 0;
+    WorldPosition ground_origin{};
     // Voie : trois matériaux partagés par toutes les tuiles (M9). Sans texture pour
     // l'instant — les UV sont générés et à l'échelle physique, prêts à en recevoir.
     render::MaterialId rail_material = 0;
@@ -469,13 +423,6 @@ struct Application::Impl {
     bool viaduct_valid = false;
     render::MaterialId sleeper_material = 0;
     render::MaterialId ballast_material = 0;
-    // Terrain : secours = le sol procédural, remplacé par le splatting dès qu'il est prêt.
-    render::MaterialId terrain_material = 0;
-
-    // --- Sol urbain (M48) : une nappe de béton, c'est tout ---------------------
-    render::MeshId road_mesh = 0;       // nappe de sol (nom historique)
-    render::MaterialId road_material = 0;
-    WorldPosition city_grid_origin{};
 
     // --- Gares (M48) : façades de quai vitrées + signalétique émissive ---------
     render::MeshId psd_mesh = 0;
@@ -534,9 +481,7 @@ struct Application::Impl {
                voiture_model && voiture_model->ready &&  // + les voitures (M16 : rame entière)
                jacobs_bogie_model && jacobs_bogie_model->ready &&  // + les bogies Jacobs
                ballast_textured &&                      // les 3 cartes du ballast
-               terrain_textured &&                      // les 6 cartes du splatting
-               streamer.active_chunk_count() > 0 &&     // au moins une tuile de voie
-               clipmap.ready();                         // et le relief sous le train
+               streamer.active_chunk_count() > 0;       // au moins une tuile de voie
     }
 
     float orbit_yaw = 3.14159f;
@@ -633,16 +578,19 @@ struct Application::Impl {
         jobs.start(2);
         audio.initialize();  // non fatal : no-op si aucun périphérique audio
 
-        // Sol : maillage indexé MeshVertex (pipeline texturé => il reçoit les ombres)
-        // + sa texture générée à la volée. Les deux montent en GPU de façon asynchrone.
-        const std::vector<unsigned char> ground_pixels = make_ground_pixels(kGroundTextureSize);
-        ground_texture =
-            renderer.create_texture(kGroundTextureSize, kGroundTextureSize, ground_pixels.data());
+        // --- SOL UNIFIÉ (M51) : UN quad, UNE couleur, créé ICI et jamais refait ----
+        // Aucune texture : une texture répétée sur 24 km rejouerait exactement le bug
+        // qu'on vient d'éteindre (grille visible, couture à chaque période, aliasing
+        // au loin). Couleur unie, donc rien ne peut moirer ni clignoter.
+        const scene::RailMeshData plane = scene::generate_ground_plane(kGroundHalfExtent);
+        ground_mesh = renderer.create_mesh_indexed(plane.vertices, plane.indices);
         render::MaterialDesc ground_desc;
-        ground_desc.base_color = ground_texture;
-        ground_desc.metallic_factor = 0.0f;   // terre/herbe : diélectrique
+        ground_desc.base_color_factor = glm::vec4(0.11f, 0.12f, 0.12f, 1.0f);  // gris très sombre
+        ground_desc.metallic_factor = 0.0f;    // béton : diélectrique
         ground_desc.roughness_factor = 0.95f;  // totalement mat
         ground_material = renderer.create_material(ground_desc);
+        log::info("M51 : sol unifié — 1 quad de {:.0f} km de côté, à Y = 0",
+                  2.0 * kGroundHalfExtent / 1000.0);
 
         // Voie (M9) : pas de texture, la couleur vient du seul base_color_factor (le
         // secours blanc 1x1 le laisse passer tel quel).
@@ -776,13 +724,6 @@ struct Application::Impl {
         voiture_model = resources.load_model("models/metro_voiture.glb");
         jacobs_bogie_model = resources.load_model("models/metro_bogie.glb");
 
-        // Sol urbain (M48) : nappe de béton gris foncé.
-        render::MaterialDesc road_desc;
-        road_desc.base_color_factor = glm::vec4(0.14f, 0.15f, 0.17f, 1.0f);
-        road_desc.metallic_factor = 0.05f;
-        road_desc.roughness_factor = 0.85f;
-        road_material = renderer.create_material(road_desc);
-
         // Gares (M48) : verre des façades de quai (BLEND, après les opaques) et
         // signalétique suspendue émissive (panneau blanc chaud HDR).
         render::MaterialDesc psd_desc;
@@ -833,18 +774,10 @@ struct Application::Impl {
         ballast_nor = resources.load_texture("textures/ballast/gravel_nor_gl.jpg",
                                              render::TextureFormat::LinearData);
 
-        // Terrain (Poly Haven CC0). `aerial_grass_rock` est une texture AÉRIENNE, pensée
-        // pour être vue de dessus : c'est exactement notre cas. Même règle qu'ailleurs —
-        // l'espace colorimétrique est dicté par le RÔLE, pas par le fichier.
-        const char* terrain_files[6] = {
-            "textures/terrain/grass_diff.jpg", "textures/terrain/grass_arm.jpg",
-            "textures/terrain/grass_nor_gl.jpg", "textures/terrain/chalk_diff.jpg",
-            "textures/terrain/chalk_arm.jpg", "textures/terrain/chalk_nor_gl.jpg"};
-        for (std::size_t i = 0; i < 6; ++i) {
-            terrain_maps[i] = resources.load_texture(
-                terrain_files[i], i % 3 == 0 ? render::TextureFormat::SrgbColor
-                                             : render::TextureFormat::LinearData);
-        }
+        // M51 : les 6 cartes de splatting du terrain (herbe/craie) ne sont plus
+        // chargées — plus rien ne les échantillonne depuis que le sol est un quad uni.
+        // C'est ~40 Mio de VRAM et 6 décodages JPEG en moins au démarrage.
+
         // Ciel HDR (M8 étape 6a). 1024 par face => ~64 Mio de VRAM avec les mips, le
         // compromis retenu pour un iGPU. Absent => le fond uni est conservé.
         sky = resources.load_environment("textures/sky/kloofendal_puresky_2k.hdr", 1024);
@@ -1383,35 +1316,34 @@ struct Application::Impl {
         return hud;
     }
 
-    // M48 — Sol urbain : UNE nappe de béton gris foncé qui épouse le terrain.
-    // Décision de game design : plus de routes, trottoirs, lampadaires ni
-    // intersections — le focus est sur le train, les gares et les immeubles.
-    void reseed_city_grid() {
+    // M51 — Ré-ancrage du sol unifié. Ce n'est PAS une régénération : le maillage
+    // (4 sommets) est créé une fois pour toutes au démarrage, on ne déplace que son
+    // origine, par pas de 1 km, pour que ses 24 km de côté restent centrés sur le
+    // train sans jamais que ses coordonnées relatives ne perdent en précision.
+    // Y reste rigoureusement à 0 : le sol ne monte ni ne descend, JAMAIS.
+    void update_ground_anchor() {
         const WorldPosition wp = wagon.body_position();
-        WorldPosition grid_center = wp;
-        grid_center.y = 0.0;  // Origine Y monde = 0.0 pour aligner avec terrain.height()
-
-        const auto sampler = [this](double wx, double wz) {
-            return terrain.height(wx, wz);
-        };
-        // M49 : portée très large (2,5 km) — UNE nappe unifiée qui couvre toute la
-        // ville visible, fini le patchwork gris/vert aux frontières.
-        auto ground = scene::generate_ground_sheet(sampler, grid_center, 2500.0);
-
-        if (road_mesh != 0) {
-            renderer.destroy_mesh(road_mesh);
-            road_mesh = 0;
-        }
-        if (!ground.empty()) {
-            road_mesh = renderer.create_mesh_indexed(ground.vertices, ground.indices);
-        }
-        city_grid_origin = grid_center;
+        const double ax = std::round(wp.x / kGroundAnchorStep) * kGroundAnchorStep;
+        const double az = std::round(wp.z / kGroundAnchorStep) * kGroundAnchorStep;
+        ground_origin = WorldPosition{ax, 0.0, az};
     }
 
-    // --- Bâtiments (M47/M48) : hyper-densité sur la nappe de béton --------------
-    void reseed_buildings() {
-        reseed_city_grid();  // la nappe de sol suit le train
+    // --- M51 : LE CORRIDOR SANITAIRE -----------------------------------------
+    // La règle elle-même vit dans scene::is_space_clear (fonction PURE, testable,
+    // réutilisable par tout futur semis : props, végétation, mobilier). L'app ne
+    // fait que lui passer les distances du monde — et elle les tient d'un seul
+    // endroit, les constantes ci-dessus, partagées avec la génération des gares.
+    [[nodiscard]] bool is_space_clear(double wx, double wz, double footprint = 0.0) const {
+        scene::ExclusionZones zones;
+        zones.track_clearance = kTrackClearance;
+        zones.station_clearance = kStationClearance;
+        zones.station_spacing = kStationSpacing;
+        zones.station_length = kStationLength;
+        return scene::is_space_clear(terrain, wx, wz, footprint, zones);
+    }
 
+    // --- Bâtiments (M47/M48/M51) : hyper-densité SUR le sol unifié --------------
+    void reseed_buildings() {
         const WorldPosition wp = wagon.body_position();
         std::array<std::vector<render::InstanceData>, kBuildingVariants> seeded;
         const auto cells = static_cast<long>(kBuildingRange / kBuildingCell) + 1;
@@ -1443,6 +1375,23 @@ struct Application::Impl {
                 constexpr float kModelFootprints[kBuildingVariants] = {22.0f, 30.0f, 42.0f};
                 constexpr float kHalfDiag[kBuildingVariants] = {15.6f, 21.2f, 23.7f};
 
+                // M51 — PADDING GARANTI PAR CONSTRUCTION. Chaque immeuble est
+                // inscrit dans une parcelle, et son empreinte à l'échelle est bornée
+                // par (pas de la parcelle - kBuildingPadding). Deux voisins laissent
+                // donc toujours au moins kBuildingPadding entre eux, qu'ils soient
+                // dans la même cellule ou de part et d'autre d'une frontière :
+                //   * cellule subdivisée : pas de 15 m => empreinte <= 12 m ;
+                //   * cellule pleine     : pas de 30 m => empreinte <= 27 m ;
+                //   * de chaque côté d'une frontière, chacun se retire de la moitié
+                //     du padding, donc l'écart vaut encore kBuildingPadding.
+                // Les rotations d'instance sont des multiples de 90°, et l'empreinte
+                // retenue est le PLUS GRAND côté du gabarit : tourner ne peut pas
+                // faire déborder un bâtiment de sa parcelle.
+                constexpr double kSubPitch = kBuildingCell * 0.5;      // 15 m
+                constexpr auto kSubFoot = static_cast<float>(kSubPitch - kBuildingPadding);
+                constexpr auto kFullFoot = static_cast<float>(kBuildingCell - kBuildingPadding);
+                constexpr double kQ = kSubPitch * 0.5;                 // centre de sous-parcelle
+
                 const bool subdivide = (h1 & 1u) != 0u;
                 struct SubPlot {
                     double dx, dz;
@@ -1450,11 +1399,11 @@ struct Application::Impl {
                     std::uint32_t hash;
                 };
                 const std::array<SubPlot, 4> subs = subdivide
-                    ? std::array<SubPlot, 4>{{{-7.25, -7.25, 13.5f, h1},
-                                              {7.25, -7.25, 13.5f, h2},
-                                              {7.25, 7.25, 13.5f, h3},
-                                              {-7.25, 7.25, 13.5f, h4}}}
-                    : std::array<SubPlot, 4>{{{0.0, 0.0, 26.0f, h3},
+                    ? std::array<SubPlot, 4>{{{-kQ, -kQ, kSubFoot, h1},
+                                              {kQ, -kQ, kSubFoot, h2},
+                                              {kQ, kQ, kSubFoot, h3},
+                                              {-kQ, kQ, kSubFoot, h4}}}
+                    : std::array<SubPlot, 4>{{{0.0, 0.0, kFullFoot, h3},
                                               {0.0, 0.0, 0.0f, 0u},
                                               {0.0, 0.0, 0.0f, 0u},
                                               {0.0, 0.0, 0.0f, 0u}}};
@@ -1478,20 +1427,25 @@ struct Application::Impl {
                     const float scale = std::min(desired_h / kModelHeights[variant],
                                                  sub.max_foot / kModelFootprints[variant]);
 
-                    // M45 — CORRIDOR DE SÉCURITÉ ABSOLU : distance euclidienne réelle
-                    // à l'axe de la voie, empreinte comprise. Aucun mur ne traverse
-                    // le viaduc.
-                    const double clearance =
-                        kBuildingCorridor + static_cast<double>(kHalfDiag[variant]) * scale;
-                    if (terrain.distance_to_track(px, pz) < clearance ||
+                    // M51 — EXCLUSION ABSOLUE : un seul test, celui du corridor
+                    // sanitaire, avec l'empreinte réelle du bâtiment. Il couvre la
+                    // voie (25 m) ET les gares (45 m) : plus aucune tour ne peut
+                    // pousser contre un quai ni engloutir une verrière.
+                    const auto footprint =
+                        static_cast<double>(kHalfDiag[variant]) * static_cast<double>(scale);
+                    if (!is_space_clear(px, pz, footprint) ||
                         std::abs(pz - wp.z) > kBuildingHalfWidth) {
                         continue;
                     }
 
                     render::InstanceData inst;
-                    const double h = terrain.height(px, pz) - 4.0;
+                    // Le sol est UN plan à Y = 0 : l'assise est donc connue sans
+                    // échantillonner quoi que ce soit. 0,5 m d'enfoncement — assez
+                    // pour qu'aucune face de base ne soit coplanaire avec le sol
+                    // (le Z-fighting qu'on vient d'éliminer), pas assez pour rogner
+                    // le rez-de-chaussée.
                     inst.position_scale = glm::vec4(
-                        glm::vec3(glm::dvec3(px, h, pz) - wp), scale);
+                        glm::vec3(glm::dvec3(px, -0.5, pz) - wp), scale);
 
                     // Décalage d'UVs unique par bâtiment (M37 anti-clones)
                     const float u_off = static_cast<float>((sh >> 4) & 0x0fu) * 0.25f;
@@ -1763,30 +1717,6 @@ struct Application::Impl {
             ballast_textured = true;  // une seule tentative, réussie ou non
         }
 
-        // Terrain texturé : le matériau de splatting est créé dès que les 6 cartes sont
-        // sur le GPU. Comme le ballast, on ne réécrit JAMAIS un matériau (son set serait
-        // en vol) : on en crée un neuf et on change la référence.
-        if (!terrain_textured) {
-            bool all = true;
-            for (const auto& h : terrain_maps) {
-                all = all && h && h->id != 0;
-            }
-            if (all) {
-                render::TerrainMaterialDesc td;
-                td.grass_base = terrain_maps[0]->id;
-                td.grass_metallic_rough = terrain_maps[1]->id;
-                td.grass_normal = terrain_maps[2]->id;
-                td.chalk_base = terrain_maps[3]->id;
-                td.chalk_metallic_rough = terrain_maps[4]->id;
-                td.chalk_normal = terrain_maps[5]->id;
-                if (const render::MaterialId m = renderer.create_terrain_material(td)) {
-                    terrain_material = m;
-                    log::info("M11 : terrain splatté (herbe + craie Poly Haven CC0)");
-                }
-                terrain_textured = true;
-            }
-        }
-
         if (!model_ready_reported && train_model && train_model->ready) {
             log::info("M10 : motrice E235 procédurale chargée — {} primitive(s), cubes masqués",
                       train_model->primitives.size());
@@ -1826,7 +1756,7 @@ struct Application::Impl {
         streamer.update(wagon.chainage(), renderer);
         update_catenary();
         update_viaduct();
-        clipmap.update(wagon.body_position(), renderer);
+        update_ground_anchor();
 
         // Bâtiments : re-semés quand le train franchit une cellule. Le semis étant
         // déterministe, les immeubles déjà présents retombent EXACTEMENT au même endroit —
@@ -2070,14 +2000,14 @@ struct Application::Impl {
 
         std::vector<render::DrawItem> items;
 
-        // Terrain (M11) : geo-clipmap centré sur le train. Il remplace le plan plat, qui
-        // ne pouvait par construction ni onduler ni suivre la voie. UN seul maillage pour
-        // les 7 niveaux => un seul draw call, un seul upload par régénération.
-        if (clipmap.ready()) {
-            items.push_back(render::DrawItem{camera.relative_model(clipmap.origin()),
-                                             clipmap.mesh(),
-                                             terrain_material != 0 ? terrain_material
-                                                                   : ground_material});
+        // SOL UNIFIÉ (M51) : le seul et unique sol du monde. Un draw call, 2 triangles,
+        // aucune régénération — il remplace À LA FOIS le geo-clipmap du terrain et la
+        // nappe urbaine, dont la superposition était la cause du damier et des
+        // « plaques de béton ». Deux surfaces de sol ne peuvent plus coexister : il
+        // n'y en a plus qu'une dans tout le moteur.
+        if (ground_mesh != 0 && ground_material != 0) {
+            items.push_back(render::DrawItem{camera.relative_model(ground_origin),
+                                             ground_mesh, ground_material});
         }
 
         // Voie streamée (une origine par tuile) : 3 sous-maillages, 3 matériaux (M9).
@@ -2132,12 +2062,6 @@ struct Application::Impl {
         if (viaduct_mesh != 0) {
             items.push_back(render::DrawItem{camera.relative_model(viaduct_origin),
                                              viaduct_mesh, viaduct_material});
-        }
-
-        // Sol urbain (M48) : nappe de béton.
-        if (road_mesh != 0 && road_material != 0) {
-            items.push_back(render::DrawItem{camera.relative_model(city_grid_origin),
-                                             road_mesh, road_material});
         }
 
         // Signalétique des gares (M48) : panneaux suspendus émissifs, opaques.

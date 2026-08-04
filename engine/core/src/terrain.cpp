@@ -106,7 +106,7 @@ double Terrain::fbm(double x, double z) const {
     return norm > 0.0 ? sum / norm : 0.0;  // ~[-1, 1]
 }
 
-double Terrain::distance_to_track(double wx, double wz) const {
+double Terrain::distance_to_track(double wx, double wz, double* out_chainage) const {
     // M45 : distance euclidienne RÉELLE à l'axe de la voie, et plus l'approximation
     // |wz - z(s)| qui n'était valable que pour une voie presque droite alignée sur X —
     // en courbe, elle laissait des immeubles paver le viaduc. On cherche le chainage
@@ -131,6 +131,9 @@ double Terrain::distance_to_track(double wx, double wz) const {
         lo = best_s - step;
         hi = best_s + step;
         step *= 0.1;
+    }
+    if (out_chainage != nullptr) {
+        *out_chainage = best_s;
     }
     return std::sqrt(best_d2);
 }
