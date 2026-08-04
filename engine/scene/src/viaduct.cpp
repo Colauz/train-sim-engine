@@ -227,16 +227,48 @@ StationMeshes generate_station(const TrackSource& track, double s_center,
         frames.push_back(f);
     }
 
-    // Quais : caissons fermés de part et d'autre du tablier, dessus à +1,10 m.
+    // --- Quais (M52) : nez de quai au gabarit de la rame, plancher de plain-pied ---
+    // Profil DÉCROCHÉ, en 6 points : le nez porte en encorbellement au-dessus de
+    // l'épaulement du ballast (on ne peut pas descendre un quai plein jusqu'au
+    // tablier à 1,55 m de l'axe — le plateau de ballast va jusqu'à 1,90 m), puis la
+    // dalle redescend sur le tablier une fois le pied du talus passé.
+    //
+    //        nez (1,55)                             rive (8,00)
+    //   +1,20  o------------------------------------o
+    //          |                                    |
+    //   -0,30  o--------o (2,70)                    |   <- au-dessus du ballast
+    //                   |                           |
+    //   -0,80          o---------------------------o     <- sur le tablier
     const float in = profile.platform_inner;
     const float out_w = profile.platform_outer;
     const float top = profile.platform_top;
     const float bottom = -0.80f;  // affleure le dessus du tablier
+    const float edge_bot = profile.edge_bottom;
+    const float edge_out = profile.edge_outer;
+    {
+        // Le décroché DOIT rester accordé au ballast : ces deux invariants sont la
+        // raison d'être du profil, et un changement de RailProfile doit casser ici,
+        // à la compilation, plutôt que sous forme de ballast à travers le quai.
+        constexpr RailProfile rail{};
+        static_assert(rail.ballast_crown_half > 1.55f,
+                      "Si le ballast se rétrécit sous 1,55 m, le décroché du nez de quai "
+                      "n'a plus lieu d'être : repasser le quai en profil plein.");
+        static_assert(rail.ballast_base_half < 2.70f,
+                      "Le pied du talus de ballast doit rester en deçà de edge_outer, "
+                      "sinon le quai le traverse.");
+    }
     for (const float sign : {-1.0f, 1.0f}) {
-        const float a = sign * in, b = sign * out_w;
-        const std::vector<P2> platform = {
-            {a, bottom}, {b, bottom}, {b, top}, {a, top},
+        const float a = sign * in, b = sign * out_w, m = sign * edge_out;
+        std::vector<P2> platform = {
+            {a, edge_bot}, {m, edge_bot}, {m, bottom}, {b, bottom}, {b, top}, {a, top},
         };
+        // Le miroir INVERSE le sens de parcours, donc les normales sortantes. Sans ce
+        // retournement, le quai de gauche est engendré à l'envers : il ne s'éclaire
+        // pas comme celui de droite et disparaît dès que le rendu élimine les faces
+        // arrière. Le profil reste rigoureusement le même — seul l'ordre change.
+        if (sign < 0.0f) {
+            std::reverse(platform.begin(), platform.end());
+        }
         extrude(out, frames, platform, uv_period);
     }
 
@@ -302,46 +334,102 @@ StationMeshes generate_station(const TrackSource& track, double s_center,
         }
     }
 
-    // M48/M49 — Façades de quai (platform screen doors, style Tokyo) : panneaux
-    // vitrés ALTERNÉS sur la trame de 2,5 m — un fixe, un mobile. Le panneau mobile
-    // est décalé de 4 cm vers le quai : en coulissant (translation du DrawItem, côté
-    // app) il passe devant le fixe sans jamais le toucher (zéro Z-fighting).
-    const float psd = profile.platform_inner + profile.psd_offset;
-    const long f0 = static_cast<long>(std::ceil(s0 / 2.5));
-    const long f1 = static_cast<long>(std::floor(s1 / 2.5));
-    for (long k = f0; k < f1; ++k) {
-        const double s = (static_cast<double>(k) + 0.5) * 2.5;
+    // --- M52 : FAÇADE DE QUAI CALQUÉE SUR LE PLAN DE PORTES DE LA RAME --------
+    // Fini la clôture générique sur trame de 2,5 m, qui ne tombait en face d'une
+    // porte de rame que par hasard. On parcourt le quai d'un bout à l'autre en
+    // s'arrêtant à chaque porte : baie ouvrante EXACTEMENT à son chainage et
+    // EXACTEMENT à sa largeur (2 x door_half = 1,30 m, la cote du gabarit), verre
+    // fixe sur tout le reste. Les montants opaques encadrent la baie PAR L'EXTÉRIEUR
+    // pour ne pas rogner le passage.
+    //
+    // Latéralement, tout est indexé sur le nez de quai `in` (1,55 m) :
+    //   * le vitrage fixe a sa FACE côté voie exactement au nez de quai ;
+    //   * les vantaux mobiles sont 7 cm en retrait, donc ils coulissent DERRIÈRE le
+    //     vitrage fixe sans jamais le toucher (aucun Z-fighting possible).
+    const float psd_face = in + profile.psd_offset;
+    const float psd_lat = psd_face + profile.psd_thickness;          // axe du vitrage fixe
+    const float leaf_lat = psd_lat + 2.0f * profile.psd_thickness + 0.01f;  // axe des vantaux
+    const float psd_mid_y = top + profile.psd_height * 0.5f;
+    const float psd_hh = profile.psd_height * 0.5f;
+    const float jamb = profile.jamb_half;
+
+    // Un élément de façade : une boîte centrée au chainage `sc`, longue de 2*half_len,
+    // posée des DEUX côtés de la voie (symétrie M51).
+    const auto add_panel = [&](RailMeshData& dst, double sc, float half_len, float lateral) {
+        if (half_len <= 0.0f) {
+            return;
+        }
         glm::dvec3 pos_world;
         glm::dvec3 tangent;
-        track.sample(s, pos_world, tangent);
-        const glm::vec3 forward = glm::vec3(glm::normalize(tangent));
-        const glm::vec3 right = glm::normalize(glm::cross(forward, world_up));
-        const bool is_door = (k % 2 != 0);
+        track.sample(sc, pos_world, tangent);
+        const glm::vec3 fwd = glm::vec3(glm::normalize(tangent));
+        const glm::vec3 rgt = glm::normalize(glm::cross(fwd, world_up));
+        // On monte selon la NORMALE DE LA VOIE, pas selon la verticale du monde.
+        // Le quai est extrudé dans ce repère : s'élever verticalement depuis un rail
+        // en pente fait glisser le panneau LE LONG du quai (hauteur x pente, soit
+        // 18 mm à 2,10 m sur une rampe de 0,9 %) — assez pour décaler une baie par
+        // rapport à la porte de rame qu'elle doit encadrer au millimètre.
+        const glm::vec3 up = glm::normalize(glm::cross(rgt, fwd));
         for (const float sign : {-1.0f, 1.0f}) {
-            const float lateral = sign * (psd + 0.03f) + (is_door ? sign * 0.04f : 0.0f);
-            const glm::vec3 mid = glm::vec3(pos_world - origin) + right * lateral +
-                                  glm::vec3(0.0f, top + profile.psd_height * 0.5f, 0.0f);
-            add_box(is_door ? meshes.psd_doors : meshes.glass, mid, right, forward,
-                    glm::vec3(0.0f, 1.0f, 0.0f),
-                    glm::vec3(0.03f, profile.psd_height * 0.5f, 1.2f), uv_period);
+            const glm::vec3 mid = glm::vec3(pos_world - origin) + rgt * (sign * lateral) +
+                                  up * psd_mid_y;
+            // Le panneau est dressé selon la NORMALE DE LA VOIE et non d'aplomb sur
+            // le monde. C'est la porte de la RAME qu'il doit épouser : elle est
+            // solidaire de la caisse, donc inclinée de la pente. Un panneau d'aplomb
+            // voit ses arêtes haute et basse se décaler de 8 mm le long du quai sur
+            // une rampe de 0,9 % — la baie ne serait plus « au millimètre ».
+            add_box(dst, mid, rgt, fwd, up,
+                    glm::vec3(profile.psd_thickness, psd_hh, half_len), uv_period);
+        }
+    };
+    // Verre FIXE entre deux baies : découpé en panneaux de `panel_max` au plus, pour
+    // que la façade suive la courbure de la voie au lieu de la couper à la corde.
+    const auto add_fixed_run = [&](double from, double to) {
+        const double len = to - from;
+        if (len <= 0.01) {
+            return;
+        }
+        const int n = std::max(1, static_cast<int>(std::ceil(len / profile.panel_max)));
+        const double seg = len / n;
+        for (int i = 0; i < n; ++i) {
+            add_panel(meshes.glass, from + (static_cast<double>(i) + 0.5) * seg,
+                      static_cast<float>(seg * 0.5), psd_lat);
+        }
+    };
+
+    // Les portes, converties en chainage et triées. `door_centers` donne des
+    // distances d'ARC depuis le centre de la gare — c'est la seule unité qui a un
+    // sens ici, puisque c'est en distance d'arc que la physique place les voitures.
+    // Les additionner au chainage comme si c'était la même chose décalait les baies
+    // d'autant plus que la voiture était loin de la motrice (cf. chainage_at_arc).
+    std::vector<double> doors;
+    doors.reserve(profile.door_centers.size());
+    for (const double rel : profile.door_centers) {
+        const double sc = chainage_at_arc(track, s_center, rel);
+        const double half_bay = static_cast<double>(profile.door_half + 2.0f * jamb);
+        if (sc - half_bay > s0 && sc + half_bay < s1) {
+            doors.push_back(sc);
         }
     }
-    // Cadres opaques aux jointures de la trame.
-    for (long k = f0; k <= f1; ++k) {
-        const double s = static_cast<double>(k) * 2.5;
-        glm::dvec3 pos_world;
-        glm::dvec3 tangent;
-        track.sample(s, pos_world, tangent);
-        const glm::vec3 forward = glm::vec3(glm::normalize(tangent));
-        const glm::vec3 right = glm::normalize(glm::cross(forward, world_up));
-        for (const float sign : {-1.0f, 1.0f}) {
-            const glm::vec3 mid = glm::vec3(pos_world - origin) +
-                                  right * (sign * (psd + 0.03f)) +
-                                  glm::vec3(0.0f, top + profile.psd_height * 0.5f, 0.0f);
-            add_box(out, mid, right, forward, glm::vec3(0.0f, 1.0f, 0.0f),
-                    glm::vec3(0.08f, profile.psd_height * 0.5f, 0.08f), uv_period);
-        }
+    std::sort(doors.begin(), doors.end());
+
+    double cursor = s0;
+    for (const double sc : doors) {
+        const double a = sc - static_cast<double>(profile.door_half);  // rive de la baie
+        const double b = sc + static_cast<double>(profile.door_half);
+        // Verre fixe jusqu'au montant, puis les deux montants qui bordent la baie.
+        add_fixed_run(cursor, a - 2.0 * static_cast<double>(jamb));
+        add_panel(out, a - static_cast<double>(jamb), jamb, psd_lat);
+        add_panel(out, b + static_cast<double>(jamb), jamb, psd_lat);
+        // Deux demi-vantaux bi-parting : `a` s'efface vers les chainages décroissants,
+        // `b` vers les croissants. Chacun fait la moitié de la baie, donc s'ouvrir de
+        // sa propre longueur suffit à dégager tout le passage.
+        const float leaf = profile.door_half * 0.5f;
+        add_panel(meshes.psd_doors, sc - static_cast<double>(leaf), leaf, leaf_lat);
+        add_panel(meshes.psd_doors_b, sc + static_cast<double>(leaf), leaf, leaf_lat);
+        cursor = b + 2.0 * static_cast<double>(jamb);
     }
+    add_fixed_run(cursor, s1);
 
     // M48 — Panneaux d'affichage suspendus sous la verrière, au-dessus de chaque quai.
     const long p0 = static_cast<long>(std::ceil(s0 / profile.sign_spacing));
@@ -362,17 +450,21 @@ StationMeshes generate_station(const TrackSource& track, double s_center,
         }
     }
 
-    // M49/M50 — Repère d'arrêt (stop marker). Il faisait la taille d'un immeuble
-    // en M49 ; il est ramené aux cotes RÉELLES d'un panneau de quai :
-    //   0,5 m x 0,5 m de plaque, 0,1 m d'épaisseur (demi-cotes 0,25/0,25/0,05),
-    //   carré tourné de 45° (le losange japonais), matériau émissif,
-    //   plaqué à +2,00 m au-dessus du plan de roulement — 12,0 m au chainage
-    //   nominal, soit la hauteur des yeux du conducteur en cabine (assis à
-    //   +0,25 m dans une caisse dont le plancher est à +1,05 m),
-    //   au bout du quai de droite (3 m de retrait depuis l'extrémité).
-    // L'épaisseur est portée par `forward` : la plaque FAIT FACE au train entrant.
+    // Repère d'arrêt (stop marker). Cotes M50, inchangées : plaque de 0,5 x 0,5 m,
+    // 0,1 m d'épaisseur (demi-cotes 0,25/0,25/0,05), carré tourné de 45° (le losange
+    // japonais), matériau émissif, à +2,00 m au-dessus du plan de roulement — la
+    // hauteur des yeux du conducteur. L'épaisseur est portée par `forward` : la
+    // plaque FAIT FACE au train entrant.
+    //
+    // M52 — SA POSITION. Elle était arbitraire (3 m avant le bout du quai) : le
+    // conducteur qui s'y alignait plaçait sa rame 40 m trop loin, portes en face du
+    // verre fixe. Le repère est désormais posé au chainage EXACT de la cabine quand
+    // le centre de la rame coïncide avec le centre de la gare — c'est-à-dire au
+    // point d'arrêt dont dérive aussi `door_centers`. Repère et baies vitrées
+    // viennent donc du MÊME calcul : s'aligner sur le losange, c'est nécessairement
+    // avoir chaque porte de la rame en face de sa baie.
     {
-        const double s_mark = s1 - 3.0;  // 3 m de retrait depuis l'extrémité du quai
+        const double s_mark = chainage_at_arc(track, s_center, profile.stop_marker_offset);
         glm::dvec3 pos_world;
         glm::dvec3 tangent;
         track.sample(s_mark, pos_world, tangent);
@@ -381,12 +473,19 @@ StationMeshes generate_station(const TrackSource& track, double s_center,
         const float k = 0.70710678f;  // cos/sin 45°
         const glm::vec3 diag_r = (right + glm::vec3(0.0f, 1.0f, 0.0f)) * k;
         const glm::vec3 diag_u = (glm::vec3(0.0f, 1.0f, 0.0f) - right) * k;
+        const float marker_y = 2.0f;
+        // Même règle que les façades : on s'élève selon la normale de la voie, sinon
+        // le losange glisse le long du quai sur les sections en pente — et c'est
+        // précisément le repère qui ne doit PAS bouger d'un millimètre.
+        const glm::vec3 up_frame = glm::normalize(glm::cross(right, forward));
         const glm::vec3 mid = glm::vec3(pos_world - origin) +
-                              right * ((in + out_w) * 0.5f) +
-                              glm::vec3(0.0f, 2.0f, 0.0f);  // Y = 12,0 m absolu
-        // Mât fin (4 cm) du dessus du quai au losange, dans le béton.
-        add_box(out, mid - glm::vec3(0.0f, 0.45f, 0.0f), right, forward,
-                glm::vec3(0.0f, 1.0f, 0.0f), glm::vec3(0.02f, 0.45f, 0.02f), uv_period);
+                              right * ((in + out_w) * 0.5f) + up_frame * marker_y;
+        // Mât fin (4 cm) du dessus du quai au losange, dans le béton. Sa hauteur suit
+        // le quai : elle se recalcule, elle n'est plus codée en dur (le quai est
+        // passé de +1,10 m à +1,20 m au M52, le mât aurait flotté).
+        const float mast_h = marker_y - top;
+        add_box(out, mid - glm::vec3(0.0f, mast_h * 0.5f, 0.0f), right, forward,
+                glm::vec3(0.0f, 1.0f, 0.0f), glm::vec3(0.02f, mast_h * 0.5f, 0.02f), uv_period);
         add_box(meshes.signs, mid, diag_r, forward, diag_u,
                 glm::vec3(0.25f, 0.25f, 0.05f), uv_period);  // 0,5 x 0,5 x 0,1 m
     }

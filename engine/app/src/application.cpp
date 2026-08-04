@@ -31,6 +31,7 @@
 #include "noire/scene/city_layout.hpp"
 #include "noire/scene/ground_plane.hpp"
 #include "noire/scene/track_mesh.hpp"
+#include "noire/scene/train_layout.hpp"
 #include "noire/scene/viaduct.hpp"
 #include "noire/scene/world_streamer.hpp"
 
@@ -161,6 +162,21 @@ constexpr double kViaductStep = 250.0;
 constexpr double kStationSpacing = 2000.0;
 constexpr double kStationLength = 150.0;  // = StationProfile::length
 
+// --- M52 : GÉOMÉTRIE DE LA RAME ----------------------------------------------
+// Tout ce qui doit « tomber en face » du train — baies des façades de quai, repère
+// d'arrêt, point d'arrêt de précision — se dérive de CE plan, et de nulle part
+// ailleurs (cf. scene::TrainLayout, qui porte aussi le pourquoi). La physique de la
+// rame en sort également : impossible que la gare et le train décrivent deux rames
+// différentes, puisqu'il n'y en a qu'une de décrite.
+inline const scene::TrainLayout& train_layout() {
+    static const scene::TrainLayout layout{};
+    return layout;
+}
+// Tolérance de l'arrêt de précision : au-delà, les portes de quai restent closes.
+// C'est du GAMEPLAY (la difficulté de l'exercice), pas de la géométrie — d'où sa
+// place ici et non dans TrainLayout.
+constexpr double kStopTolerance = 0.5;
+
 constexpr double kBuildingCell = 30.0;        // une cellule de semis, en mètres
 constexpr double kBuildingHalfWidth = 380.0;  // portée latérale de part et d'autre du viaduc
 constexpr double kBuildingRange = 700.0;      // au-delà, une tour de 100 m fond dans la nuit
@@ -278,12 +294,44 @@ struct Application::Impl {
 
     static physics::ConsistConfig make_consist_config() {
         physics::ConsistConfig cc;
-        cc.car_count = 2;              // motrice + 2 voitures (rame de 3)
-        cc.loco_half_length = 10.0;    // voiture de 20 m
-        cc.car_spacing = 20.5;         // 20 m de caisse + 0,5 m d'intercirculation
-        cc.head_to_first_jacobs = 0.6;
+        // M52 : la composition vient du PLAN DE LA RAME, comme la géométrie de gare.
+        const scene::TrainLayout& tl = train_layout();
+        cc.car_count = tl.car_count;
+        cc.loco_half_length = tl.loco_half_length;
+        cc.car_spacing = tl.car_spacing;
+        cc.head_to_first_jacobs = tl.head_to_first_jacobs;
         cc.ats_margin_kmh = 5.0;       // ATS : tolérance avant l'urgence (métro = strict)
         return cc;
+    }
+
+    // M52 — Écart signé au point d'arrêt idéal de la gare la plus proche, en mètres.
+    // Positif = la rame a DÉPASSÉ le repère. C'est la grandeur que le conducteur
+    // cherche à annuler, et la seule qui décide de l'ouverture des portes de quai.
+    [[nodiscard]] double stop_error() const {
+        const double x = wagon.chainage();
+        const double stop = train_layout().stop_offset();
+        // Gare la plus proche (l'offset ~20 m est négligeable devant l'entraxe de
+        // 2 km : l'arrondi ne peut pas se tromper de gare).
+        const double nearest = std::round((x - stop) / kStationSpacing) * kStationSpacing;
+        // Point d'arrêt EXACT : `stop` est une distance d'arc, pas un chainage.
+        // La confondre décalait la cible de quelques centimètres ici, et jusqu'à
+        // plusieurs dizaines là où la voie serpente — sur une tolérance de 50 cm.
+        return x - chainage_at_arc(track, nearest, stop);
+    }
+
+    // M52 — Le profil de gare, DÉRIVÉ de la rame. La gare ne devine rien : on lui
+    // remet le plan de portes du train (chainages relatifs au centre de la gare,
+    // rame à l'arrêt idéal) et la position de sa cabine à ce même instant. Les baies
+    // vitrées et le repère d'arrêt sortent donc du même calcul que kStopOffset, ce
+    // qui rend le désalignement structurellement impossible.
+    static scene::StationProfile make_station_profile() {
+        const scene::TrainLayout& tl = train_layout();
+        scene::StationProfile sp;
+        sp.door_half = static_cast<float>(tl.door_half_width);
+        sp.platform_top = static_cast<float>(tl.floor_height);  // plain-pied
+        sp.stop_marker_offset = tl.stop_marker_offset();
+        sp.door_centers = tl.door_chainages();
+        return sp;
     }
 
     // M51 — SOL UNIFIÉ, jusque dans le modèle de terrain. Le sol de la ville est UN
@@ -428,8 +476,13 @@ struct Application::Impl {
     render::MeshId psd_mesh = 0;
     render::MeshId psd_uploading = 0;
     render::MaterialId psd_material = 0;      // verre BLEND
-    render::MeshId psd_door_mesh = 0;         // panneaux vitrés MOBILES (M49)
+    render::MeshId psd_door_mesh = 0;         // vantaux mobiles (M49), coulissent vers l'arrière
     render::MeshId psd_door_uploading = 0;
+    render::MeshId psd_door_b_mesh = 0;       // M52 : vantaux opposés (baies bi-parting)
+    render::MeshId psd_door_b_uploading = 0;
+    // M52 : autorisation d'ouverture des portes de QUAI, verrouillée à l'instant où
+    // le conducteur commande l'ouverture (cf. update_input).
+    bool psd_authorized = false;
     float psd_t = 0.0f;                       // 0 = fermé, 1 = ouvert (synchro portes)
     render::MeshId station_sign_mesh = 0;
     render::MeshId station_sign_uploading = 0;
@@ -953,7 +1006,29 @@ struct Application::Impl {
                 }
             } else if (consist.immobilized() || std::abs(wagon.speed()) <= 0.01) {
                 doors_opening = true;
-                log::info("Portes : OUVERTURE");
+                // M52 — ARRÊT DE PRÉCISION. La décision se prend ICI, à l'instant de
+                // la commande, et se verrouille : les portes de QUAI ne s'ouvrent que
+                // si la rame est réellement à quai, arrêtée, et à moins de 50 cm de
+                // son point d'arrêt. Sinon le conducteur ouvre sa rame dans le vide —
+                // c'est la sanction d'un arrêt raté, et elle doit se voir.
+                //
+                // Verrouiller à l'appui plutôt que réévaluer en continu, c'est ce qui
+                // fait qu'une façade ouverte ne se referme pas au nez des voyageurs
+                // parce que la rame a flué de 2 cm sur son frein.
+                const double err = stop_error();
+                const bool halted = std::abs(wagon.speed()) <= 0.01;
+                psd_authorized = halted && std::abs(err) < kStopTolerance;
+                if (psd_authorized) {
+                    log::info("Portes : OUVERTURE — arrêt de précision ({:+.2f} m), "
+                              "façades de quai OUVERTES", err);
+                } else if (!halted) {
+                    log::info("Portes : OUVERTURE rame seule — train non immobilisé, "
+                              "façades de quai FERMÉES");
+                } else {
+                    log::info("Portes : OUVERTURE rame seule — arrêt à {:+.2f} m du repère "
+                              "(tolérance {:.2f} m), façades de quai FERMÉES",
+                              err, kStopTolerance);
+                }
             } else {
                 log::info("Portes : VERROUILLÉES (train non immobilisé)");
             }
@@ -1103,17 +1178,12 @@ struct Application::Impl {
         const float door_dir = doors_opening ? 1.0f : -1.0f;
         door_t = glm::clamp(door_t + static_cast<float>(dt) * door_speed * door_dir, 0.0f, 1.0f);
 
-        // M49 — Synchronisation des façades de quai (PSD) : elles ne s'ouvrent QUE si
-        // la rame est à l'arrêt ET alignée sur la gare la plus proche (gares tous les
-        // 2 km ; la fenêtre de ±30 m correspond à un quai de 150 m moins la rame).
-        // Sinon elles restent closes, même si les portes de la rame bougent.
+        // M52 — Façades de quai : elles suivent l'AUTORISATION verrouillée à la
+        // commande d'ouverture (arrêt de précision), et rien d'autre. La fenêtre de
+        // ±30 m du M49 laissait les façades s'ouvrir avec la rame à 30 m des baies.
+        // Elles se referment avec les portes de la rame, comme il se doit.
         {
-            const double nearest =
-                std::round(wagon.chainage() / kStationSpacing) * kStationSpacing;
-            const bool aligned = std::abs(wagon.chainage() - nearest) <= 30.0;
-            const bool stopped =
-                std::abs(wagon.speed()) <= 0.01 || consist.immobilized();
-            const bool psd_open = doors_opening && stopped && aligned;
+            const bool psd_open = doors_opening && psd_authorized;
             const float psd_dir = psd_open ? 1.0f : -1.0f;
             psd_t = glm::clamp(psd_t + static_cast<float>(dt) * door_speed * psd_dir,
                                0.0f, 1.0f);
@@ -1584,6 +1654,7 @@ struct Application::Impl {
         if (viaduct_uploading != 0 && renderer.is_mesh_ready(viaduct_uploading) &&
             (psd_uploading == 0 || renderer.is_mesh_ready(psd_uploading)) &&
             (psd_door_uploading == 0 || renderer.is_mesh_ready(psd_door_uploading)) &&
+            (psd_door_b_uploading == 0 || renderer.is_mesh_ready(psd_door_b_uploading)) &&
             (station_sign_uploading == 0 || renderer.is_mesh_ready(station_sign_uploading)) &&
             (canopy_uploading == 0 || renderer.is_mesh_ready(canopy_uploading))) {
             if (viaduct_mesh != 0) {
@@ -1603,6 +1674,11 @@ struct Application::Impl {
             }
             psd_door_mesh = psd_door_uploading;
             psd_door_uploading = 0;
+            if (psd_door_b_mesh != 0) {
+                renderer.destroy_mesh(psd_door_b_mesh);
+            }
+            psd_door_b_mesh = psd_door_b_uploading;
+            psd_door_b_uploading = 0;
             if (station_sign_mesh != 0) {
                 renderer.destroy_mesh(station_sign_mesh);
             }
@@ -1631,12 +1707,13 @@ struct Application::Impl {
         // façades de quai vitrées + signalétique. Le béton est FUSIONNÉ avec le
         // viaduc (même matériau, même fenêtre, grille absolue) ; le verre et la
         // signalétique ont leurs maillages/matériaux dédiés, téléversés ensemble.
-        scene::RailMeshData psd_all, psd_door_all, signs_all, canopy_all;
+        scene::RailMeshData psd_all, psd_door_all, psd_door_b_all, signs_all, canopy_all;
+        const scene::StationProfile station_profile = make_station_profile();
         const long g0 = static_cast<long>(std::ceil((center - kViaductRange) / kStationSpacing));
         const long g1 = static_cast<long>(std::floor((center + kViaductRange) / kStationSpacing));
         for (long g = g0; g <= g1; ++g) {
             scene::StationMeshes st = scene::generate_station(
-                track, static_cast<double>(g) * kStationSpacing, origin);
+                track, static_cast<double>(g) * kStationSpacing, origin, station_profile);
             const auto append = [](scene::RailMeshData& dst, scene::RailMeshData& src) {
                 const auto base = static_cast<std::uint32_t>(dst.vertices.size());
                 dst.vertices.insert(dst.vertices.end(), src.vertices.begin(),
@@ -1650,6 +1727,7 @@ struct Application::Impl {
             append(canopy_all, st.canopy);
             append(psd_all, st.glass);
             append(psd_door_all, st.psd_doors);
+            append(psd_door_b_all, st.psd_doors_b);
             append(signs_all, st.signs);
         }
 
@@ -1660,6 +1738,10 @@ struct Application::Impl {
             psd_door_all.empty()
                 ? 0
                 : renderer.create_mesh_indexed(psd_door_all.vertices, psd_door_all.indices);
+        const render::MeshId fresh_psd_door_b =
+            psd_door_b_all.empty() ? 0
+                                   : renderer.create_mesh_indexed(psd_door_b_all.vertices,
+                                                                  psd_door_b_all.indices);
         const render::MeshId fresh_signs = signs_all.empty()
                                                ? 0
                                                : renderer.create_mesh_indexed(signs_all.vertices,
@@ -1674,6 +1756,7 @@ struct Application::Impl {
             viaduct_snap = snap;
             psd_uploading = fresh_psd;
             psd_door_uploading = fresh_psd_door;
+            psd_door_b_uploading = fresh_psd_door_b;
             station_sign_uploading = fresh_signs;
             canopy_uploading = fresh_canopy;
         }
@@ -2291,20 +2374,37 @@ struct Application::Impl {
             items.push_back(render::DrawItem{camera.relative_model(viaduct_origin),
                                              psd_mesh, psd_material});
         }
-        // Panneaux vitrés MOBILES (M49) : coulissent le long du quai, synchronisés
-        // sur les portes de la rame (psd_t). La translation suit la tangente de la
-        // voie à la gare la plus proche.
-        if (psd_door_mesh != 0 && psd_material != 0) {
-            glm::mat4 m = camera.relative_model(viaduct_origin);
+        // Vantaux MOBILES des baies de quai (M49/M52) : bi-parting, donc deux
+        // maillages qui coulissent en sens OPPOSÉS le long de la tangente de la voie.
+        // Chaque vantail couvre la moitié de la baie (0,65 m) et s'efface derrière
+        // le vitrage fixe voisin : le passage de 1,30 m est intégralement dégagé,
+        // exactement en face de la porte de la rame.
+        if (psd_material != 0 && (psd_door_mesh != 0 || psd_door_b_mesh != 0)) {
+            // Course d'un vantail = SA PROPRE LARGEUR (la moitié de la baie, soit
+            // door_half = 0,65 m), plus 3 cm de garde : les deux vantaux réunis
+            // dégagent alors les 1,30 m de la baie, exactement la largeur de la
+            // porte de la rame en face.
+            constexpr float kLeafTravel = 0.68f;
+            glm::vec3 slide(0.0f);
             if (psd_t > 0.0f) {
+                const double stop = train_layout().stop_offset();
                 const double nearest =
-                    std::round(wagon.chainage() / kStationSpacing) * kStationSpacing;
+                    std::round((wagon.chainage() - stop) / kStationSpacing) * kStationSpacing;
                 glm::dvec3 pos, tangent;
                 track.sample(nearest, pos, tangent);
-                const glm::vec3 slide = glm::vec3(glm::normalize(tangent)) * (1.2f * psd_t);
-                m = m * glm::translate(glm::mat4(1.0f), slide);
+                slide = glm::vec3(glm::normalize(tangent)) * (kLeafTravel * psd_t);
             }
-            items.push_back(render::DrawItem{m, psd_door_mesh, psd_material});
+            const glm::mat4 base = camera.relative_model(viaduct_origin);
+            if (psd_door_mesh != 0) {
+                items.push_back(render::DrawItem{
+                    base * glm::translate(glm::mat4(1.0f), -slide), psd_door_mesh,
+                    psd_material});
+            }
+            if (psd_door_b_mesh != 0) {
+                items.push_back(render::DrawItem{
+                    base * glm::translate(glm::mat4(1.0f), slide), psd_door_b_mesh,
+                    psd_material});
+            }
         }
         // Verrière (M50) : la surface transparente la PLUS HAUTE de la scène, donc la
         // dernière tirée. Depuis la cabine, tout ce qu'elle recouvre (câbles, façades

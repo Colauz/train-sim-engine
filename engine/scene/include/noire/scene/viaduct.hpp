@@ -1,5 +1,7 @@
 #pragma once
 
+#include <vector>
+
 #include "noire/core/math.hpp"
 #include "noire/core/track_source.hpp"
 #include "noire/scene/track_mesh.hpp"
@@ -49,9 +51,25 @@ struct ViaductProfile {
 struct StationProfile {
     double length = 150.0;      // longueur des quais et de la verrière (m)
     double step = 10.0;         // pas de tessellation le long de la voie (m)
-    float platform_inner = 4.6f;  // bord de quai = rive du tablier
-    float platform_outer = 8.0f;  // rive extérieure du quai (3,4 m de large)
-    float platform_top = 1.10f;   // dessus du quai au-dessus du plan de roulement
+    // M52 — LE GAP. Le nez de quai était calé sur la rive du TABLIER (4,60 m) : il
+    // restait 3,12 m entre le flanc de la rame et le quai. On le cale désormais sur
+    // le GABARIT DE LA RAME : caisse large de 2,95 m => flanc à 1,475 m, nez de quai
+    // à 1,55 m, soit 7,5 cm de jeu — la cote d'un quai réel.
+    float platform_inner = 1.55f;
+    float platform_outer = 8.0f;  // rive extérieure du quai (6,45 m de large)
+    // Plancher de la rame : origine de caisse à +2,20 m (CarBodyConfig::body_height),
+    // plancher intérieur à -1,00 m dans le gabarit (IN_FLOOR, tools/gen_metro.py)
+    // => +1,20 m au-dessus du plan de roulement. Le quai est mis EXACTEMENT à cette
+    // cote : embarquement de plain-pied, aucune marche. (La consigne citait 1,15 m
+    // « par exemple » ; 1,20 m est la valeur qui annule réellement la marche.)
+    float platform_top = 1.20f;
+    // Nez de quai en encorbellement AU-DESSUS de l'épaulement du ballast. À 1,55 m de
+    // l'axe on est à l'intérieur du plateau de ballast (RailProfile::ballast_crown_half
+    // = 1,90 m) : un quai plein descendant jusqu'au tablier le traverserait. Le profil
+    // est donc décroché — plein depuis le tablier au-delà du pied du talus, en dalle
+    // au-dessus. Ces deux cotes sont vérifiées contre RailProfile (static_assert).
+    float edge_bottom = -0.30f;  // = RailProfile::ballast_crown_y
+    float edge_outer = 2.70f;    // > RailProfile::ballast_base_half (2,65 m)
     // M50 — VERRIÈRE BORNÉE. Le bug M49 : la dalle de toiture était extrudée sur
     // toute la fenêtre du viaduc (7 km), d'où un « plafond infini ». Elle est
     // désormais enfermée dans une boîte englobante EXPLICITE, vérifiable :
@@ -77,23 +95,40 @@ struct StationProfile {
     // unifié (Y = 0). Plus trapu : il reprend une vingtaine de mètres de hauteur.
     float pillar_half = 0.35f;
     double column_spacing = 15.0;
-    // M48 — Façades de quai (platform screen doors) : panneaux vitrés alternés le
-    // long du quai — un fixe, un MOBILE (il coulisse avec les portes de la rame,
-    // M49) — cadres opaques réguliers ; et panneaux d'affichage suspendus.
+    // --- M52 : FAÇADES DE QUAI CALQUÉES SUR LE PLAN DE PORTES DE LA RAME -------
+    // La façade n'est plus une clôture générique sur une trame arbitraire de 2,5 m
+    // (qui ne tombait en face d'une porte de rame que par accident). `door_centers`
+    // donne les chainages des portes de la rame RELATIVEMENT au centre de la gare,
+    // la rame étant à son point d'arrêt idéal. La façade se construit AUTOUR d'eux :
+    // une baie ouvrante à chaque porte, du verre fixe partout ailleurs.
+    //
+    // C'est l'app qui remplit ce vecteur, en le dérivant de la géométrie de la rame
+    // (ConsistConfig + implantation des portes du gabarit) : la gare ne devine rien,
+    // elle reçoit le plan du train. Vide => façade entièrement fixe, sans baie.
+    std::vector<double> door_centers;
+    float door_half = 0.65f;      // = DOOR_HALF du gabarit => 1,30 m de passage
+    float jamb_half = 0.08f;      // montant opaque, POSÉ EN DEHORS de la baie
     float psd_height = 1.8f;      // hauteur vitrée au-dessus du quai
-    float psd_offset = 0.25f;     // retrait du vitrage depuis le bord de quai
+    float psd_thickness = 0.03f;  // demi-épaisseur du vitrage
+    float psd_offset = 0.0f;      // retrait de la FACE vitrée depuis le nez de quai
+    double panel_max = 2.5f;      // longueur max d'un panneau fixe (tessellation)
     double sign_spacing = 25.0;   // entraxe des panneaux suspendus
+    // M52 — Repère d'arrêt : chainage RELATIF au centre de la gare. C'est la position
+    // de la CABINE quand le centre de la rame coïncide avec le centre de la gare ;
+    // l'app la calcule depuis la même géométrie de rame que `door_centers`.
+    double stop_marker_offset = 0.0;
 };
 
-// Cinq maillages : le béton (fusionné au viaduc), la verrière translucide (BLEND,
+// Six maillages : le béton (fusionné au viaduc), la verrière translucide (BLEND,
 // bornée : 20 m x 150 m, intrados à +7,20 m), le vitrage FIXE des façades de quai
-// (BLEND), les panneaux vitrés MOBILES (BLEND, coulissent avec les portes de la
-// rame) et la signalétique (émissif).
+// (BLEND), les DEUX demi-vantaux mobiles (BLEND — les baies sont bi-parting : `a`
+// coulisse vers l'arrière, `b` vers l'avant) et la signalétique (émissif).
 struct StationMeshes {
     RailMeshData concrete;
     RailMeshData canopy;
     RailMeshData glass;
-    RailMeshData psd_doors;
+    RailMeshData psd_doors;    // vantaux qui coulissent vers les chainages DÉCROISSANTS
+    RailMeshData psd_doors_b;  // vantaux qui coulissent vers les chainages CROISSANTS
     RailMeshData signs;
 };
 

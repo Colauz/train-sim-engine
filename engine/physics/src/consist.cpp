@@ -22,15 +22,11 @@ double Consist::chainage_behind(double x_ref, double arc_dist) const {
     if (track_ == nullptr) {
         return x_ref - arc_dist;
     }
-    // arc_dist ≈ arc_rate · (x_ref - x) sur l'intervalle => x = x_ref - arc_dist/arc_rate.
-    // On itère en évaluant arc_rate au MILIEU de l'intervalle courant : point fixe qui
-    // converge en 2-3 pas et rend la distance d'arc inter-bogies rigoureuse même en courbe.
-    double x = x_ref - arc_dist;
-    for (int i = 0; i < 4; ++i) {
-        const double rate = track_->arc_rate(0.5 * (x_ref + x));
-        x = x_ref - arc_dist / (rate > 1e-6 ? rate : 1.0);
-    }
-    return x;
+    // M52 : la conversion arc -> chainage est désormais PARTAGÉE (core/track_source.hpp).
+    // Elle était ici en propre, et la gare — qui doit tomber en face des portes placées
+    // par ce calcul — l'ignorait : d'où des baies décalées, d'autant plus que la voiture
+    // était loin de la motrice. Une seule conversion, un seul comportement.
+    return chainage_at_arc(*track_, x_ref, -arc_dist);
 }
 
 void Consist::update_running_gear(double dt, double longitudinal_accel) {

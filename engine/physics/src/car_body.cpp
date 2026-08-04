@@ -88,9 +88,22 @@ void CarBody::update(const glm::dvec3& front_pos, const glm::dvec3& rear_pos, do
     // le transfert de charge. La caisse relie ces deux points : son orientation (yaw + pitch)
     // en découle GÉOMÉTRIQUEMENT, et comme les appuis restent à ~body_height de leurs bogies,
     // la caisse ne peut PAS décoller. Fini le « wheelie ».
+    // M52 : la caisse s'élève PERPENDICULAIREMENT au plan des bogies, pas selon la
+    // verticale du monde. Une suspension est normale au plancher, pas au géoïde — et
+    // élever de 2,20 m à la verticale sur une rampe décale la caisse de 2,20 x pente
+    // le long de la voie : 19 mm à 0,9 %, 88 mm sur une rampe de 4 %. Assez pour
+    // désaligner les portes de la rame des baies du quai, qui, elles, sont posées
+    // dans le repère de la voie. Le décalage était CONSTANT sur toute la rame, donc
+    // invisible à l'œil — et fatal dès qu'on cherche le millimètre.
+    const glm::dvec3 axle = front_pos - rear_pos;
+    const glm::dvec3 fwd0 = glm::length(axle) > 1e-9 ? glm::normalize(axle)
+                                                     : glm::dvec3(1.0, 0.0, 0.0);
+    const glm::dvec3 right0 = glm::normalize(glm::cross(fwd0, world_up));
+    const glm::dvec3 up0 = glm::normalize(glm::cross(right0, fwd0));
+
     const double h = config_.body_height + heave;
-    const glm::dvec3 front_support = front_pos + world_up * (h + pitch_);
-    const glm::dvec3 rear_support = rear_pos + world_up * (h - pitch_);
+    const glm::dvec3 front_support = front_pos + up0 * (h + pitch_);
+    const glm::dvec3 rear_support = rear_pos + up0 * (h - pitch_);
     const glm::dvec3 center = (front_support + rear_support) * 0.5;
 
     const glm::vec3 forward = glm::vec3(glm::normalize(front_support - rear_support));
