@@ -2,14 +2,21 @@
 
 namespace noire {
 
-// PROFIL DE LIGNE JAPONAIS (M30 — pivot métro de Tokyo), généré par cycle :
-// une GARE tous les 1 200 m, et un séquencement d'approche typique ATS/ATC :
+// PROFIL DE LIGNE JAPONAIS (M30 — pivot métro de Tokyo), généré par cycle, sur
+// l'entraxe RÉEL des gares (kStationSpacing, cf. l'en-tête : c'est la même constante
+// que celle qui pose les quais). Séquencement d'approche typique ATS/ATC :
 //
-//     cycle +   0 m : gare (quai de 300 m) — 45 km/h  => aspect Y
-//     cycle + 300 m : pleine ligne         — 90 km/h  => aspect G
-//     cycle + 900 m : approche réduite     — 65 km/h  => aspect YG
-//     cycle +1050 m : approche courte      — 45 km/h  => aspect Y
-//     ... et on recommence. Terminus à 36 km : 0 km/h => aspect R (urgence si franchi).
+//     gare +    0 m : emprise du quai      — 45 km/h  => aspect Y
+//     gare +  300 m : pleine ligne         — 90 km/h  => aspect G
+//     gare + 1700 m : approche réduite     — 65 km/h  => aspect YG
+//     gare + 1850 m : approche courte      — 45 km/h  => aspect Y
+//     ... et la gare suivante tombe à +2000 m, donc dans la zone à 45.
+//
+// M55 — Les cotes d'approche sont désormais comptées DEPUIS LA FIN du cycle (la gare
+// suivante) et non plus depuis son début : c'est l'arrivée en gare qu'un profil
+// d'approche doit protéger. Avec l'ancien entraxe de 1 200 m, sans rapport avec les
+// 2 000 m de la géométrie, les paliers tombaient n'importe où — parfois en pleine
+// ligne, parfois au milieu d'un quai.
 //
 // Le chainage sert d'abscisse (arc_rate ≈ 1 sur notre tracé => chainage ≈ m réels). C'est
 // l'unique source de vérité, partagée par l'ATS (qui l'applique) et par les signaux
@@ -22,8 +29,7 @@ struct Zone {
     double limit_kmh;  // limite dans cette zone
 };
 
-constexpr double kStationSpacing = 1200.0;  // distance inter-gares (métro dense)
-constexpr int kCycles = 30;                 // 30 gares = 36 km de ligne
+constexpr int kCycles = 30;  // 30 gares, à kStationSpacing d'entraxe = 60 km de ligne
 
 // Zones générées une fois à l'init statique, ordonnées par chainage croissant.
 struct Zones {
@@ -32,10 +38,10 @@ struct Zones {
     Zones() {
         for (int k = 0; k < kCycles; ++k) {
             const double base = kStationSpacing * static_cast<double>(k);
-            list[count++] = {base, 45.0};         // gare (quai 0-300 m)
-            list[count++] = {base + 300.0, 90.0};  // pleine ligne
-            list[count++] = {base + 900.0, 65.0};  // approche réduite (YG)
-            list[count++] = {base + 1050.0, 45.0}; // approche courte (Y)
+            list[count++] = {base, 45.0};                          // emprise du quai
+            list[count++] = {base + 300.0, 90.0};                  // pleine ligne
+            list[count++] = {base + kStationSpacing - 300.0, 65.0};  // approche réduite (YG)
+            list[count++] = {base + kStationSpacing - 150.0, 45.0};  // approche courte (Y)
         }
         list[count++] = {kStationSpacing * kCycles, 0.0};  // terminus : R
     }

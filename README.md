@@ -131,6 +131,38 @@ Pour le réarmer : **arrêt complet** → Mascon sur `EB` → Mascon sur `N`.
 `FPS / GPU ms`, plus les témoins `IMMOBILISE`, `ATS ISOLE`, `ATS SURVITESSE`,
 `URGENCE`, `PATINAGE`.
 
+### Aide à la conduite : quelle vitesse, à quel moment (M55)
+
+Le pupitre affiche, sous la ligne ATS, la **consigne** : la vitesse à tenir *maintenant*
+pour honorer tout ce qui vient — un abaissement de limite dans 300 m, un arrêt en gare
+dans 700 m. C'est le principe de tout ATC/TASC réel : pour chaque contrainte à venir, la
+cinématique donne la vitesse maximale admissible ici, et la consigne est le **minimum**
+de toutes.
+
+```
+ATS  Y      45 KM/H        <- ce qui est INTERDIT
+CONSIGNE    43 KM/H        <- ce qu'il FAUT tenir
+  -> FREINAGE DANS  204 M  <- à quel moment serrer
+```
+
+La troisième ligne change selon la situation :
+
+| Ligne                     | Sens                                                        |
+| ------------------------- | ------------------------------------------------------------ |
+| `MAINTENIR`               | vous êtes sur la courbe, rien à faire                        |
+| `FREINAGE DANS 204 M`     | compte à rebours jusqu'au point de freinage                  |
+| `FREINER B4`              | vous êtes au-dessus : voici le cran à passer                 |
+| `ACCELERER`               | vous traînez de plus de 6 km/h sous la consigne              |
+
+La couleur de la consigne suffit à piloter sans lire les chiffres : **vert** = sur la
+courbe, **jaune** = léger excès, **rouge** = franchement trop vite, **bleu** = trop lent.
+
+Le cran conseillé tient compte de la **pente** et de la résistance à l'avancement : en
+rampe, la gravité freine déjà pour vous, et l'aide ne conseille que le complément.
+
+> **Vérifié** : un banc simule un conducteur qui suit la consigne à la lettre depuis
+> 90 km/h. La rame s'immobilise à **0,00 m** du repère d'arrêt.
+
 ### Arrêt de précision (M52 / M53)
 
 Les **portes palières** ne s'ouvrent que si la rame est arrêtée **à moins de 50 cm** du

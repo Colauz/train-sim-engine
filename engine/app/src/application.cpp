@@ -17,6 +17,7 @@
 #include "noire/core/engine.hpp"
 #include "noire/core/job_system.hpp"
 #include "noire/core/log.hpp"
+#include "noire/core/driving_advisor.hpp"
 #include "noire/core/math.hpp"
 #include "noire/core/procedural_track.hpp"
 #include "noire/core/terrain.hpp"
@@ -171,7 +172,10 @@ constexpr double kViaductStep = 250.0;
 // verrière, la caténaire y suspend son porteur au lieu de planter des mâts, et les
 // façades de quai y coulissent. Trois emprises calculées à partir de la MÊME
 // constante — quand elles divergeaient, les poteaux traversaient la gare.
-constexpr double kStationSpacing = 2000.0;
+// M55 : l'entraxe vient de noire::kStationSpacing (core/speed_limits.hpp) — la MÊME
+// constante que celle dont dérive le profil de vitesse ATS. Elle était redéfinie ici,
+// à une valeur différente de celle du profil : géométrie et signalisation décrivaient
+// deux lignes distinctes.
 constexpr double kStationLength = 150.0;  // = StationProfile::length
 
 // --- M52 : GÉOMÉTRIE DE LA RAME ----------------------------------------------
@@ -435,15 +439,44 @@ struct Application::Impl {
     // Positif = la rame a DÉPASSÉ le repère. C'est la grandeur que le conducteur
     // cherche à annuler, et la seule qui décide de l'ouverture des portes de quai.
     [[nodiscard]] double stop_error() const {
+        // M55 : le point de référence vient de target_stop_chainage(), la MÊME source
+        // que l'aide à la conduite. Les deux le calculaient séparément, et divergeaient
+        // dès le quai quitté : le pupitre affichait l'écart à la gare qu'on venait de
+        // laisser pendant que la consigne visait déjà la suivante.
+        return wagon.chainage() - target_stop_chainage();
+    }
+
+    // M55 — Chainage du point d'arrêt VISÉ. Ce n'est pas tout à fait « la gare la plus
+    // proche » : une fois le repère franchi, la rame est encore à quai pendant une
+    // vingtaine de mètres, et l'aide doit continuer de viser CE repère — sinon, à peine
+    // arrêté 30 cm trop loin, le pupitre conseillerait d'accélérer vers la gare
+    // suivante, portes encore fermées. Au-delà, la gare est bien derrière : on vise la
+    // suivante.
+    [[nodiscard]] double target_stop_chainage() const {
         const double x = wagon.chainage();
         const double stop = train_layout().stop_offset();
-        // Gare la plus proche (l'offset ~20 m est négligeable devant l'entraxe de
-        // 2 km : l'arrondi ne peut pas se tromper de gare).
-        const double nearest = std::round((x - stop) / kStationSpacing) * kStationSpacing;
-        // Point d'arrêt EXACT : `stop` est une distance d'arc, pas un chainage.
-        // La confondre décalait la cible de quelques centimètres ici, et jusqu'à
-        // plusieurs dizaines là où la voie serpente — sur une tolérance de 50 cm.
-        return x - chainage_at_arc(track, nearest, stop);
+        long g = std::lround((x - stop) / kStationSpacing);
+        double sc = chainage_at_arc(track, static_cast<double>(g) * kStationSpacing, stop);
+        if (x - sc > 20.0) {
+            sc = chainage_at_arc(track, static_cast<double>(g + 1) * kStationSpacing, stop);
+        }
+        return sc;
+    }
+
+    // Décélération que la rame obtient SANS toucher au frein : résistance à
+    // l'avancement (Davis) et pente. L'aide la retranche du cran conseillé — sur une
+    // rampe de 1 %, la pente vaut à elle seule 0,098 m/s², soit près d'un cran.
+    [[nodiscard]] double natural_decel() const {
+        const physics::WagonConfig& c = wagon.config();
+        const double v = std::abs(wagon.speed());
+        const double davis = c.davis_a + c.davis_b * v + c.davis_c * v * v;
+        constexpr double kGravity = 9.81;
+        return davis / c.mass + kGravity * wagon.grade_percent() / 100.0;
+    }
+
+    [[nodiscard]] DrivingAdvice driving_advice() const {
+        return advisor.advise(consist.speed_limits(), wagon.chainage(),
+                              std::abs(wagon.speed()), target_stop_chainage(), natural_decel());
     }
 
     // M52 — Le profil de gare, DÉRIVÉ de la rame. La gare ne devine rien : on lui
@@ -753,6 +786,9 @@ struct Application::Impl {
     // --- Qualité (M54) : NOIRE_QUALITY au lancement, F1 pour cycler en jeu ----
     QualityLevel quality_level = initial_quality();
     bool prev_f1_down = false;
+
+    // --- Aide à la conduite (M55) : l'enveloppe de vitesse, cf. DrivingAdvisor ---
+    DrivingAdvisor advisor{};
 
     // --- Portes (M30.5) -----------------------------------------------------
     // door_t : 0 = fermé, 1 = ouvert. Animation en 2 secondes (0.5/s).
@@ -1490,6 +1526,49 @@ struct Application::Impl {
         }
         lines.emplace_back(std::format("ATS {: >2}   {: >5.0f} KM/H", aspect, limit),
                            over_limit ? alert : aspect_color);
+        // --- M55 : L'AIDE À LA CONDUITE, juste sous l'ATS -----------------------
+        // Elle répond à la seule question que le conducteur se pose en roulant :
+        // « quelle vitesse, maintenant ? ». L'ATS, au-dessus, dit ce qui est INTERDIT ;
+        // la consigne dit ce qu'il FAUT tenir pour honorer ce qui vient — un
+        // abaissement de limite dans 300 m, un arrêt en gare dans 700 m. Les deux
+        // lignes ne font pas double emploi : la première sanctionne, la seconde guide.
+        const DrivingAdvice advice = driving_advice();
+        const double speed_kmh = std::abs(wagon.speed()) * 3.6;
+        const double delta = speed_kmh - advice.target_kmh;
+        {
+            // Le vert n'est pas décoratif : il dit « rien à faire ». Tant qu'on est
+            // dans la bande, la trajectoire est bonne et le conducteur peut regarder
+            // ailleurs — c'est tout l'intérêt d'une aide.
+            glm::vec4 color{0.45f, 0.85f, 0.5f, 1.0f};
+            if (delta > 3.0) {
+                color = alert;                                    // trop vite
+            } else if (delta > 1.0) {
+                color = glm::vec4{0.95f, 0.80f, 0.10f, 1.0f};     // à résorber
+            } else if (delta < -6.0) {
+                color = glm::vec4{0.45f, 0.65f, 1.0f, 1.0f};      // trop lent
+            }
+            lines.emplace_back(std::format("CONSIGNE {: >5.0f} KM/H", advice.target_kmh), color);
+
+            // La consigne dit « quoi » ; cette ligne-ci dit « comment », dans l'unité
+            // où le conducteur agit — un cran de manipulateur, pas une décélération.
+            if (delta > 1.0 && advice.recommended_notch > 0) {
+                lines.emplace_back(std::format("  -> FREINER  B{}", advice.recommended_notch),
+                                   glm::vec4{1.0f, 0.55f, 0.10f, 1.0f});
+            } else if (advice.stop_ahead && advice.distance_to_brake_point > 1.0 &&
+                       speed_kmh > 5.0) {
+                // Le compte à rebours jusqu'au point de freinage : la réponse à
+                // « à quel moment ». Il fond à mesure qu'on avance, et atteint zéro
+                // exactement quand il faut serrer.
+                lines.emplace_back(
+                    std::format("  -> FREINAGE DANS {: >4.0f} M", advice.distance_to_brake_point),
+                    label);
+            } else if (delta < -6.0 && advice.target_kmh > 5.0) {
+                lines.emplace_back("  -> ACCELERER", glm::vec4{0.45f, 0.65f, 1.0f, 1.0f});
+            } else if (speed_kmh > 1.0) {
+                lines.emplace_back("  -> MAINTENIR", glm::vec4{0.45f, 0.85f, 0.5f, 1.0f});
+            }
+        }
+
         // Manipulateur à Paliers Mascon (M33)
         lines.emplace_back(std::format("MASCON   {}", mascon_label(mascon_notch)), mascon_color(mascon_notch));
         // CG = conduite générale. Sa pression EST l'état du frein que lit le mécanicien :

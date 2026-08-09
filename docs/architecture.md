@@ -144,3 +144,13 @@ descendante : le moteur ne connaît pas le jeu.
   (`NOIRE_QUALITY`, touche `F1`) qui n'agissent que sur la résolution des cartes
   d'ombre, la portée d'ombre et l'étendue de la ville. +30 % d'images par seconde en
   qualité haute, +55 % en basse, à image identique en haute.
+- **M55 — Aide à la conduite** *(fait)* : `core::DrivingAdvisor` calcule l'**enveloppe
+  de vitesse** — pour chaque contrainte à venir (abaissement de limite, point d'arrêt),
+  la cinématique `v = √(v_c² + 2·a·d)` donne la vitesse maximale admissible ici, et la
+  consigne est le minimum de toutes. Le cran de frein conseillé en découle, déduction
+  faite de la pente et de la résistance à l'avancement. Au passage, correction d'un
+  défaut de fond : l'entraxe des gares était défini **deux fois** — 2 000 m côté
+  géométrie, 1 200 m côté profil ATS — si bien que les limites ne tombaient pas sur les
+  gares. Une seule constante (`core::kStationSpacing`) les alimente désormais toutes
+  deux. Validation par simulation : un conducteur suivant la consigne à la lettre
+  depuis 90 km/h s'immobilise à 0,00 m du repère.
