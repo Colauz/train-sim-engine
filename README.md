@@ -110,6 +110,7 @@ Le manipulateur unique va de `EB` (urgence) à `P5` (pleine traction) en passant
 | `C`                  | Bascule **Cabine (FPS)** ⇄ **Externe (orbite)**              |
 | Souris               | Orientation (orbite ou regard cabine)                        |
 | `Ctrl` / `Maj` gauche | Zoom arrière / avant (mode orbite uniquement)               |
+| `F1`                 | **Niveau de qualité** : cycle BAS → MOYEN → HAUT              |
 | `F11`                | Plein écran                                                  |
 | `Échap`              | **Menu Pause** (fige la simulation et l'audio)               |
 
@@ -151,6 +152,49 @@ que les portes de la rame (même vitesse, même courbe, même instant).
 
 ---
 
+## 🐌 Ça rame ? Les niveaux de qualité
+
+Trois presets, choisis au lancement par `NOIRE_QUALITY` ou cyclés en jeu par **`F1`**
+(le niveau courant est affiché au pupitre) :
+
+```bash
+NOIRE_QUALITY=low ./build/release/bin/noire-sim     # « grille-pain »
+NOIRE_QUALITY=medium ./build/release/bin/noire-sim
+NOIRE_QUALITY=high ./build/release/bin/noire-sim    # défaut
+```
+
+| Niveau  | Ombres         | Portée d'ombre | Ville  | Pluie |
+| ------- | -------------- | -------------- | ------ | ----- |
+| `low`   | 512² × 2       | 90 m           | 260 m  | non   |
+| `medium`| 1024² × 2      | 160 m          | 450 m  | oui   |
+| `high`  | 2048² × 2      | 250 m          | 700 m  | oui   |
+
+Les presets n'agissent que sur les **trois postes que la mesure a désignés** : le
+remplissage des cartes d'ombre, la quantité de géométrie qui y entre, et l'étendue de la
+ville. Ni la voie, ni la rame, ni les gares ne sont dégradées — elles ne coûtent pas
+assez pour que ça vaille de les abîmer.
+
+Mesuré sur le banc reproductible (`NOIRE_PIN_CAM=1 NOIRE_SPEED=0 NOIRE_NO_VSYNC=1`,
+iGPU, 1280×720), avant/après M54 :
+
+| | M53 | M54 `high` | M54 `medium` | M54 `low` |
+| --------------- | ---- | ---- | ---- | ---- |
+| images/s        | 227  | 295  | 350  | 353  |
+| GPU (ms)        | 3,0  | 2,6  | 2,3  | 1,8  |
+| draw calls      | 868  | 410  | 402  | 365  |
+
+### Lire la télémétrie
+
+Une ligne par seconde sur la sortie standard, avec la **ventilation** du temps :
+
+```
+250 fps | CPU 0.05 ms | GPU 2.6 ms (ombres 0.8 / scene 1.9) | draws 192+218 | bâtiments=776/2555 vis
+```
+
+`CPU` = construction de la frame côté app (hors attente VSync) ; `draws` = passe
+d'ombres + passe scène. C'est cette ventilation qui dit *où* chercher : un total ne se
+corrige pas, un poste identifié si.
+
 ## ⚙️ Options de build
 
 ```bash
@@ -181,6 +225,7 @@ Ces variables sont des **leviers de mesure**, jamais des réglages de jeu.
 | Variable                        | Effet                                                             |
 | ------------------------------- | ------------------------------------------------------------------ |
 | `NOIRE_ASSETS=<dir>`            | Force la racine des assets (court-circuite la remontée depuis le CWD) |
+| `NOIRE_QUALITY=low\|medium\|high` | Niveau de qualité initial (cf. ci-dessus ; `F1` en jeu)          |
 | `NOIRE_SPEED=<km/h>`            | Vitesse initiale de la rame (défaut : 20 km/h)                     |
 | `NOIRE_PIN_CAM=1`               | Verrouille la caméra (cadrage reproductible pour les A/B à l'image) |
 | `NOIRE_PITCH=<rad>`             | Pitch de la caméra épinglée (avec `NOIRE_PIN_CAM`)                 |

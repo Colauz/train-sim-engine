@@ -34,7 +34,7 @@ enum class Key {
     Space, LeftShift, LeftControl,
     E, M, H, K, P, C, // E=urgence, M=pluie (M14), H=sifflet, K=KVB isolé (M21.5), P=portes (M21), C=caméra (M23)
     R, L,            // R=pluie (M21, P reprise par les portes), L=phares (M21)
-    Escape, F11, Enter,
+    Escape, F11, F1, Enter,   // F1 = cycle des niveaux de qualité (M54)
     Num1, Num2, Num3,
     Up, Down, Left, Right,
 };

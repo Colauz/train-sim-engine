@@ -228,6 +228,67 @@ constexpr float kPsdLeafTravel = 0.68f;
 constexpr double kBuildingCell = 30.0;        // une cellule de semis, en mètres
 constexpr double kBuildingHalfWidth = 380.0;  // portée latérale de part et d'autre du viaduc
 constexpr double kBuildingRange = 700.0;      // au-delà, une tour de 100 m fond dans la nuit
+
+// --- M54 : NIVEAUX DE QUALITÉ ------------------------------------------------
+// Un moteur qui ne tourne que sur la machine de son auteur n'est pas fini. Les trois
+// presets ci-dessous ne bricolent pas des « effets » : ils agissent sur les TROIS
+// postes que la mesure a désignés, et sur eux seuls.
+//
+//   1. la carte d'ombre — du remplissage pur : 2048² x 2 cascades, c'est 8,4 Mpixels
+//      de profondeur par frame, davantage que l'image affichée elle-même ;
+//   2. la portée des ombres — décide de la quantité de géométrie qui entre dans les
+//      cascades, donc du nombre de draws de la passe ;
+//   3. la portée des bâtiments — décide du nombre d'instances semées ET de la surface
+//      d'écran qu'elles couvrent (le poste de fragments le plus lourd de la scène).
+//
+// Ce qui n'y est PAS, volontairement : la géométrie de la voie, la rame, les gares.
+// Les dégrader rendrait le simulateur moins juste, pas plus rapide — ce ne sont pas
+// elles qui coûtent (mesuré : la voie et la rame pèsent moins d'un cinquième du temps
+// de frame, l'essentiel part dans les ombres et la ville).
+enum class QualityLevel : int { Low = 0, Medium = 1, High = 2 };
+
+struct QualityPreset {
+    const char* name;
+    std::uint32_t shadow_map_size;
+    float shadow_distance;     // m
+    double building_range;     // m
+    bool rain_enabled;
+};
+
+constexpr QualityPreset kQualityPresets[3] = {
+    // « Grille-pain » : ombres en 512 (16x moins de remplissage qu'en 2048), portée
+    // ramenée au strict entourage du train, ville resserrée, pluie coupée.
+    {"BAS",   512,  90.0f, 260.0, false},
+    {"MOYEN", 1024, 160.0f, 450.0, true},
+    {"HAUT",  2048, 250.0f, 700.0, true},
+};
+
+[[nodiscard]] const QualityPreset& preset_of(QualityLevel level) {
+    return kQualityPresets[static_cast<int>(level)];
+}
+
+// Niveau initial : NOIRE_QUALITY=low|medium|high, sinon HAUT. Une variable
+// d'environnement et non un fichier de config : c'est le seul mécanisme de réglage
+// que le moteur possède déjà (cf. tous les NOIRE_* du banc), et en ajouter un second
+// pour trois entiers ne se justifie pas.
+[[nodiscard]] QualityLevel initial_quality() {
+    const char* env = std::getenv("NOIRE_QUALITY");
+    if (env == nullptr) {
+        return QualityLevel::High;
+    }
+    const std::string value(env);
+    if (value == "low" || value == "bas" || value == "0") {
+        return QualityLevel::Low;
+    }
+    if (value == "medium" || value == "moyen" || value == "1") {
+        return QualityLevel::Medium;
+    }
+    if (value == "high" || value == "haut" || value == "2") {
+        return QualityLevel::High;
+    }
+    log::warn("NOIRE_QUALITY='{}' inconnu — attendu low|medium|high. Qualité HAUTE.", value);
+    return QualityLevel::High;
+}
 constexpr double kBuildingPadding = 3.0;      // M51 : vide MINIMAL entre deux bâtiments
 constexpr int kBuildingVariants = 3;          // tower / block / slab (gen_building.py)
 
@@ -508,6 +569,8 @@ struct Application::Impl {
     std::chrono::steady_clock::time_point perf_t0 = std::chrono::steady_clock::now();
     int perf_frames = 0;
     double perf_gpu_sum = 0.0;
+    double perf_cpu_sum = 0.0;   // M54 : temps CPU de construction de frame (ms), cumulé
+    double perf_cpu_ms = 0.0;
     double perf_fps = 0.0;
     double perf_gpu_ms = 0.0;
     bool rumble_source_applied = false;
@@ -687,6 +750,10 @@ struct Application::Impl {
     bool headlights_on = false;
     bool prev_l_down = false;
 
+    // --- Qualité (M54) : NOIRE_QUALITY au lancement, F1 pour cycler en jeu ----
+    QualityLevel quality_level = initial_quality();
+    bool prev_f1_down = false;
+
     // --- Portes (M30.5) -----------------------------------------------------
     // door_t : 0 = fermé, 1 = ouvert. Animation en 2 secondes (0.5/s).
     // Phase 1 [0..0.3] : sortie latérale de 10 cm (bouchon).
@@ -729,6 +796,10 @@ struct Application::Impl {
 
         jobs.start(2);
         audio.initialize();  // non fatal : no-op si aucun périphérique audio
+
+        // Qualité AVANT tout le reste : elle dimensionne les cartes d'ombre, et les
+        // recréer plus tard coûterait un wait_idle inutile au démarrage.
+        apply_quality();
 
         // --- SOL UNIFIÉ (M51/M53) : UN plan, à Y = 0, créé ICI et jamais refait ----
         // M51 l'avait mis en couleur UNIE après un épisode de sol en damier, et le
@@ -1033,6 +1104,16 @@ struct Application::Impl {
             window.toggle_fullscreen();
         }
         prev_f11_down = f11_down;
+
+        // M54 — F1 : cycle BAS -> MOYEN -> HAUT. Recevable même en pause : c'est
+        // justement là qu'on règle sa qualité, et l'opération est un wait_idle suivi
+        // d'une recréation de cartes d'ombre — quelques millisecondes, une fois.
+        const bool f1_down = window.is_key_down(Key::F1);
+        if (f1_down && !prev_f1_down) {
+            quality_level = static_cast<QualityLevel>((static_cast<int>(quality_level) + 1) % 3);
+            apply_quality();
+        }
+        prev_f1_down = f1_down;
 
         if (is_paused) {
             // Navigation dans le menu Pause (Flèches, Z/S, 1/2/3, Entrée)
@@ -1350,13 +1431,19 @@ struct Application::Impl {
             }
             const int dh = static_cast<int>(day_time / 3600.0) % 24;
             const int dm = static_cast<int>(day_time / 60.0) % 60;
+            // M54 : la ligne de télémétrie porte désormais la VENTILATION du temps GPU
+            // et le nombre de draws par passe. Un « 6 ms » global ne se corrige pas ;
+            // un « ombres 4,1 ms en 210 draws » se corrige.
             log::info("v={:6.1f} km/h | pente={:+5.1f}% | {} | chunks={} | "
                       "pluie={:.0f}% | phares={} | {:02d}:{:02d} | "
-                      "{:.0f} fps (GPU {:.1f} ms) | bâtiments={}/{} vis",
+                      "{:.0f} fps | CPU {:.3f} ms | GPU {:.1f} ms "
+                      "(ombres {:.1f} / scene {:.1f}) | draws {}+{} | bâtiments={}/{} vis",
                       wagon.speed() * 3.6, wagon.grade_percent(),
                       wagon.slipping() ? "PATINE   " : "adherent ", streamer.active_chunk_count(),
                       wetness * 100.0f, headlights_on ? "ON" : "OFF", dh, dm,
-                      perf_fps, perf_gpu_ms, visible, total);
+                      perf_fps, perf_cpu_ms, perf_gpu_ms, renderer.last_shadow_ms(),
+                      renderer.last_scene_ms(), renderer.last_shadow_draws(),
+                      renderer.last_scene_draws(), visible, total);
         }
     }
 
@@ -1442,6 +1529,10 @@ struct Application::Impl {
                                        static_cast<double>(wetness) * 100.0),
                            meteo_color);
         lines.emplace_back(std::format("{:>3.0f} FPS  GPU {:.1f} MS", perf_fps, perf_gpu_ms), label);
+        // M54 : le niveau de qualité doit être LISIBLE. Sans lui, un joueur qui trouve
+        // le jeu lent n'a aucun moyen de savoir qu'il tourne en HAUT, ni qu'une touche
+        // existe pour en changer.
+        lines.emplace_back(std::format("QUALITE  {} (F1)", preset_of(quality_level).name), label);
         // M23 : Témoin vert d'immobilisation complète (clamp zéro vitesse + frein actif)
         const glm::vec4 green_notice{0.15f, 0.90f, 0.25f, 1.0f};
         if (consist.immobilized()) {
@@ -1650,7 +1741,8 @@ struct Application::Impl {
     void reseed_buildings() {
         const WorldPosition wp = wagon.body_position();
         std::array<std::vector<render::InstanceData>, kBuildingVariants> seeded;
-        const auto cells = static_cast<long>(kBuildingRange / kBuildingCell) + 1;
+        const double range = building_range();
+        const auto cells = static_cast<long>(range / kBuildingCell) + 1;
         const long cx0 = static_cast<long>(std::floor(wp.x / kBuildingCell));
         const long cz0 = static_cast<long>(std::floor(wp.z / kBuildingCell));
 
@@ -1667,7 +1759,7 @@ struct Application::Impl {
                 const double wx = (static_cast<double>(ci) + 0.5) * kBuildingCell;
                 const double wz = (static_cast<double>(cj) + 0.5) * kBuildingCell;
 
-                if (std::hypot(wx - wp.x, wz - wp.z) > kBuildingRange) {
+                if (std::hypot(wx - wp.x, wz - wp.z) > range) {
                     continue;
                 }
 
@@ -1879,6 +1971,29 @@ struct Application::Impl {
         if (insulator_count > 0) {
             insulator_instances = renderer.create_instances(data.insulators);
         }
+    }
+
+    // M54 — Applique le preset courant. Le renderer reçoit ce qui le concerne (cartes
+    // d'ombre) ; l'app garde le reste (portée du bâti, pluie). Le semis de bâtiments
+    // est INVALIDÉ : sa portée vient de changer, et le laisser tel quel afficherait
+    // l'ancienne ville jusqu'au prochain franchissement de cellule.
+    void apply_quality() {
+        const QualityPreset& preset = preset_of(quality_level);
+        render::QualitySettings qs;
+        qs.shadow_map_size = preset.shadow_map_size;
+        qs.shadow_distance = preset.shadow_distance;
+        renderer.set_quality(qs);
+        building_snap_valid = false;
+        log::info("Qualité : {} — ombres {}px/{:.0f} m, ville {:.0f} m, pluie {}",
+                  preset.name, preset.shadow_map_size, preset.shadow_distance,
+                  preset.building_range, preset.rain_enabled ? "oui" : "non");
+    }
+
+    // Portée courante du semis de bâtiments : c'est le preset qui la fixe, plus la
+    // constante. Une seule source, lue partout (semis ET test de portée) — les faire
+    // diverger sèmerait des immeubles que le test rejetterait ensuite.
+    [[nodiscard]] double building_range() const {
+        return preset_of(quality_level).building_range;
     }
 
     // M53 — Bascule un matériau vers sa version texturée dès que ses trois cartes
@@ -2206,8 +2321,10 @@ struct Application::Impl {
             if (el >= 1.0) {
                 perf_fps = perf_frames / el;
                 perf_gpu_ms = perf_gpu_sum / perf_frames;
+                perf_cpu_ms = perf_cpu_sum / perf_frames;
                 perf_frames = 0;
                 perf_gpu_sum = 0.0;
+                perf_cpu_sum = 0.0;
                 perf_t0 = now;
             }
         }
@@ -2303,7 +2420,12 @@ struct Application::Impl {
         // le paysage file à l'écran. Caméra de face (train qui s'éloigne) => pas de biais
         // latéral, la pluie tombe droite ; caméra de profil à 300 km/h => elle raye
         // l'écran presque à l'horizontale. Le signe suit l'orbite, donc c'est cohérent.
-        uniforms.rain_intensity = wetness;
+        // M54 — En qualité BASSE, la passe de pluie est coupée. C'est un plein écran
+        // de fragments transparents et non triés, donc un coût de remplissage qui ne
+        // dépend QUE de la résolution : exactement ce qu'une machine faible ne peut
+        // pas absorber. Le reste de la météo (adhérence, brouillard, assombrissement)
+        // continue de vivre — on retire les gouttes, pas la pluie.
+        uniforms.rain_intensity = preset_of(quality_level).rain_enabled ? wetness : 0.0f;
         uniforms.rain_time = static_cast<float>(sim_time);
         const glm::vec3 train_vel =
             glm::vec3(wagon.front_bogie().tangent()) * static_cast<float>(wagon.speed());
@@ -2497,50 +2619,53 @@ struct Application::Impl {
         // le bogie roule sur le rail, la caisse flotte au-dessus sur ses ressorts.
         // M30.5 / M36 : les dernières primitives de la motrice / voiture sont les battants de porte
         // (16 battants en acier + optionnellement 16 décors de bande verte solidaire des portes).
-        constexpr int kDoorPairs = 8;  // 4 doubles portes par face
+        // M54 — QUATRE GROUPES DE BATTANTS, pas seize. Les 16 vantaux d'une voiture
+        // n'ont que quatre mouvements distincts : flanc droit ou gauche (sortie du
+        // bouchon), vantail A ou B (sens du coulissement). tools/gen_metro.py les
+        // fusionne donc par groupe, et cette boucle applique QUATRE transformations au
+        // lieu de trente-deux. Même image à l'écran, 24 draw calls de moins PAR
+        // VOITURE — 72 pour la rame, un quart de la passe scène.
+        constexpr int kDoorGroups = 4;  // (droit, gauche) x (vantail A, vantail B)
         const float door_t1 = glm::clamp(door_t / kDoorPlugPhase, 0.0f, 1.0f);
         const float door_t2 = door_slide_fraction(door_t);
         auto push_car = [&](const resource::ModelHandle& model, const glm::mat4& caisse_m) {
             const auto& prims = model->primitives;
             const int n_prims = static_cast<int>(prims.size());
-            const bool has_door_bands = n_prims >= 4 * kDoorPairs; // 32 primitives de portes (M36)
-            const bool has_doors = n_prims >= 2 * kDoorPairs;      // 16 primitives de portes
-            const int door_prims = has_door_bands ? 4 * kDoorPairs : (has_doors ? 2 * kDoorPairs : 0);
+            // Acier + bande verte (M36) : 8 primitives en tout. Un modèle sans bande
+            // n'en a que 4. En deçà, il n'a pas de portes animées du tout.
+            const bool has_door_bands = n_prims >= 2 * kDoorGroups;
+            const bool has_doors = n_prims >= kDoorGroups;
+            const int door_prims =
+                has_door_bands ? 2 * kDoorGroups : (has_doors ? kDoorGroups : 0);
             const auto body_count = static_cast<std::size_t>(n_prims - door_prims);
 
             for (std::size_t j = 0; j < body_count; ++j) {
                 const render::MaterialId mat = prims[j].material ? prims[j].material->id : 0;
                 items.push_back(render::DrawItem{caisse_m, prims[j].mesh, mat});
             }
-            if (door_prims > 0) {
-                for (int d = 0; d < kDoorPairs; ++d) {
-                    const float sx = (d < 4) ? +1.0f : -1.0f;  // flanc droit / gauche
-                    for (int leaf = 0; leaf < 2; ++leaf) {
-                        const float sz = (leaf == 0) ? -1.0f : +1.0f;  // A : -z, B : +z
-                        const glm::mat4 door_local = glm::translate(
-                            glm::mat4(1.0f),
-                            glm::vec3(sx * kDoorPlugTravel * door_t1, 0.0f,
-                                      sz * kDoorLeafTravel * door_t2));
-                        const int leaf_idx = 2 * d + leaf;
+            for (int g = 0; g < door_prims / (has_door_bands ? 2 : 1); ++g) {
+                // Ordre des groupes fixé par gen_metro : 0 = droit/A, 1 = droit/B,
+                // 2 = gauche/A, 3 = gauche/B.
+                const float sx = (g < 2) ? +1.0f : -1.0f;          // flanc
+                const float sz = (g % 2 == 0) ? -1.0f : +1.0f;     // A : -z, B : +z
+                const glm::mat4 door_local = glm::translate(
+                    glm::mat4(1.0f), glm::vec3(sx * kDoorPlugTravel * door_t1, 0.0f,
+                                               sz * kDoorLeafTravel * door_t2));
 
-                        // 1. Panneau de battant en acier
-                        const auto prim_steel = static_cast<std::size_t>(
-                            n_prims - door_prims + leaf_idx);
-                        const render::MaterialId mat_steel =
-                            prims[prim_steel].material ? prims[prim_steel].material->id : 0;
-                        items.push_back(
-                            render::DrawItem{caisse_m * door_local, prims[prim_steel].mesh, mat_steel});
+                // 1. Panneaux de battants en acier du groupe
+                const auto prim_steel = static_cast<std::size_t>(n_prims - door_prims + g);
+                const render::MaterialId mat_steel =
+                    prims[prim_steel].material ? prims[prim_steel].material->id : 0;
+                items.push_back(render::DrawItem{caisse_m * door_local,
+                                                 prims[prim_steel].mesh, mat_steel});
 
-                        // 2. Décoration bande verte sur le battant (si présente M36)
-                        if (has_door_bands) {
-                            const auto prim_band = static_cast<std::size_t>(
-                                n_prims - 2 * kDoorPairs + leaf_idx);
-                            const render::MaterialId mat_band =
-                                prims[prim_band].material ? prims[prim_band].material->id : 0;
-                            items.push_back(
-                                render::DrawItem{caisse_m * door_local, prims[prim_band].mesh, mat_band});
-                        }
-                    }
+                // 2. Bandes vertes solidaires des mêmes battants (M36)
+                if (has_door_bands) {
+                    const auto prim_band = static_cast<std::size_t>(n_prims - kDoorGroups + g);
+                    const render::MaterialId mat_band =
+                        prims[prim_band].material ? prims[prim_band].material->id : 0;
+                    items.push_back(render::DrawItem{caisse_m * door_local,
+                                                     prims[prim_band].mesh, mat_band});
                 }
             }
         };
@@ -2740,6 +2865,15 @@ struct Application::Impl {
                 fade_active = false;
             }
         }
+        // M54 — Coût CPU de la CONSTRUCTION de la frame : tout ce que l'app a fait
+        // depuis le début de render_frame (semis, culling, assemblage des DrawItem,
+        // HUD). Mesuré ICI et pas autour de draw_frame, parce que draw_frame contient
+        // l'attente du VSync : l'y inclure mesurerait la patience du CPU, pas son
+        // travail. Ce qui reste (1000/fps - cette valeur) est l'enregistrement des
+        // commandes plus l'attente.
+        perf_cpu_sum += std::chrono::duration<double>(std::chrono::steady_clock::now() - now)
+                            .count() * 1000.0;
+
         renderer.draw_frame(uniforms, items, hud);
     }
 

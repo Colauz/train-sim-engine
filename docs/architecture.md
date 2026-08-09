@@ -133,3 +133,14 @@ descendante : le moteur ne connaît pas le jeu.
   au-dessus des façades, ligne d'arrêt peinte, écart signé et règle graduée au pupitre.
   Le banc d'alignement a confirmé que les baies tombaient déjà en face des portes à
   ±1 mm : ce qui manquait n'était pas la géométrie, c'était le moyen de viser.
+- **M54 — Performance** *(fait)* : profil GPU ventilé (ombres / scène / HUD) et
+  compteurs de draws, sans lesquels toute optimisation est une devinette. Puis, dans
+  l'ordre de ce que la mesure a désigné : **culling de la passe d'ombres** par cascade
+  (sphère englobante calculée à la création du maillage, test asymétrique côté soleil)
+  et **rejet des casters sous-texel** ; **regroupement des vantaux de porte par
+  mouvement** (16 battants → 4 groupes : les 16 subissaient la même translation à
+  quatre variantes près) ; **suppression des liaisons d'état redondantes** dans les
+  deux passes. 868 draw calls → 410. Enfin trois **niveaux de qualité**
+  (`NOIRE_QUALITY`, touche `F1`) qui n'agissent que sur la résolution des cartes
+  d'ombre, la portée d'ombre et l'étendue de la ville. +30 % d'images par seconde en
+  qualité haute, +55 % en basse, à image identique en haute.

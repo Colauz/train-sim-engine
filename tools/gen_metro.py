@@ -11,9 +11,9 @@ Trois fichiers :
     rien ne bouche la vue depuis la tête du conducteur (0, 0.25, -8.55).
     Pupitre japonais : manipulateur unique à gauche (T-handle), 2 écrans, siège.
   * metro_voiture.glb : voiture intermédiaire, 4 PORTES DOUBLES coulissantes par
-    face. Les 16 battants sont les 16 DERNIÈRES primitives du GLB (embrasures
-    0-3 flanc droit x>0, 4-7 flanc gauche ; paire = vantail A puis B), convention
-    que l'app anime (bouchon latéral puis coulissement).
+    face. Les battants sont REGROUPÉS PAR MOUVEMENT dans les 8 DERNIÈRES primitives
+    du GLB — 4 groupes d'acier (droit/A, droit/B, gauche/A, gauche/B) puis leurs
+    4 bandes vertes. Convention que l'app anime (bouchon latéral puis coulissement).
   * metro_bogie.glb : bogie, origine au plan de roulement ; les 2 dernières
     primitives sont les essieux centrés à l'origine (roues Ø920, voie 1435 mm).
 
@@ -25,8 +25,8 @@ sur le toit ; décalé à z = +5 sur la motrice, où le pantographe occupe déj�
 milieu). M48 : pantographe en
 losange sur la motrice, phares blancs et feux rouges ÉMISSIFS HDR aux DEUX
 extrémités de la motrice (rame réversible). Toute cette géométrie vit dans des
-parts dont le matériau précède MAT_DOOR0 : les 32 battants de porte restent les
-32 DERNIÈRES primitives, et les 2 essieux les 2 dernières du bogie.
+parts dont le matériau précède MAT_DOOR0 : les 8 groupes de battants restent les
+8 DERNIÈRES primitives, et les 2 essieux les 2 dernières du bogie.
 
 Carrosserie : ACIER INOXYDABLE BROSSÉ (métallique) + bande verte Yamanote.
 
@@ -175,15 +175,27 @@ MAT_FEU_AR, MAT_CLIM, MAT_PANTO = 10, 11, 12
 MAT_FLOOR = len(MATERIALS)
 MATERIALS.append({"name": "sol", "factor": [1.0, 1.0, 1.0, 1.0], "metallic": 0.0,
                   "roughness": 1.0, **tex("floor")})
-# 16 slots de portes, pour que chaque battant soit une part (= une primitive) séparée ;
-# write_glb les DÉDUPLIQUE ensuite en un seul matériau glTF.
+# --- M54 : LES BATTANTS REGROUPÉS PAR MOUVEMENT ---------------------------------
+# Il y avait 16 battants dans 16 parts séparées, plus 16 bandes : 32 primitives, donc
+# 32 draw calls par voiture, soit 96 pour la rame — un tiers de toute la scène pour
+# des panneaux de 65 cm.
+#
+# Or ces 16 battants n'ont que QUATRE mouvements distincts : flanc droit ou gauche
+# (sortie du bouchon vers +x ou -x), vantail A ou B (coulissement vers -z ou +z). Tous
+# les battants d'un même groupe subissent EXACTEMENT la même translation à chaque
+# frame. Les garder séparés ne servait donc à rien — c'était payer 4 fois le même
+# draw. On les fusionne par groupe : 4 parts d'acier + 4 de bande verte.
+#
+# Ordre des groupes, que l'app recopie : 0 = droit/A, 1 = droit/B, 2 = gauche/A,
+# 3 = gauche/B.
+DOOR_GROUPS = 4
 MAT_DOOR0 = len(MATERIALS)
-for _ in range(16):
+for _ in range(DOOR_GROUPS):
     MATERIALS.append({"name": "porte", "factor": [1.0, 1.0, 1.0, 1.0],
                       "metallic": 1.0, "roughness": 1.0, **tex("steel")})
-# Bande verte sur les 16 battants de porte (M36)
+# Bande verte, découpée sur les mêmes groupes (M36)
 MAT_DOOR_BANDE0 = len(MATERIALS)
-for _ in range(16):
+for _ in range(DOOR_GROUPS):
     MATERIALS.append({"name": "bande", "factor": [0.42, 0.73, 0.35, 1.0],
                       "metallic": 0.20, "roughness": 0.55, **relief("panel")})
 # Bogie + 2 essieux (parts séparées, les 3 dernières du GLB bogie). Ils DOIVENT rester
@@ -605,17 +617,22 @@ def build_door_leaf(steel_part, bande_part, side, z0, z1):
 
 
 def build_door_parts(parts, doorways):
-    """LES 32 DERNIÈRES PARTS du GLB : battants (16 acier + 16 bande verte M36).
-    Embrasures 0-3 = flanc droit (x>0), 4-7 = flanc gauche ; paire = vantail A (coulisse vers -z)
-    puis B (vers +z). Convention INDEX que l'app C++ anime."""
+    """LES 8 DERNIÈRES PARTS du GLB : 4 groupes de battants en acier, puis les 4
+    groupes de bande verte correspondants (M36).
+
+    Un GROUPE réunit tous les battants qui bougent ensemble — les 4 vantaux A du
+    flanc droit, par exemple. Ordre : droit/A, droit/B, gauche/A, gauche/B. C'est la
+    convention d'INDEX que l'app C++ anime, et la seule chose qu'elle sache de ce
+    fichier : quatre translations, quatre primitives."""
     for d in range(8):
         side = 1.0 if d < 4 else -1.0
         z0, z1, _, _ = doorways[d % 4]
         zc = 0.5 * (z0 + z1)
-        # Vantail A
-        build_door_leaf(parts[MAT_DOOR0 + 2 * d], parts[MAT_DOOR_BANDE0 + 2 * d], side, z0, zc)
-        # Vantail B
-        build_door_leaf(parts[MAT_DOOR0 + 2 * d + 1], parts[MAT_DOOR_BANDE0 + 2 * d + 1], side, zc, z1)
+        base = 0 if d < 4 else 2          # flanc droit -> groupes 0/1, gauche -> 2/3
+        # Vantail A (coulisse vers -z) puis B (vers +z).
+        build_door_leaf(parts[MAT_DOOR0 + base], parts[MAT_DOOR_BANDE0 + base], side, z0, zc)
+        build_door_leaf(parts[MAT_DOOR0 + base + 1], parts[MAT_DOOR_BANDE0 + base + 1],
+                        side, zc, z1)
 
 
 def build_motrice(out):

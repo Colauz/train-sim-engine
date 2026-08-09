@@ -169,7 +169,7 @@ bool Renderer::initialize(const RendererCreateInfo& info) {
     }
 
     // Ombres du soleil (M8) : passe depth-only + cascades. Leur taille est fixe
-    // (kShadowMapSize) => indépendantes de la swapchain, donc créées une seule fois et
+    // (shadow_map_size_) => indépendantes de la swapchain, donc créées une seule fois et
     // jamais recréées au redimensionnement. AVANT les descriptor sets, qui référencent
     // les vues des cascades et le sampler comparatif (set 0, binding 1).
     if (!create_shadow_render_pass() || !create_shadow_resources() || !create_shadow_sampler() ||
@@ -256,7 +256,7 @@ bool Renderer::initialize(const RendererCreateInfo& info) {
         VkQueryPoolCreateInfo qp{};
         qp.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
         qp.queryType = VK_QUERY_TYPE_TIMESTAMP;
-        qp.queryCount = kFramesInFlight * 2;  // début + fin par frame en vol
+        qp.queryCount = kFramesInFlight * kTimestampsPerFrame;
         if (vkCreateQueryPool(context_.device(), &qp, nullptr, &timestamp_pool_) != VK_SUCCESS) {
             timestamp_pool_ = VK_NULL_HANDLE;
             log::warn("Renderer : création du query pool échouée, profil désactivé");
@@ -298,6 +298,26 @@ MeshId Renderer::create_mesh_indexed(const std::vector<MeshVertex>& vertices,
     mesh.topology = Topology::Triangles;
     mesh.indexed = true;
     mesh.ready = false;  // dessinable seulement après complétion du transfert GPU.
+
+    // M54 — SPHÈRE ENGLOBANTE, calculée UNE FOIS ici. C'est ce qui manquait pour que
+    // la passe d'ombres puisse rejeter quoi que ce soit : sans volume englobant, un
+    // maillage n'a aucune étendue connue, et le seul choix possible était de tout
+    // dessiner dans chaque cascade. Centre = milieu de la boîte englobante (et non
+    // moyenne des sommets, qui se laisse tirer par les zones densément tessellées),
+    // rayon = distance au sommet le plus éloigné de ce centre.
+    glm::vec3 lo = vertices[0].position;
+    glm::vec3 hi = vertices[0].position;
+    for (const MeshVertex& v : vertices) {
+        lo = glm::min(lo, v.position);
+        hi = glm::max(hi, v.position);
+    }
+    mesh.bounds_center = (lo + hi) * 0.5f;
+    float r2 = 0.0f;
+    for (const MeshVertex& v : vertices) {
+        r2 = std::max(r2, glm::dot(v.position - mesh.bounds_center,
+                                   v.position - mesh.bounds_center));
+    }
+    mesh.bounds_radius = std::sqrt(r2);
 
     const VkDeviceSize vsize = sizeof(MeshVertex) * vertices.size();
     const VkDeviceSize isize = sizeof(std::uint32_t) * indices.size();
@@ -942,7 +962,7 @@ bool Renderer::create_shadow_resources() {
     for (ShadowCascade& cascade : shadow_cascades_) {
         // SAMPLED dès maintenant : la passe principale échantillonnera ces cartes
         // (étape 2) sans qu'il faille recréer les images.
-        if (!context_.create_image(kShadowMapSize, kShadowMapSize, kShadowFormat,
+        if (!context_.create_image(shadow_map_size_, shadow_map_size_, kShadowFormat,
                                    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
                                        VK_IMAGE_USAGE_SAMPLED_BIT,
                                    cascade.image, cascade.allocation)) {
@@ -968,8 +988,8 @@ bool Renderer::create_shadow_resources() {
         fb.renderPass = shadow_render_pass_;
         fb.attachmentCount = 1;
         fb.pAttachments = &cascade.view;
-        fb.width = kShadowMapSize;
-        fb.height = kShadowMapSize;
+        fb.width = shadow_map_size_;
+        fb.height = shadow_map_size_;
         fb.layers = 1;
         if (vkCreateFramebuffer(context_.device(), &fb, nullptr, &cascade.framebuffer) !=
             VK_SUCCESS) {
@@ -1310,7 +1330,7 @@ void Renderer::update_shadow_cascades(const FrameUniforms& uniforms) {
     // z NDC de CHAQUE plan : c'est ce qui permet de déprojeter les coins dans le bon ordre.
     const float ndc_near = depth1 < depth0 ? 1.0f : 0.0f;
     const float ndc_far = depth1 < depth0 ? 0.0f : 1.0f;
-    const float shadow_far = std::min(kShadowDistance, far_plane);
+    const float shadow_far = std::min(shadow_distance_, far_plane);
     const float depth_range = far_plane - near_plane;
 
     // Coins du frustum caméra dans l'ESPACE FLOTTANT : la vue ne portant aucune
@@ -1336,6 +1356,7 @@ void Renderer::update_shadow_cascades(const FrameUniforms& uniforms) {
     const glm::vec3 up =
         std::abs(to_sun.y) > 0.99f ? glm::vec3(0.0f, 0.0f, 1.0f) : glm::vec3(0.0f, 1.0f, 0.0f);
     const glm::mat4 light_rotation = glm::lookAt(glm::vec3(0.0f), -to_sun, up);
+    shadow_light_rotation_ = light_rotation;
 
     float slice_near = near_plane;
     for (std::uint32_t i = 0; i < kShadowCascades; ++i) {
@@ -1374,7 +1395,7 @@ void Renderer::update_shadow_cascades(const FrameUniforms& uniforms) {
         // Snap du centre sur la grille de texels de la carte, en espace lumière :
         // sans ça, un déplacement sub-texel fait grouiller le bord des ombres.
         glm::vec3 center_light(light_rotation * glm::vec4(center, 1.0f));
-        const float units_per_texel = (2.0f * radius) / static_cast<float>(kShadowMapSize);
+        const float units_per_texel = (2.0f * radius) / static_cast<float>(shadow_map_size_);
         // Le snap doit ancrer la grille de texels sur le MONDE, pas sur la caméra. Or tout
         // ce cadrage vit en caméra-relatif, où `center_light` est CONSTANT à orientation
         // fixe : y appliquer floor() quantifiait une constante en une constante — un snap
@@ -1409,6 +1430,10 @@ void Renderer::update_shadow_cascades(const FrameUniforms& uniforms) {
 
         shadow_cascades_[i].light_view_proj = light_projection * light_rotation;
         shadow_cascades_[i].split_depth = slice_far;
+        // Le volume EFFECTIVEMENT couvert, après snap : c'est celui-là que la passe
+        // d'ombres doit interroger, pas le volume théorique d'avant snap.
+        shadow_cascades_[i].center_light = center_light;
+        shadow_cascades_[i].radius = radius;
         slice_near = slice_far;
     }
 }
@@ -1416,16 +1441,39 @@ void Renderer::update_shadow_cascades(const FrameUniforms& uniforms) {
 void Renderer::record_shadow_pass(VkCommandBuffer cmd, const std::vector<DrawItem>& items) {
     VkClearValue clear{};
     clear.depthStencil = {1.0f, 0};
+    std::uint32_t shadow_draws = 0;
 
     // Viewport/scissor dynamiques (comme les autres pipelines) : ici toujours la
     // taille fixe de la carte.
     VkViewport viewport{};
-    viewport.width = static_cast<float>(kShadowMapSize);
-    viewport.height = static_cast<float>(kShadowMapSize);
+    viewport.width = static_cast<float>(shadow_map_size_);
+    viewport.height = static_cast<float>(shadow_map_size_);
     viewport.minDepth = 0.0f;
     viewport.maxDepth = 1.0f;
     VkRect2D scissor{};
-    scissor.extent = {kShadowMapSize, kShadowMapSize};
+    scissor.extent = {shadow_map_size_, shadow_map_size_};
+
+    // M54 — LE TEST DE CASTER. Un objet doit être dessiné dans une cascade s'il peut
+    // projeter DEDANS, ce qui n'est pas la même chose qu'« être dedans » : un immeuble
+    // situé entre le soleil et la cascade projette dessus sans y être. D'où un test
+    // asymétrique — borné en x et y (le rayon du volume, élargi du rayon de l'objet),
+    // ouvert du côté du soleil, fermé de l'autre.
+    //
+    // Le seul faux négatif possible serait de rejeter un vrai caster, ce qui ferait un
+    // trou visible dans l'ombre ; c'est pour ça que tout ce qui n'a pas de sphère
+    // connue (rayon 0) et tout ce qui est INSTANCIÉ (le maillage décrit une instance,
+    // pas la nuée) passe sans être testé.
+    const auto casts_into = [](const ShadowCascade& cascade, const glm::mat4& light_rotation,
+                               const glm::vec3& center_rel, float radius) {
+        const glm::vec3 c(light_rotation * glm::vec4(center_rel, 1.0f));
+        const float reach = cascade.radius + radius;
+        if (std::abs(c.x - cascade.center_light.x) > reach) return false;
+        if (std::abs(c.y - cascade.center_light.y) > reach) return false;
+        // La lumière regarde vers -Z : un z PLUS GRAND est plus près du soleil, donc
+        // toujours un caster potentiel. On ne rejette que ce qui est entièrement
+        // DERRIÈRE le volume, hors de portée de son plan lointain.
+        return c.z + radius >= cascade.center_light.z - cascade.radius;
+    };
 
     for (const ShadowCascade& cascade : shadow_cascades_) {
         VkRenderPassBeginInfo rp{};
@@ -1433,13 +1481,18 @@ void Renderer::record_shadow_pass(VkCommandBuffer cmd, const std::vector<DrawIte
         rp.renderPass = shadow_render_pass_;
         rp.framebuffer = cascade.framebuffer;
         rp.renderArea.offset = {0, 0};
-        rp.renderArea.extent = {kShadowMapSize, kShadowMapSize};
+        rp.renderArea.extent = {shadow_map_size_, shadow_map_size_};
         rp.clearValueCount = 1;
         rp.pClearValues = &clear;
         vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
 
         vkCmdSetViewport(cmd, 0, 1, &viewport);
         vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+        // État lié courant : rebinder un pipeline déjà lié coûte un appel driver pour
+        // rien, et il y en avait UN PAR OBJET. Sur cette passe, presque tout partage
+        // le même pipeline — le suivi ramène des centaines de binds à quelques-uns.
+        VkPipeline bound_pipeline = VK_NULL_HANDLE;
 
         for (const DrawItem& item : items) {
             const auto mesh_it = meshes_.find(item.mesh);
@@ -1449,6 +1502,38 @@ void Renderer::record_shadow_pass(VkCommandBuffer cmd, const std::vector<DrawIte
             const Mesh& mesh = mesh_it->second;
             if (!mesh.ready || mesh.topology == Topology::Lines) {
                 continue;  // transfert en cours, ou géométrie filaire (ne porte pas d'ombre)
+            }
+            // Culling par cascade (M54). Les instanciés en sont exemptés : leur sphère
+            // est celle d'UNE instance, elle ne dit rien de l'étendue du semis.
+            if (mesh.bounds_radius > 0.0f && item.instances == 0 &&
+                item.cpu_instances == nullptr) {
+                const glm::vec3 center(item.model * glm::vec4(mesh.bounds_center, 1.0f));
+                // Échelle du modèle : la plus grande des trois colonnes. Les matrices
+                // du moteur sont des rotations+translations (échelle 1), sauf les
+                // ModelTransform calibrés — ne pas en tenir compte rétrécirait la
+                // sphère d'un modèle agrandi, et le ferait disparaître de l'ombre.
+                const float sx = glm::length(glm::vec3(item.model[0]));
+                const float sy = glm::length(glm::vec3(item.model[1]));
+                const float sz = glm::length(glm::vec3(item.model[2]));
+                const float radius = mesh.bounds_radius * std::max(sx, std::max(sy, sz));
+                if (!casts_into(cascade, shadow_light_rotation_, center, radius)) {
+                    continue;
+                }
+                // REJET SOUS-TEXEL. Une cascade a une résolution finie : un objet dont
+                // le diamètre couvre moins de quelques texels ne peut PAS y écrire une
+                // ombre lisible — le filtrage PCF l'efface de toute façon. Le dessiner
+                // coûte un draw complet pour un résultat invisible.
+                //
+                // C'est le poste le plus lourd de la rame : ses vantaux de porte, ses
+                // poignées, ses boutons de pupitre sont des dizaines de primitives
+                // minuscules, chacune payée deux fois (une par cascade). Le seuil est
+                // volontairement bas — on jette ce qui est indiscutablement invisible,
+                // pas ce qui est « petit ».
+                const float texels_per_meter =
+                    static_cast<float>(shadow_map_size_) / (2.0f * cascade.radius);
+                if (2.0f * radius * texels_per_meter < kMinShadowCasterTexels) {
+                    continue;
+                }
             }
             // Les CÂBLES ne portent pas d'ombre, et ne le peuvent pas : leur ruban est déplié
             // face à la CAMÉRA par le vertex shader, alors que cette passe regarde depuis le
@@ -1489,7 +1574,11 @@ void Renderer::record_shadow_pass(VkCommandBuffer cmd, const std::vector<DrawIte
                 push.wind_params = glm::vec4(shadow_time_, 0.0f, 0.0f, 0.0f);
                 push.base_color_factor = material.base_color_factor;
 
-                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, shadow_pipeline_foliage_);
+                if (bound_pipeline != shadow_pipeline_foliage_) {
+                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                      shadow_pipeline_foliage_);
+                    bound_pipeline = shadow_pipeline_foliage_;
+                }
                 vkCmdPushConstants(cmd, shadow_foliage_pipeline_layout_,
                                    VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                                    sizeof(push), &push);
@@ -1500,24 +1589,75 @@ void Renderer::record_shadow_pass(VkCommandBuffer cmd, const std::vector<DrawIte
                 vkCmdBindVertexBuffers(cmd, 1, 1, &inst_it->second.buffer, &offset);
                 vkCmdBindIndexBuffer(cmd, mesh.index_buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
                 vkCmdDrawIndexed(cmd, mesh.index_count, item.instance_count, 0, 0, 0);
+                ++shadow_draws;
                 continue;
             }
 
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                              mesh.indexed ? shadow_pipeline_mesh_ : shadow_pipeline_legacy_);
+            const VkPipeline want =
+                mesh.indexed ? shadow_pipeline_mesh_ : shadow_pipeline_legacy_;
+            if (bound_pipeline != want) {
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, want);
+                bound_pipeline = want;
+            }
             vkCmdPushConstants(cmd, shadow_pipeline_layout_, VK_SHADER_STAGE_VERTEX_BIT, 0,
                                sizeof(glm::mat4), &light_mvp);
             vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertex_buffer.buffer, &offset);
             if (mesh.indexed) {
                 vkCmdBindIndexBuffer(cmd, mesh.index_buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
                 vkCmdDrawIndexed(cmd, mesh.index_count, 1, 0, 0, 0);
+                ++shadow_draws;
             } else {
                 vkCmdDraw(cmd, mesh.vertex_count, 1, 0, 0);
+                ++shadow_draws;
             }
         }
 
         vkCmdEndRenderPass(cmd);
     }
+    last_shadow_draws_ = shadow_draws;
+}
+
+void Renderer::rewrite_shadow_descriptors() {
+    std::array<VkDescriptorImageInfo, kShadowCascades> infos{};
+    for (std::size_t c = 0; c < kShadowCascades; ++c) {
+        infos[c].sampler = shadow_sampler_;
+        infos[c].imageView = shadow_cascades_[c].view;
+        infos[c].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }
+    for (const VkDescriptorSet set : descriptor_sets_) {
+        VkWriteDescriptorSet write{};
+        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet = set;
+        write.dstBinding = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        write.descriptorCount = static_cast<std::uint32_t>(infos.size());
+        write.pImageInfo = infos.data();
+        vkUpdateDescriptorSets(context_.device(), 1, &write, 0, nullptr);
+    }
+}
+
+void Renderer::set_quality(const QualitySettings& quality) {
+    const bool resize = quality.shadow_map_size != shadow_map_size_ &&
+                        quality.shadow_map_size > 0;
+    quality_ = quality;
+    shadow_distance_ = quality.shadow_distance;
+    if (!resize) {
+        return;
+    }
+    // Les cartes sont référencées par des sets qu'une frame en vol peut encore lire :
+    // on attend le GPU avant de les détruire. C'est le seul endroit du moteur où un
+    // wait_idle est justifié — un changement de réglage, pas un événement de frame.
+    wait_idle();
+    destroy_shadow_resources();
+    shadow_map_size_ = quality.shadow_map_size;
+    if (!create_shadow_resources()) {
+        log::error("Renderer : recréation des cartes d'ombre en {}x{} échouée",
+                   shadow_map_size_, shadow_map_size_);
+        return;
+    }
+    rewrite_shadow_descriptors();
+    log::info("Renderer : cartes d'ombre {}x{} x{} cascades, portée {:.0f} m",
+              shadow_map_size_, shadow_map_size_, kShadowCascades, shadow_distance_);
 }
 
 void Renderer::destroy_shadow_resources() {
@@ -3598,9 +3738,9 @@ void Renderer::record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
     // Le reset doit être commandé sur la file, PAS depuis le CPU : les deux requêtes du
     // slot ont été relues juste avant, et leur ancienne valeur doit disparaître avant
     // d'être réécrite — sinon vkGetQueryPoolResults rendrait un résultat périmé.
-    const std::uint32_t query_base = current_frame_ * 2;
+    const std::uint32_t query_base = current_frame_ * kTimestampsPerFrame;
     if (timestamp_pool_ != VK_NULL_HANDLE) {
-        vkCmdResetQueryPool(cmd, timestamp_pool_, query_base, 2);
+        vkCmdResetQueryPool(cmd, timestamp_pool_, query_base, kTimestampsPerFrame);
         // TOP_OF_PIPE : dès que la commande entre dans la file. Le pendant BOTTOM_OF_PIPE
         // n'est écrit qu'une fois TOUT le travail précédent retiré — l'intervalle couvre
         // donc bien l'exécution complète, ombres comprises.
@@ -3609,10 +3749,19 @@ void Renderer::record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
         timestamp_written_[current_frame_] = true;
     }
 
+    last_scene_draws_ = 0;
+
     // Ombres d'abord : les cartes doivent être remplies avant que la passe principale
     // ne les échantillonne (la synchro est portée par les dépendances de la render
     // pass d'ombre). Le cadrage des cascades a été calculé dans draw_frame.
     record_shadow_pass(cmd, items);
+
+    // Borne 1 : fin des ombres. BOTTOM_OF_PIPE, donc écrite une fois les cascades
+    // réellement retirées — pas quand la commande est enregistrée.
+    if (timestamp_pool_ != VK_NULL_HANDLE) {
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestamp_pool_,
+                            query_base + 1);
+    }
 
     std::array<VkClearValue, 2> clears{};
     clears[0].color = {{background_color_.r, background_color_.g, background_color_.b, 1.0f}};
@@ -3649,16 +3798,17 @@ void Renderer::record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
     // le slot n'est plus lu par le GPU — même garantie que l'UBO et le HUD.
     stream_cursor_bytes_ = 0;
 
-    // Curseur du tampon de streaming (M15) : remis à zéro à chaque frame, avancé au fil des
-    // DrawItem cullés. L'écriture se fait ICI, après le vkWaitForFences de draw_frame, donc
-    // le slot n'est plus lu par le GPU — même garantie que l'UBO et le HUD.
-    stream_cursor_bytes_ = 0;
-
     // M22 : séparation opaques / transparents (vitrage) pour éviter de casser le Z-Buffer.
     // Les opaques écrivent la profondeur ; les transparents sont triés du plus LOIN au plus
     // PROCHE de la caméra, puis dessinés sans écriture Z (depth-write = false, depth-test = true).
-    std::vector<const DrawItem*> opaque_items;
-    std::vector<const DrawItem*> transparent_items;
+    //
+    // M54 : les deux listes sont des MEMBRES, vidées et non détruites. Elles étaient
+    // reconstruites à chaque frame, donc deux allocations tas par frame, éternellement
+    // de la même taille — de la pure dépense de heap à 300 Hz.
+    std::vector<const DrawItem*>& opaque_items = opaque_scratch_;
+    std::vector<const DrawItem*>& transparent_items = transparent_scratch_;
+    opaque_items.clear();
+    transparent_items.clear();
     opaque_items.reserve(items.size());
 
     for (const DrawItem& item : items) {
@@ -3687,6 +3837,27 @@ void Renderer::record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
                   const glm::vec3 pos_b(b->model[3]);
                   return glm::dot(pos_a, pos_a) > glm::dot(pos_b, pos_b);
               });
+
+    // État lié courant de la passe principale (M54). Chaque DrawItem rebindait son
+    // pipeline, ses trois descriptor sets et ses tampons, y compris quand rien n'avait
+    // changé depuis le draw précédent — et l'app soumet ses objets par familles
+    // (toutes les tuiles de voie, puis toute la rame...), donc la quasi-totalité de ces
+    // liaisons était redondante. On ne rebinde que ce qui bouge.
+    VkPipeline bound_pipeline = VK_NULL_HANDLE;
+    VkDescriptorSet bound_material = VK_NULL_HANDLE;
+    VkBuffer bound_vertex = VK_NULL_HANDLE;
+    VkBuffer bound_index = VK_NULL_HANDLE;
+    // Le suivi d'état n'est valable que sur une suite ININTERROMPUE de draw_item_list.
+    // Le ciel et la pluie s'intercalent entre les opaques et les transparents avec
+    // leurs propres pipelines et sets : après eux, ce que l'on croit lié ne l'est plus.
+    // Oublier cet appel serait le bug le plus vicieux du lot — un rendu correct la
+    // plupart du temps, faux dès qu'un transparent suit un opaque du même matériau.
+    const auto forget_bound_state = [&] {
+        bound_pipeline = VK_NULL_HANDLE;
+        bound_material = VK_NULL_HANDLE;
+        bound_vertex = VK_NULL_HANDLE;
+        bound_index = VK_NULL_HANDLE;
+    };
 
     auto draw_item_list = [&](const std::vector<const DrawItem*>& list) {
         for (const DrawItem* item_ptr : list) {
@@ -3762,24 +3933,51 @@ void Renderer::record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
                                                       : pipeline_textured_;
                 const VkPipelineLayout layout =
                     terrain ? terrain_pipeline_layout_ : textured_pipeline_layout_;
-                const std::array<VkDescriptorSet, 3> sets{frame_ubo, material.descriptor, env_set};
-                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0,
-                                        static_cast<std::uint32_t>(sets.size()), sets.data(), 0,
-                                        nullptr);
+                if (bound_pipeline != pipeline) {
+                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+                    bound_pipeline = pipeline;
+                    // Changer de pipeline peut changer de LAYOUT (terrain vs texturé) :
+                    // les sets liés ne sont plus garantis compatibles, on les réémet.
+                    bound_material = VK_NULL_HANDLE;
+                }
+                if (bound_material != material.descriptor) {
+                    const std::array<VkDescriptorSet, 3> sets{frame_ubo, material.descriptor,
+                                                              env_set};
+                    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0,
+                                            static_cast<std::uint32_t>(sets.size()), sets.data(),
+                                            0, nullptr);
+                    bound_material = material.descriptor;
+                }
+                // Les push constants, elles, portent la matrice de CET objet : jamais
+                // redondantes, toujours réémises.
                 vkCmdPushConstants(cmd, layout,
                                    VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                                    sizeof(push), &push);
-                vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertex_buffer.buffer, &offset);
+                if (bound_vertex != mesh.vertex_buffer.buffer) {
+                    vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertex_buffer.buffer, &offset);
+                    bound_vertex = mesh.vertex_buffer.buffer;
+                }
                 if (instanced) {
+                    // Toujours réémis : l'offset dans le tampon de streaming avance à
+                    // chaque objet instancié, le binding n'est donc jamais identique.
                     vkCmdBindVertexBuffers(cmd, 1, 1, &instance_buffer, &instance_offset);
                 }
-                vkCmdBindIndexBuffer(cmd, mesh.index_buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
+                if (bound_index != mesh.index_buffer.buffer) {
+                    vkCmdBindIndexBuffer(cmd, mesh.index_buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
+                    bound_index = mesh.index_buffer.buffer;
+                }
                 vkCmdDrawIndexed(cmd, mesh.index_count, instanced ? instance_draw : 1, 0, 0, 0);
+                ++last_scene_draws_;
             } else {
                 // Géométrie debug (grille, rails, cubes de secours) : couleur par sommet.
                 VkPipeline pipeline =
                     mesh.topology == Topology::Lines ? pipeline_lines_ : pipeline_triangles_;
+                // Chemin debug : autre layout, autres sets. Il casse le suivi d'état,
+                // donc il le remet à zéro plutôt que de le laisser mentir.
+                bound_pipeline = VK_NULL_HANDLE;
+                bound_material = VK_NULL_HANDLE;
+                bound_vertex = VK_NULL_HANDLE;
+                bound_index = VK_NULL_HANDLE;
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
                 vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_, 0, 1,
                                         &frame_ubo, 0, nullptr);
@@ -3787,6 +3985,7 @@ void Renderer::record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
                                    sizeof(glm::mat4), &item.model);
                 vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertex_buffer.buffer, &offset);
                 vkCmdDraw(cmd, mesh.vertex_count, 1, 0, 0);
+                ++last_scene_draws_;
             }
         }
     };
@@ -3798,6 +3997,7 @@ void Renderer::record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
     // donc l'early-z rejette le ciel partout où elle est passée. Le dessiner en premier
     // coûterait un fragment plein écran systématique.
     record_skybox(cmd);
+    forget_bound_state();
 
     // Passe 2 : transparents (triés back-to-front) APRÈS LE CIEL (M24) : le verre
     // n'écrit pas de profondeur, donc un ciel dessiné après lui le repeindrait partout
@@ -3808,6 +4008,12 @@ void Renderer::record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
     // rester net par-dessus). Toujours dans la même passe.
     record_rain(cmd, uniforms);
 
+    // Borne 2 : fin de la scène, avant le HUD.
+    if (timestamp_pool_ != VK_NULL_HANDLE) {
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestamp_pool_,
+                            query_base + 2);
+    }
+
     // Le HUD en tout dernier : à l'écran, sans profondeur, il couvre tout le reste — y
     // compris la pluie.
     record_hud(cmd, glyph_count);
@@ -3816,7 +4022,7 @@ void Renderer::record_commands(VkCommandBuffer cmd, std::uint32_t image_index,
 
     if (timestamp_pool_ != VK_NULL_HANDLE) {
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestamp_pool_,
-                            query_base + 1);
+                            query_base + 3);
     }
     vkEndCommandBuffer(cmd);
 }
@@ -3841,12 +4047,17 @@ void Renderer::draw_frame(const FrameUniforms& uniforms, const std::vector<DrawI
     // ses deux timestamps sont donc disponibles, et on les lit SANS attendre. Les
     // premières frames n'ont encore rien écrit -> VK_NOT_READY, qu'on ignore.
     if (timestamp_pool_ != VK_NULL_HANDLE && timestamp_written_[current_frame_]) {
-        std::array<std::uint64_t, 2> ticks{};
+        std::array<std::uint64_t, kTimestampsPerFrame> ticks{};
         const VkResult qres = vkGetQueryPoolResults(
-            dev, timestamp_pool_, current_frame_ * 2, 2, sizeof(ticks), ticks.data(),
-            sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT);
-        if (qres == VK_SUCCESS && ticks[1] > ticks[0]) {
-            last_gpu_ms_ = static_cast<float>(ticks[1] - ticks[0]) * timestamp_period_ * 1e-6f;
+            dev, timestamp_pool_, current_frame_ * kTimestampsPerFrame, kTimestampsPerFrame,
+            sizeof(ticks), ticks.data(), sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT);
+        if (qres == VK_SUCCESS && ticks[3] > ticks[0]) {
+            const auto ms = [this](std::uint64_t a, std::uint64_t b) {
+                return b > a ? static_cast<float>(b - a) * timestamp_period_ * 1e-6f : 0.0f;
+            };
+            last_gpu_ms_ = ms(ticks[0], ticks[3]);
+            last_shadow_ms_ = ms(ticks[0], ticks[1]);
+            last_scene_ms_ = ms(ticks[1], ticks[2]);
         }
     }
 

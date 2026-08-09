@@ -30,8 +30,27 @@ struct RendererCreateInfo {
 // suffisent pour une sim ferroviaire (une proche très détaillée autour du train, une
 // large pour le paysage). Au-delà de kShadowDistance, plus d'ombre projetée.
 inline constexpr std::uint32_t kShadowCascades = 2;
+// Valeurs par DÉFAUT (qualité haute). Elles ne sont plus figées : cf. QualitySettings.
 inline constexpr std::uint32_t kShadowMapSize = 2048;
 inline constexpr float kShadowDistance = 250.0f;  // portée max des ombres (m)
+// M54 — Diamètre minimal, EN TEXELS de la carte d'ombre, sous lequel un caster est
+// ignoré. En dessous, le PCF de la passe principale efface sa contribution : on paie
+// un draw pour rien. 3 texels est le seuil au-delà duquel une différence commence à
+// se voir sur une comparaison d'images.
+inline constexpr float kMinShadowCasterTexels = 3.0f;
+
+// M54 — LES DEUX SEULS LEVIERS GPU QUE LE RENDERER EXPOSE.
+//
+// Ce ne sont pas des « options graphiques » décoratives : ce sont les deux postes qui
+// dominent le coût d'une frame sur une machine faible. La carte d'ombre est un coût
+// de REMPLISSAGE pur (2048² x 2 cascades = 8,4 Mpixels de profondeur par frame, plus
+// que l'image affichée) ; la portée décide, elle, de la QUANTITÉ de géométrie qui y
+// entre. Les diviser par deux divise le poste par quatre et par deux respectivement,
+// sans toucher à une seule ligne du reste du moteur.
+struct QualitySettings {
+    std::uint32_t shadow_map_size = kShadowMapSize;
+    float shadow_distance = kShadowDistance;
+};
 
 // Paramètres d'ENTRÉE de la frame, fournis par l'app (uniquement des float :
 // l'origine flottante est déjà résolue côté CPU). Le Renderer en dérive l'UBO
@@ -277,12 +296,29 @@ public:
     void wait_idle();
     void notify_resized() { framebuffer_resized_ = true; }
 
+    // Applique un niveau de qualité. Changer la RÉSOLUTION des cartes d'ombre impose
+    // de les recréer, donc un wait_idle : c'est une opération de réglage, à faire à
+    // l'initialisation ou sur une action explicite du joueur, jamais par frame.
+    // Changer la seule portée est gratuit (elle n'est lue qu'au cadrage des cascades).
+    void set_quality(const QualitySettings& quality);
+    [[nodiscard]] const QualitySettings& quality() const { return quality_; }
+
     // Temps GPU de la dernière frame achevée, en millisecondes. À ne PAS confondre avec
     // le temps de frame CPU : celui-ci est plafonné par le VSync (FIFO), donc il mesure
     // l'ATTENTE, pas le travail. Les timestamps, eux, chronomètrent l'exécution réelle du
     // command buffer et ignorent le VSync — c'est la seule mesure honnête de la marge.
     // 0 tant qu'aucune mesure n'est revenue (les toutes premières frames).
     [[nodiscard]] float last_gpu_ms() const { return last_gpu_ms_; }
+    // M54 — Décomposition du temps GPU. `shadow` = les cascades, `scene` = opaques +
+    // ciel + transparents + pluie. Le reste (HUD, présentations) est la différence
+    // avec last_gpu_ms(). Sans cette ventilation, impossible de dire si un gain vient
+    // de là où on l'a cherché.
+    [[nodiscard]] float last_shadow_ms() const { return last_shadow_ms_; }
+    [[nodiscard]] float last_scene_ms() const { return last_scene_ms_; }
+    // Nombre de draws réellement soumis à la dernière frame enregistrée, par passe.
+    // C'est le compteur qui dit si le culling sert à quelque chose.
+    [[nodiscard]] std::uint32_t last_shadow_draws() const { return last_shadow_draws_; }
+    [[nodiscard]] std::uint32_t last_scene_draws() const { return last_scene_draws_; }
 
 private:
     struct Mesh {
@@ -295,6 +331,12 @@ private:
         // false tant que le transfert GPU asynchrone n'est pas terminé (chemin M7).
         // Les maillages host-visible (M2) sont prêts dès leur création.
         bool ready = true;
+        // Sphère englobante en espace MODÈLE (M54), pour le culling de la passe
+        // d'ombres. rayon = 0 => inconnue : l'objet n'est alors JAMAIS rejeté, ce qui
+        // est le seul défaut acceptable (un caster manquant est un trou dans l'ombre,
+        // visible ; un caster dessiné pour rien ne coûte que du temps).
+        glm::vec3 bounds_center{0.0f};
+        float bounds_radius = 0.0f;
     };
 
     // Texture GPU (M7 étape 3) : image + vue. `ready` bascule à true quand le transfert
@@ -373,6 +415,11 @@ private:
         VkFramebuffer framebuffer = VK_NULL_HANDLE;
         glm::mat4 light_view_proj{1.0f};
         float split_depth = 0.0f;  // distance de vue où finit la cascade (m)
+        // M54 — Le volume de la cascade, tel qu'il a servi à cadrer l'ortho : centre
+        // en ESPACE LUMIÈRE et rayon. Conservé pour que la passe d'ombres puisse
+        // tester un caster contre lui sans refaire le cadrage.
+        glm::vec3 center_light{0.0f};
+        float radius = 0.0f;
     };
 
     bool create_descriptor_set_layout();
@@ -609,6 +656,21 @@ private:
     // uniforms, et le vent DOIT être le même que dans la vue caméra : sinon l'arbre se
     // balance et son ombre reste plantée.
     float shadow_time_ = 0.0f;
+    // Rotation seule de la « vue » du soleil (il est directionnel : pas d'origine).
+    // Partagée par toutes les cascades — c'est elle qui amène un centre d'objet en
+    // espace lumière pour le tester contre le volume de chaque cascade (M54).
+    glm::mat4 shadow_light_rotation_{1.0f};
+    // Listes de tri opaques/transparents, réutilisées d'une frame à l'autre (M54) :
+    // leur capacité se stabilise dès les premières frames et plus rien n'alloue.
+    std::vector<const DrawItem*> opaque_scratch_;
+    std::vector<const DrawItem*> transparent_scratch_;
+    QualitySettings quality_{};
+    std::uint32_t shadow_map_size_ = kShadowMapSize;
+    float shadow_distance_ = kShadowDistance;
+    // Réécrit le binding 1 (les cartes d'ombre) des sets de frame. Obligatoire après
+    // toute recréation des cascades : les anciennes vues sont détruites, et un set qui
+    // les référence encore est un descripteur pendouillant.
+    void rewrite_shadow_descriptors();
     std::array<ShadowCascade, kShadowCascades> shadow_cascades_{};
 
     // Profondeur (partagée) pour le test de profondeur 3D.
@@ -663,16 +725,28 @@ private:
     // M39 : nuit étoilée bleu très sombre plutôt que noir pur.
     glm::vec3 background_color_{0.02f, 0.02f, 0.06f};
 
-    // Chronométrage GPU : 2 timestamps (début/fin du command buffer) par frame en vol.
-    // On relit ceux du slot courant APRÈS son fence — donc les valeurs datent de
-    // kFramesInFlight frames, ce qui est sans importance pour un profil.
+    // Chronométrage GPU. On relit les requêtes du slot courant APRÈS son fence — donc
+    // les valeurs datent de kFramesInFlight frames, ce qui est sans importance pour un
+    // profil.
+    //
+    // M54 — QUATRE horodatages au lieu de deux. Un total de frame ne dit pas OÙ passe
+    // le temps, et « optimiser » sans le savoir revient à tirer au hasard : la passe
+    // d'ombres et la passe principale ont des coûts qui n'ont RIEN à voir (l'une est
+    // limitée par le nombre de draws, l'autre par les pixels) et ne se corrigent pas
+    // avec les mêmes leviers. Les bornes sont : début, fin des ombres, fin de la scène
+    // (avant HUD), fin de frame.
+    static constexpr std::uint32_t kTimestampsPerFrame = 4;
     VkQueryPool timestamp_pool_ = VK_NULL_HANDLE;
     float timestamp_period_ = 0.0f;  // ns par tick (limite du device)
     float last_gpu_ms_ = 0.0f;
+    float last_shadow_ms_ = 0.0f;
+    float last_scene_ms_ = 0.0f;
     // Un slot n'est lisible qu'une fois SA première frame enregistrée : relire une requête
     // jamais écrite est une faute (VUID-vkGetQueryPoolResults-None-09401), et pas
     // seulement une valeur douteuse.
     std::array<bool, kFramesInFlight> timestamp_written_{};
+    std::uint32_t last_shadow_draws_ = 0;
+    std::uint32_t last_scene_draws_ = 0;
 
     std::uint32_t current_frame_ = 0;
     bool framebuffer_resized_ = false;
