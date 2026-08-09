@@ -205,6 +205,10 @@ StationMeshes generate_station(const TrackSource& track, double s_center,
                                const WorldPosition& origin, const StationProfile& profile) {
     StationMeshes meshes;
     RailMeshData& out = meshes.concrete;
+    // Tuile d'un mètre pour la bande podotactile : ses plots font 20 cm, ils doivent
+    // sortir à leur taille réelle. Le reste de la gare est sur la tuile de 4 m du
+    // viaduc (uv_period ci-dessous) — deux échelles, deux périodes.
+    constexpr float kTactileUvPeriod = 1.0f;
     const double s0 = s_center - profile.length * 0.5;
     const double s1 = s_center + profile.length * 0.5;
     const glm::vec3 world_up(0.0f, 1.0f, 0.0f);
@@ -225,6 +229,15 @@ StationMeshes generate_station(const TrackSource& track, double s_center,
         f.up = glm::normalize(glm::cross(f.right, forward));
         f.u = static_cast<float>((s - s0) / uv_period);
         frames.push_back(f);
+    }
+
+    // Les mêmes frames, mais graduées pour la tuile d'un mètre de la bande
+    // podotactile (cf. l'usage plus bas). Une copie d'une quinzaine de repères :
+    // moins cher que de rendre `extrude` paramétrable, et surtout impossible à
+    // confondre avec les frames du quai.
+    std::vector<Frame> tactile_frames = frames;
+    for (Frame& f : tactile_frames) {
+        f.u *= uv_period / kTactileUvPeriod;
     }
 
     // --- Quais (M52) : nez de quai au gabarit de la rame, plancher de plain-pied ---
@@ -269,7 +282,33 @@ StationMeshes generate_station(const TrackSource& track, double s_center,
         if (sign < 0.0f) {
             std::reverse(platform.begin(), platform.end());
         }
-        extrude(out, frames, platform, uv_period);
+        // M53 : la dalle part dans SON PROPRE maillage (carrelage de quai), plus
+        // dans le béton de structure. Même géométrie, matériau différent.
+        extrude(meshes.platform, frames, platform, uv_period);
+
+        // Bande podotactile : un plat surélevé de 12 mm posé sur la dalle, derrière
+        // la façade vitrée. Extrudé sur les MÊMES frames que le quai, donc il en
+        // épouse exactement la courbure et la pente — un ruban posé « à plat sur le
+        // monde » se décollerait du quai dès la première rampe.
+        //
+        // ...mais sur des frames dont le U a été RECALÉ : `extrude` prend le U tel
+        // qu'il est déjà porté par les frames (calculé pour la tuile de 4 m du
+        // viaduc) et ne dérive du paramètre `uv_period` que le V. Réutiliser les
+        // frames telles quelles étirerait donc les plots d'un facteur 4 dans le sens
+        // de la marche : des ovales, pas des plots.
+        const float t_in = sign * profile.tactile_inner;
+        const float t_out = sign * (profile.tactile_inner + profile.tactile_width);
+        const float t_top = top + profile.tactile_rise;
+        // Enfoncée de 5 mm DANS la dalle : sa face inférieure n'est alors coplanaire
+        // avec rien (la discipline anti-z-fighting du M30.5, appliquée ici aussi).
+        const float t_bot = top - 0.005f;
+        std::vector<P2> band = {
+            {t_in, t_bot}, {t_out, t_bot}, {t_out, t_top}, {t_in, t_top},
+        };
+        if (sign < 0.0f) {
+            std::reverse(band.begin(), band.end());
+        }
+        extrude(meshes.tactile, tactile_frames, band, kTactileUvPeriod);
     }
 
     // Verrière (M50) : caisson plan STRICTEMENT borné, dans son propre maillage.
@@ -450,19 +489,23 @@ StationMeshes generate_station(const TrackSource& track, double s_center,
         }
     }
 
-    // Repère d'arrêt (stop marker). Cotes M50, inchangées : plaque de 0,5 x 0,5 m,
-    // 0,1 m d'épaisseur (demi-cotes 0,25/0,25/0,05), carré tourné de 45° (le losange
-    // japonais), matériau émissif, à +2,00 m au-dessus du plan de roulement — la
-    // hauteur des yeux du conducteur. L'épaisseur est portée par `forward` : la
-    // plaque FAIT FACE au train entrant.
-    //
-    // M52 — SA POSITION. Elle était arbitraire (3 m avant le bout du quai) : le
-    // conducteur qui s'y alignait plaçait sa rame 40 m trop loin, portes en face du
-    // verre fixe. Le repère est désormais posé au chainage EXACT de la cabine quand
-    // le centre de la rame coïncide avec le centre de la gare — c'est-à-dire au
+    // --- REPÈRE D'ARRÊT (停止位置目標) ----------------------------------------
+    // M52 avait corrigé sa POSITION : le losange est au chainage EXACT de la cabine
+    // quand le centre de la rame coïncide avec celui de la gare, c'est-à-dire au
     // point d'arrêt dont dérive aussi `door_centers`. Repère et baies vitrées
-    // viennent donc du MÊME calcul : s'aligner sur le losange, c'est nécessairement
-    // avoir chaque porte de la rame en face de sa baie.
+    // sortent du MÊME calcul : s'aligner sur le losange, c'est nécessairement avoir
+    // chaque porte de la rame en face de sa baie.
+    //
+    // M53 corrige ce qu'il en restait d'INUTILISABLE. Il y avait bien un repère,
+    // mais un seul, du côté droit, planté au MILIEU du quai à +2,00 m — soit
+    // derrière la façade vitrée et hors de l'axe du regard. Viser « à peu près le
+    // petit losange » ne permet pas de tenir 50 cm. Trois choses changent :
+    //   1. il est posé des DEUX CÔTÉS (la ligne est banale dans les deux sens) ;
+    //   2. il monte à +2,95 m, au-dessus de la façade, à hauteur d'œil de cabine ;
+    //   3. une LIGNE D'ARRÊT est peinte en travers des deux quais à son chainage.
+    // Le losange dit « où », la ligne dit « exactement où » : sur les derniers
+    // mètres, c'est elle qu'on regarde, parce qu'une ligne se juge au centimètre
+    // alors qu'un panneau vu de biais, non.
     {
         const double s_mark = chainage_at_arc(track, s_center, profile.stop_marker_offset);
         glm::dvec3 pos_world;
@@ -470,24 +513,47 @@ StationMeshes generate_station(const TrackSource& track, double s_center,
         track.sample(s_mark, pos_world, tangent);
         const glm::vec3 forward = glm::vec3(glm::normalize(tangent));
         const glm::vec3 right = glm::normalize(glm::cross(forward, world_up));
-        const float k = 0.70710678f;  // cos/sin 45°
-        const glm::vec3 diag_r = (right + glm::vec3(0.0f, 1.0f, 0.0f)) * k;
-        const glm::vec3 diag_u = (glm::vec3(0.0f, 1.0f, 0.0f) - right) * k;
-        const float marker_y = 2.0f;
-        // Même règle que les façades : on s'élève selon la normale de la voie, sinon
-        // le losange glisse le long du quai sur les sections en pente — et c'est
-        // précisément le repère qui ne doit PAS bouger d'un millimètre.
+        // Même règle que les façades : on s'élève selon la NORMALE DE LA VOIE, sinon
+        // le repère glisse le long du quai sur les sections en pente — et c'est
+        // précisément lui qui ne doit PAS bouger d'un millimètre.
         const glm::vec3 up_frame = glm::normalize(glm::cross(right, forward));
-        const glm::vec3 mid = glm::vec3(pos_world - origin) +
-                              right * ((in + out_w) * 0.5f) + up_frame * marker_y;
-        // Mât fin (4 cm) du dessus du quai au losange, dans le béton. Sa hauteur suit
-        // le quai : elle se recalcule, elle n'est plus codée en dur (le quai est
-        // passé de +1,10 m à +1,20 m au M52, le mât aurait flotté).
-        const float mast_h = marker_y - top;
-        add_box(out, mid - glm::vec3(0.0f, mast_h * 0.5f, 0.0f), right, forward,
-                glm::vec3(0.0f, 1.0f, 0.0f), glm::vec3(0.02f, mast_h * 0.5f, 0.02f), uv_period);
-        add_box(meshes.signs, mid, diag_r, forward, diag_u,
-                glm::vec3(0.25f, 0.25f, 0.05f), uv_period);  // 0,5 x 0,5 x 0,1 m
+        const glm::vec3 anchor = glm::vec3(pos_world - origin);
+        const float k = 0.70710678f;  // cos/sin 45°
+
+        for (const float sign : {-1.0f, 1.0f}) {
+            const glm::vec3 lat = right * (sign * profile.marker_lateral);
+            // Losange : carré tourné de 45° dans le plan (travers voie, vertical),
+            // épaisseur portée par `forward` => la plaque FAIT FACE au train.
+            const glm::vec3 diag_r = (right * sign + up_frame) * k;
+            const glm::vec3 diag_u = (up_frame - right * sign) * k;
+            const glm::vec3 mid = anchor + lat + up_frame * profile.marker_y;
+            add_box(meshes.signs, mid, diag_r, forward, diag_u,
+                    glm::vec3(profile.marker_half, profile.marker_half, 0.05f), uv_period);
+            // Mât fin (4 cm) du dessus du quai au losange. Sa hauteur se RECALCULE
+            // depuis le quai : codée en dur, elle aurait laissé le mât flotter au
+            // premier changement de cote de dalle (c'est arrivé au M52).
+            const float mast_h = profile.marker_y - top;
+            add_box(out, anchor + lat + up_frame * (top + mast_h * 0.5f), right, forward,
+                    up_frame, glm::vec3(0.02f, mast_h * 0.5f, 0.02f), uv_period);
+        }
+
+        // Ligne d'arrêt peinte, en travers des deux quais. Elle démarre au-delà de
+        // la bande podotactile (deux surfaces ne se disputent pas le même plan) et
+        // court jusqu'à la rive extérieure. Elle mord de 4 mm DANS la dalle et en
+        // ressort de 6 mm : de la peinture épaisse, dont aucune face n'est
+        // coplanaire avec le quai.
+        const float line_in = profile.tactile_inner + profile.tactile_width + 0.02f;
+        const float line_len = out_w - line_in;
+        if (line_len > 0.1f) {
+            for (const float sign : {-1.0f, 1.0f}) {
+                const glm::vec3 mid = anchor +
+                                      right * (sign * (line_in + line_len * 0.5f)) +
+                                      up_frame * (top + 0.001f);
+                add_box(meshes.markings, mid, right, forward, up_frame,
+                        glm::vec3(line_len * 0.5f, 0.005f, profile.stop_line_half),
+                        kTactileUvPeriod);
+            }
+        }
     }
     return meshes;
 }

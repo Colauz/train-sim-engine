@@ -126,8 +126,20 @@ void append_box(std::vector<render::MeshVertex>& verts, std::vector<std::uint32_
 // 12 km - 0,5 km de dérive = 11,5 km de marge : la rive est toujours hors champ.
 constexpr double kGroundHalfExtent = 12000.0;
 // Pas de RÉ-ANCRAGE (le maillage, lui, n'est jamais régénéré : on ne bouge que sa
-// matrice modèle). Grossier exprès — la couleur étant unie, rien ne peut « glisser ».
+// matrice modèle).
 constexpr double kGroundAnchorStep = 1000.0;
+// M53 — Côté de la tuile d'enrobé, en mètres. Même valeur que l'uv_period du viaduc
+// et des quais : une seule échelle pour toutes les surfaces bâties, sinon deux
+// bétons voisins n'ont pas le même grain et ça se voit immédiatement.
+constexpr double kGroundUvPeriod = 4.0;
+// Le sol porte désormais des UV en mètres, SOLIDAIRES de son repère ré-ancré. Si le
+// pas de ré-ancrage ne tombait pas sur une période entière, la texture sauterait
+// d'une fraction de tuile à chaque kilomètre parcouru — le sol entier glisserait
+// sous le train. La contrainte est donc vérifiée à la COMPILATION, pas espérée.
+static_assert(kGroundAnchorStep / kGroundUvPeriod ==
+                  static_cast<double>(static_cast<long>(kGroundAnchorStep / kGroundUvPeriod)),
+              "Le pas de ré-ancrage du sol doit être un multiple entier de la période UV, "
+              "sinon la texture du sol saute à chaque ré-ancrage.");
 
 // Couleurs de la voie, portées par le base_color_factor de leur matériau (M8 étape 3).
 // Valeurs LINÉAIRES (la conversion sRGB est matérielle).
@@ -176,6 +188,42 @@ inline const scene::TrainLayout& train_layout() {
 // C'est du GAMEPLAY (la difficulté de l'exercice), pas de la géométrie — d'où sa
 // place ici et non dans TrainLayout.
 constexpr double kStopTolerance = 0.5;
+// M53 — Le cran «定位置 » : l'arrêt jugé parfait par un contrôleur japonais. Il ne
+// change RIEN à l'ouverture des portes (c'est kStopTolerance qui décide), il n'est
+// que la mention affichée. Séparer les deux, c'est pouvoir durcir la notation sans
+// rendre le jeu injouable, et inversement.
+constexpr double kStopPerfect = 0.15;
+// Portée d'affichage de l'aide à l'alignement : au-delà, elle encombrerait le HUD
+// pour rien (le conducteur roule, il ne vise pas encore).
+constexpr double kStopAidRange = 400.0;
+// Demi-échelle de la règle graduée d'approche, en mètres : le curseur sort du cadre
+// au-delà. 12 m, c'est la longueur d'une demi-voiture — l'ordre de grandeur qu'on
+// corrige au frein, pas la distance à parcourir.
+constexpr double kStopAidSpan = 12.0;
+
+// --- M30.5/M53 : CINÉMATIQUE DES PORTES, UNE SEULE FOIS ----------------------
+// Ces cotes étaient éparpillées entre update_physics (vitesse), le rendu de la rame
+// (course des vantaux, phases) et le rendu des façades de quai (course, pas de
+// phase du tout). Résultat : les portes du train et celles du quai ne s'ouvraient
+// PAS ensemble — le verre partait immédiatement quand la rame, elle, passait
+// d'abord 0,6 s à déboucher ses vantaux latéralement. 0,6 s de décalage sur une
+// ouverture de 2 s, c'est un tiers du mouvement : parfaitement visible.
+//
+// Tout est désormais ici, et les deux géométries lisent les mêmes nombres.
+constexpr float kDoorSpeed = 0.5f;        // 1/s => 2 s pour ouvrir ou fermer
+constexpr float kDoorPlugPhase = 0.3f;    // part du cycle passée à déboucher (portes-bouchon)
+constexpr float kDoorPlugTravel = 0.10f;  // sortie latérale d'un vantail de rame (m)
+constexpr float kDoorLeafTravel = 0.60f;  // course de coulissement d'un vantail de rame (m)
+// Vantail de quai : il doit dégager toute la baie (2 x door_half = 1,30 m), donc sa
+// propre largeur (0,65 m) plus 3 cm de garde.
+constexpr float kPsdLeafTravel = 0.68f;
+
+// Fraction de COULISSEMENT à l'instant `t` du cycle d'ouverture. Avant la fin du
+// débouchage, un vantail ne coulisse pas : il sort. C'est cette courbe, et elle
+// seule, qui doit piloter le glissement — côté rame comme côté quai.
+[[nodiscard]] constexpr float door_slide_fraction(float t) {
+    return glm::clamp((t - kDoorPlugPhase) / (1.0f - kDoorPlugPhase), 0.0f, 1.0f);
+}
 
 constexpr double kBuildingCell = 30.0;        // une cellule de semis, en mètres
 constexpr double kBuildingHalfWidth = 380.0;  // portée latérale de part et d'autre du viaduc
@@ -279,6 +327,24 @@ enum class MasconNotch : int {
             return glm::vec4{0.15f, 0.90f, 0.25f, 1.0f};  // Vert
     }
     return glm::vec4{1.0f, 1.0f, 1.0f, 1.0f};
+}
+
+// M53 — Couleur de l'écart au point d'arrêt. Trois paliers, et ils veulent dire
+// quelque chose de précis : vert vif = arrêt parfait, vert = les portes de quai
+// s'ouvriront, orange = elles resteront closes. Le conducteur lit donc le RÉSULTAT
+// de son freinage, pas juste un nombre.
+[[nodiscard]] glm::vec4 stop_aid_color(double error) {
+    const double a = std::abs(error);
+    if (a <= kStopPerfect) {
+        return glm::vec4{0.25f, 1.0f, 0.35f, 1.0f};
+    }
+    if (a <= kStopTolerance) {
+        return glm::vec4{0.55f, 0.90f, 0.35f, 1.0f};
+    }
+    if (a <= 2.0) {
+        return glm::vec4{0.95f, 0.80f, 0.10f, 1.0f};
+    }
+    return glm::vec4{1.0f, 0.55f, 0.10f, 1.0f};
 }
 
 struct Application::Impl {
@@ -402,6 +468,26 @@ struct Application::Impl {
     resource::TextureHandle ballast_nor;
     bool ballast_textured = false;
 
+    // --- M53 : LES SURFACES DU MONDE ONT UNE MATIÈRE -------------------------
+    // Avant, tout ce qui n'était pas du ballast était peint en COULEUR UNIE :
+    // béton du viaduc, quais, sol de la ville. Une couleur unie ne donne aucune
+    // échelle — un aplat gris de 20 m de haut et un aplat gris de 2 m se
+    // ressemblent, et c'est ce qui faisait « maquette ». Chaque jeu ci-dessous est
+    // un triplet base color / ARM / normale engendré par tools/gen_textures.py,
+    // tuilable, calé sur la MÊME période que les UV de la géométrie (4 m pour le
+    // viaduc et les quais, 1 m pour la bande podotactile).
+    struct PbrTextureSet {
+        resource::TextureHandle diff, arm, nor;
+        bool applied = false;  // une seule tentative de bascule, réussie ou non
+        [[nodiscard]] bool on_gpu() const {
+            return diff && diff->id != 0 && arm && arm->id != 0 && nor && nor->id != 0;
+        }
+    };
+    PbrTextureSet tex_concrete;   // viaduc, piles, colonnes, structure de gare
+    PbrTextureSet tex_platform;   // dalle de quai (carrelage 50 cm)
+    PbrTextureSet tex_asphalt;    // sol unifié de la ville
+    PbrTextureSet tex_tactile;    // bande podotactile
+
     // Bâtiments (M31) : un tampon d'instances PAR VARIANTE (le pipeline instancié ne
     // connaît qu'une échelle uniforme, la variété des proportions est dans les modèles).
     // Refaits quand le train change de cellule ; le semis est purement fonction du hash,
@@ -487,6 +573,19 @@ struct Application::Impl {
     render::MeshId station_sign_mesh = 0;
     render::MeshId station_sign_uploading = 0;
     render::MaterialId station_sign_material = 0;  // émissif
+    // M53 — La gare n'est plus d'un seul bloc de béton. Chaque surface qui a une
+    // MATIÈRE distincte a son maillage : le carrelage des quais, la bande
+    // podotactile jaune, la ligne d'arrêt peinte. Fusionner, c'était condamner les
+    // trois à partager la texture du viaduc.
+    render::MeshId platform_mesh = 0;
+    render::MeshId platform_uploading = 0;
+    render::MaterialId platform_material = 0;   // carrelage de quai
+    render::MeshId tactile_mesh = 0;
+    render::MeshId tactile_uploading = 0;
+    render::MaterialId tactile_material = 0;    // bande podotactile (jaune à plots)
+    render::MeshId marking_mesh = 0;
+    render::MeshId marking_uploading = 0;
+    render::MaterialId marking_material = 0;    // ligne d'arrêt peinte (légèrement émissive)
     // Verrière (M50) : maillage DÉDIÉ, borné à 20 x 150 m par gare. Séparé du béton
     // du viaduc parce qu'il est TRANSLUCIDE — il se dessine avec les transparents.
     render::MeshId canopy_mesh = 0;
@@ -631,18 +730,24 @@ struct Application::Impl {
         jobs.start(2);
         audio.initialize();  // non fatal : no-op si aucun périphérique audio
 
-        // --- SOL UNIFIÉ (M51) : UN quad, UNE couleur, créé ICI et jamais refait ----
-        // Aucune texture : une texture répétée sur 24 km rejouerait exactement le bug
-        // qu'on vient d'éteindre (grille visible, couture à chaque période, aliasing
-        // au loin). Couleur unie, donc rien ne peut moirer ni clignoter.
-        const scene::RailMeshData plane = scene::generate_ground_plane(kGroundHalfExtent);
+        // --- SOL UNIFIÉ (M51/M53) : UN plan, à Y = 0, créé ICI et jamais refait ----
+        // M51 l'avait mis en couleur UNIE après un épisode de sol en damier, et le
+        // raisonnement d'alors était juste : une texture mal calée sur 24 km moire.
+        // Mais la conclusion était trop large. Ce qui moirait, c'était une période
+        // fausse sans mips ; une tuile d'enrobé de 4 m, mippée et anisotrope, ne
+        // moire pas — elle donne au sol de la ville la seule chose qui lui manquait,
+        // une MATIÈRE. Le quad devient donc une grille (UV métriques par cellule,
+        // cf. generate_ground_plane) et reçoit l'enrobé.
+        const scene::RailMeshData plane =
+            scene::generate_ground_plane(kGroundHalfExtent, kGroundUvPeriod);
         ground_mesh = renderer.create_mesh_indexed(plane.vertices, plane.indices);
         render::MaterialDesc ground_desc;
-        ground_desc.base_color_factor = glm::vec4(0.11f, 0.12f, 0.12f, 1.0f);  // gris très sombre
-        ground_desc.metallic_factor = 0.0f;    // béton : diélectrique
+        // Secours avant l'arrivée des cartes : le gris sombre du M51, à l'identique.
+        ground_desc.base_color_factor = glm::vec4(0.11f, 0.12f, 0.12f, 1.0f);
+        ground_desc.metallic_factor = 0.0f;    // enrobé : diélectrique
         ground_desc.roughness_factor = 0.95f;  // totalement mat
         ground_material = renderer.create_material(ground_desc);
-        log::info("M51 : sol unifié — 1 quad de {:.0f} km de côté, à Y = 0",
+        log::info("M51 : sol unifié — plan de {:.0f} km de côté, à Y = 0",
                   2.0 * kGroundHalfExtent / 1000.0);
 
         // Voie (M9) : pas de texture, la couleur vient du seul base_color_factor (le
@@ -803,6 +908,32 @@ struct Application::Impl {
         sign_desc.roughness_factor = 0.6f;
         station_sign_material = renderer.create_material(sign_desc);
 
+        // --- M53 : les trois matériaux propres au quai ------------------------
+        // Secours en couleur unie, remplacés par leur version texturée dès que les
+        // cartes sont sur le GPU (cf. apply_pbr_set) : la gare est dessinable dès
+        // la première frame, texturée dès la seconde ou la troisième.
+        render::MaterialDesc plat_desc;
+        plat_desc.base_color_factor = glm::vec4(0.55f, 0.54f, 0.52f, 1.0f);
+        plat_desc.metallic_factor = 0.0f;
+        plat_desc.roughness_factor = 0.55f;
+        platform_material = renderer.create_material(plat_desc);
+
+        render::MaterialDesc tac_desc;
+        tac_desc.base_color_factor = glm::vec4(0.72f, 0.45f, 0.05f, 1.0f);  // jaune podotactile
+        tac_desc.metallic_factor = 0.0f;
+        tac_desc.roughness_factor = 0.65f;
+        tactile_material = renderer.create_material(tac_desc);
+
+        // Ligne d'arrêt : peinture blanche, LÉGÈREMENT émissive. L'émissif n'est pas
+        // là pour faire joli — la ligne doit rester lisible de nuit sous la verrière,
+        // à 100 m, depuis la cabine. C'est un repère de conduite avant d'être un décor.
+        render::MaterialDesc mark_desc;
+        mark_desc.base_color_factor = glm::vec4(0.60f, 0.58f, 0.52f, 1.0f);
+        mark_desc.emissive_factor = glm::vec3(0.55f, 0.52f, 0.42f);
+        mark_desc.metallic_factor = 0.0f;
+        mark_desc.roughness_factor = 0.70f;
+        marking_material = renderer.create_material(mark_desc);
+
         // Bâtiments Neo-Tokyo (M31) : trois gabarits, semés par reseed_buildings().
         const char* building_files[kBuildingVariants] = {
             "models/building_a.glb", "models/building_b.glb", "models/building_c.glb"};
@@ -830,6 +961,24 @@ struct Application::Impl {
         // M51 : les 6 cartes de splatting du terrain (herbe/craie) ne sont plus
         // chargées — plus rien ne les échantillonne depuis que le sol est un quad uni.
         // C'est ~40 Mio de VRAM et 6 décodages JPEG en moins au démarrage.
+
+        // --- M53 : les surfaces bâties (tools/gen_textures.py) -----------------
+        // Même discipline d'espace colorimétrique que le ballast : la base color est
+        // du sRGB, l'ARM et la normale sont des DONNÉES. Les charger en sRGB
+        // fausserait rugosité et relief — c'est l'erreur qui rend un PBR « plastique ».
+        const auto load_set = [this](PbrTextureSet& set, const char* dir, const char* name) {
+            const std::string base = std::string("textures/") + dir + "/" + name;
+            set.diff = resources.load_texture(base + "_diff.png",
+                                              render::TextureFormat::SrgbColor);
+            set.arm = resources.load_texture(base + "_arm.png",
+                                             render::TextureFormat::LinearData);
+            set.nor = resources.load_texture(base + "_nor.png",
+                                             render::TextureFormat::LinearData);
+        };
+        load_set(tex_concrete, "world", "concrete");
+        load_set(tex_platform, "world", "platform");
+        load_set(tex_asphalt, "world", "asphalt");
+        load_set(tex_tactile, "world", "tactile");
 
         // Ciel HDR (M8 étape 6a). 1024 par face => ~64 Mio de VRAM avec les mips, le
         // compromis retenu pour un iGPU. Absent => le fond uni est conservé.
@@ -1174,18 +1323,22 @@ struct Application::Impl {
                 log::info("Portes : FERMETURE");
             }
         }
-        const float door_speed = 0.5f;
         const float door_dir = doors_opening ? 1.0f : -1.0f;
-        door_t = glm::clamp(door_t + static_cast<float>(dt) * door_speed * door_dir, 0.0f, 1.0f);
+        door_t = glm::clamp(door_t + static_cast<float>(dt) * kDoorSpeed * door_dir, 0.0f, 1.0f);
 
         // M52 — Façades de quai : elles suivent l'AUTORISATION verrouillée à la
         // commande d'ouverture (arrêt de précision), et rien d'autre. La fenêtre de
         // ±30 m du M49 laissait les façades s'ouvrir avec la rame à 30 m des baies.
         // Elles se referment avec les portes de la rame, comme il se doit.
+        //
+        // M53 — MÊME HORLOGE que la rame : même vitesse, même instant de départ, et
+        // (côté rendu) même courbe de coulissement. `psd_t` et `door_t` sont donc
+        // rigoureusement égaux tant que l'ouverture est autorisée — c'est ce qui
+        // fait que les deux portes bougent ENSEMBLE, au lieu de se suivre.
         {
             const bool psd_open = doors_opening && psd_authorized;
             const float psd_dir = psd_open ? 1.0f : -1.0f;
-            psd_t = glm::clamp(psd_t + static_cast<float>(dt) * door_speed * psd_dir,
+            psd_t = glm::clamp(psd_t + static_cast<float>(dt) * kDoorSpeed * psd_dir,
                                0.0f, 1.0f);
         }
 
@@ -1257,6 +1410,31 @@ struct Application::Impl {
         lines.emplace_back(std::format("CG      {: >5.1f} BAR", brake.pipe_pressure()),
                            brake.emergency() ? alert : value);
         lines.emplace_back(std::format("PENTE    {: >+5.1f} %", wagon.grade_percent()), label);
+
+        // --- M53 : AIDE À L'ARRÊT (定位置停止) --------------------------------
+        // Le M52 avait rendu l'arrêt de précision DÉCISIF (pas de portes de quai
+        // au-delà de 50 cm) sans donner au conducteur le moindre moyen de le
+        // réussir : un losange de 50 cm à demi caché derrière le vitrage, et rien
+        // d'autre. Viser 50 cm à l'œil nu sur un repère pareil, ce n'est pas
+        // difficile, c'est du hasard — et comme les façades ne s'ouvraient donc
+        // jamais, elles avaient l'air cassées.
+        //
+        // Le pupitre affiche maintenant ce que tout métro moderne affiche : la
+        // distance signée au point d'arrêt. Loin, c'est un compte à rebours ; près,
+        // c'est un écart au centimètre. La règle graduée, plus bas, en donne la
+        // lecture d'un coup d'œil.
+        const double stop_err = stop_error();
+        const bool near_station = std::abs(stop_err) < kStopAidRange;
+        if (near_station) {
+            if (std::abs(stop_err) > kStopAidSpan) {
+                // Approche : la distance qui RESTE (donc l'opposé de l'écart, qui
+                // est compté positif une fois le repère dépassé).
+                lines.emplace_back(std::format("ARRET  {: >6.0f} M", -stop_err), label);
+            } else {
+                lines.emplace_back(std::format("ARRET  {: >+6.2f} M", stop_err),
+                                   stop_aid_color(stop_err));
+            }
+        }
         // Météo (M14 → touche R) : mot d'état + intensité. Bleuté sous la pluie.
         const bool raining = wetness > 0.5f;
         const glm::vec4 meteo_color = raining ? glm::vec4{0.45f, 0.65f, 1.0f, 1.0f} : label;
@@ -1268,6 +1446,27 @@ struct Application::Impl {
         const glm::vec4 green_notice{0.15f, 0.90f, 0.25f, 1.0f};
         if (consist.immobilized()) {
             lines.emplace_back("IMMOBILISE", green_notice);
+        }
+
+        // M53 — Verdict de l'arrêt, à l'arrêt seulement. C'est LE retour qui manquait :
+        // avant, une rame arrêtée 80 cm trop loin donnait exactement le même pupitre
+        // qu'une rame parfaitement à quai, et le conducteur découvrait le problème en
+        // voyant les façades rester closes, sans jamais savoir de combien il s'était
+        // trompé ni dans quel sens.
+        const bool halted_at_platform = near_station && std::abs(wagon.speed()) <= 0.01;
+        if (halted_at_platform) {
+            if (doors_opening) {
+                lines.emplace_back(psd_authorized ? "PORTES QUAI OUVERTES"
+                                                  : "PORTES QUAI CLOSES (ARRET RATE)",
+                                   psd_authorized ? green_notice : alert);
+            } else if (std::abs(stop_err) <= kStopPerfect) {
+                lines.emplace_back("ARRET PARFAIT - P POUR OUVRIR", green_notice);
+            } else if (std::abs(stop_err) <= kStopTolerance) {
+                lines.emplace_back("A QUAI - P POUR OUVRIR", green_notice);
+            } else {
+                lines.emplace_back(std::format("HORS TOLERANCE ({:+.2f} M)", stop_err),
+                                   glm::vec4{1.0f, 0.55f, 0.10f, 1.0f});
+            }
         }
 
         // ATS (M30 / M34) : témoin prioritaire.
@@ -1304,6 +1503,41 @@ struct Application::Impl {
 
         render::Hud hud;
         hud.rects.push_back({{kOrigin, kOrigin}, {plate_w, plate_h}, {0.0f, 0.0f, 0.0f, 0.45f}});
+
+        // --- M53 : LA RÈGLE GRADUÉE D'ARRÊT ------------------------------------
+        // Elle n'apparaît que dans les 12 derniers mètres, quand elle sert. Le
+        // chiffre dit l'écart ; la règle, elle, dit s'il se RÉSORBE ou s'il file —
+        // c'est la seule des deux qu'on peut lire sans quitter la voie des yeux.
+        //
+        // Sa géométrie tient en une règle de trois : le curseur est à l'écart
+        // rapporté à la demi-portée, la zone verte à la tolérance rapportée à la
+        // même demi-portée. Les deux se déduisent donc des MÊMES constantes que la
+        // décision d'ouvrir les portes — la règle ne peut pas mentir sur ce qui va
+        // se passer.
+        if (near_station && std::abs(stop_err) <= kStopAidSpan) {
+            constexpr float kBarW = 396.0f;
+            constexpr float kBarH = 24.0f;
+            const float bar_x = kOrigin;
+            const float bar_y = kOrigin + plate_h + 12.0f;
+            const float half = kBarW * 0.5f;
+            const float center = bar_x + half;
+            hud.rects.push_back({{bar_x, bar_y}, {kBarW, kBarH}, {0.0f, 0.0f, 0.0f, 0.55f}});
+            // Zone de tolérance : c'est là-dedans, et seulement là, que les façades
+            // de quai s'ouvriront.
+            const float tol_w = static_cast<float>(kStopTolerance / kStopAidSpan) * half;
+            hud.rects.push_back({{center - tol_w, bar_y},
+                                 {tol_w * 2.0f, kBarH},
+                                 {0.12f, 0.45f, 0.16f, 0.85f}});
+            // Repère du point d'arrêt exact.
+            hud.rects.push_back({{center - 1.0f, bar_y}, {2.0f, kBarH},
+                                 {0.85f, 0.88f, 0.92f, 1.0f}});
+            // Curseur = la rame. À droite du repère, elle l'a dépassé.
+            const auto offset =
+                static_cast<float>(glm::clamp(stop_err / kStopAidSpan, -1.0, 1.0)) * half;
+            hud.rects.push_back({{center + offset - 4.0f, bar_y - 3.0f},
+                                 {8.0f, kBarH + 6.0f}, stop_aid_color(stop_err)});
+        }
+
         float y = kOrigin + kPad;
         for (const auto& [text, color] : lines) {
             hud.texts.push_back({{kOrigin + kPad, y}, kScale, color, text});
@@ -1647,6 +1881,32 @@ struct Application::Impl {
         }
     }
 
+    // M53 — Bascule un matériau vers sa version texturée dès que ses trois cartes
+    // sont sur le GPU. Un matériau ne se RÉÉCRIT jamais (son descriptor set peut
+    // être en vol dans une frame) : on en crée un neuf et on change la référence.
+    // L'ancien, unique et minuscule, meurt avec l'app.
+    //
+    // Facteurs laissés à 1 : convention glTF (facteur x texture). Les cartes portent
+    // déjà leur albédo, leur rugosité et leur métallicité — les remultiplier par la
+    // teinte de secours donnerait un béton deux fois trop sombre.
+    void apply_pbr_set(PbrTextureSet& set, render::MaterialId& target, const char* label) {
+        if (set.applied || !set.on_gpu()) {
+            return;
+        }
+        render::MaterialDesc desc;
+        desc.base_color = set.diff->id;
+        desc.metallic_roughness = set.arm->id;
+        desc.normal = set.nor->id;
+        desc.base_color_factor = glm::vec4(1.0f);
+        desc.metallic_factor = 1.0f;
+        desc.roughness_factor = 1.0f;
+        if (const render::MaterialId textured = renderer.create_material(desc)) {
+            target = textured;
+            log::info("M53 : {} texturé (base + ARM + normale, procédural CC0)", label);
+        }
+        set.applied = true;  // une seule tentative, réussie ou non
+    }
+
     // Viaduc (M31) : ré-engendré quand le train a franchi kViaductStep. Même sas que la
     // caténaire (create_mesh_indexed est asynchrone : on ne substitue qu'un maillage
     // prêt), mêmes grilles ABSOLUES (piles au chainage fixe : rien ne saute).
@@ -1656,6 +1916,9 @@ struct Application::Impl {
             (psd_door_uploading == 0 || renderer.is_mesh_ready(psd_door_uploading)) &&
             (psd_door_b_uploading == 0 || renderer.is_mesh_ready(psd_door_b_uploading)) &&
             (station_sign_uploading == 0 || renderer.is_mesh_ready(station_sign_uploading)) &&
+            (platform_uploading == 0 || renderer.is_mesh_ready(platform_uploading)) &&
+            (tactile_uploading == 0 || renderer.is_mesh_ready(tactile_uploading)) &&
+            (marking_uploading == 0 || renderer.is_mesh_ready(marking_uploading)) &&
             (canopy_uploading == 0 || renderer.is_mesh_ready(canopy_uploading))) {
             if (viaduct_mesh != 0) {
                 renderer.destroy_mesh(viaduct_mesh);
@@ -1689,6 +1952,20 @@ struct Application::Impl {
             }
             canopy_mesh = canopy_uploading;
             canopy_uploading = 0;
+            // M53 : les trois surfaces de quai suivent EXACTEMENT le même sas que le
+            // reste. Les substituer plus tôt ferait apparaître un carrelage à
+            // l'ancienne origine flottante pendant une frame — un quai décalé de
+            // 250 m, le temps d'un battement.
+            const auto swap_mesh = [this](render::MeshId& live, render::MeshId& pending) {
+                if (live != 0) {
+                    renderer.destroy_mesh(live);
+                }
+                live = pending;
+                pending = 0;
+            };
+            swap_mesh(platform_mesh, platform_uploading);
+            swap_mesh(tactile_mesh, tactile_uploading);
+            swap_mesh(marking_mesh, marking_uploading);
         }
         const long snap = std::lround(wagon.chainage() / kViaductStep);
         if (viaduct_uploading != 0 || (viaduct_valid && snap == viaduct_snap)) {
@@ -1708,6 +1985,7 @@ struct Application::Impl {
         // viaduc (même matériau, même fenêtre, grille absolue) ; le verre et la
         // signalétique ont leurs maillages/matériaux dédiés, téléversés ensemble.
         scene::RailMeshData psd_all, psd_door_all, psd_door_b_all, signs_all, canopy_all;
+        scene::RailMeshData platform_all, tactile_all, marking_all;
         const scene::StationProfile station_profile = make_station_profile();
         const long g0 = static_cast<long>(std::ceil((center - kViaductRange) / kStationSpacing));
         const long g1 = static_cast<long>(std::floor((center + kViaductRange) / kStationSpacing));
@@ -1729,6 +2007,9 @@ struct Application::Impl {
             append(psd_door_all, st.psd_doors);
             append(psd_door_b_all, st.psd_doors_b);
             append(signs_all, st.signs);
+            append(platform_all, st.platform);
+            append(tactile_all, st.tactile);
+            append(marking_all, st.markings);
         }
 
         const render::MeshId fresh = renderer.create_mesh_indexed(deck.vertices, deck.indices);
@@ -1750,6 +2031,13 @@ struct Application::Impl {
             canopy_all.empty()
                 ? 0
                 : renderer.create_mesh_indexed(canopy_all.vertices, canopy_all.indices);
+        const auto upload = [this](const scene::RailMeshData& data) -> render::MeshId {
+            return data.empty() ? 0
+                                : renderer.create_mesh_indexed(data.vertices, data.indices);
+        };
+        const render::MeshId fresh_platform = upload(platform_all);
+        const render::MeshId fresh_tactile = upload(tactile_all);
+        const render::MeshId fresh_marking = upload(marking_all);
         if (fresh != 0) {
             viaduct_uploading = fresh;
             viaduct_uploading_origin = origin;
@@ -1759,6 +2047,9 @@ struct Application::Impl {
             psd_door_b_uploading = fresh_psd_door_b;
             station_sign_uploading = fresh_signs;
             canopy_uploading = fresh_canopy;
+            platform_uploading = fresh_platform;
+            tactile_uploading = fresh_tactile;
+            marking_uploading = fresh_marking;
         }
     }
 
@@ -1799,6 +2090,14 @@ struct Application::Impl {
             }
             ballast_textured = true;  // une seule tentative, réussie ou non
         }
+
+        // M53 : même bascule pour les surfaces bâties. Le matériau de secours en
+        // couleur unie a tenu le temps du chargement ; à partir d'ici, la matière
+        // vient des cartes.
+        apply_pbr_set(tex_concrete, viaduct_material, "béton (viaduc, piles, gare)");
+        apply_pbr_set(tex_platform, platform_material, "carrelage de quai");
+        apply_pbr_set(tex_asphalt, ground_material, "enrobé (sol unifié)");
+        apply_pbr_set(tex_tactile, tactile_material, "bande podotactile");
 
         if (!model_ready_reported && train_model && train_model->ready) {
             log::info("M10 : motrice E235 procédurale chargée — {} primitive(s), cubes masqués",
@@ -2147,6 +2446,22 @@ struct Application::Impl {
                                              viaduct_mesh, viaduct_material});
         }
 
+        // M53 — Les surfaces de quai, OPAQUES, donc ici avec le viaduc et à la même
+        // origine flottante que lui (elles sortent du même generate_station, dans le
+        // même repère : leur donner une autre origine les décalerait).
+        if (platform_mesh != 0 && platform_material != 0) {
+            items.push_back(render::DrawItem{camera.relative_model(viaduct_origin),
+                                             platform_mesh, platform_material});
+        }
+        if (tactile_mesh != 0 && tactile_material != 0) {
+            items.push_back(render::DrawItem{camera.relative_model(viaduct_origin),
+                                             tactile_mesh, tactile_material});
+        }
+        if (marking_mesh != 0 && marking_material != 0) {
+            items.push_back(render::DrawItem{camera.relative_model(viaduct_origin),
+                                             marking_mesh, marking_material});
+        }
+
         // Signalétique des gares (M48) : panneaux suspendus émissifs, opaques.
         if (station_sign_mesh != 0 && station_sign_material != 0) {
             items.push_back(render::DrawItem{camera.relative_model(viaduct_origin),
@@ -2183,8 +2498,8 @@ struct Application::Impl {
         // M30.5 / M36 : les dernières primitives de la motrice / voiture sont les battants de porte
         // (16 battants en acier + optionnellement 16 décors de bande verte solidaire des portes).
         constexpr int kDoorPairs = 8;  // 4 doubles portes par face
-        const float door_t1 = glm::clamp(door_t / 0.3f, 0.0f, 1.0f);
-        const float door_t2 = glm::clamp((door_t - 0.3f) / 0.7f, 0.0f, 1.0f);
+        const float door_t1 = glm::clamp(door_t / kDoorPlugPhase, 0.0f, 1.0f);
+        const float door_t2 = door_slide_fraction(door_t);
         auto push_car = [&](const resource::ModelHandle& model, const glm::mat4& caisse_m) {
             const auto& prims = model->primitives;
             const int n_prims = static_cast<int>(prims.size());
@@ -2204,7 +2519,8 @@ struct Application::Impl {
                         const float sz = (leaf == 0) ? -1.0f : +1.0f;  // A : -z, B : +z
                         const glm::mat4 door_local = glm::translate(
                             glm::mat4(1.0f),
-                            glm::vec3(sx * 0.10f * door_t1, 0.0f, sz * 0.60f * door_t2));
+                            glm::vec3(sx * kDoorPlugTravel * door_t1, 0.0f,
+                                      sz * kDoorLeafTravel * door_t2));
                         const int leaf_idx = 2 * d + leaf;
 
                         // 1. Panneau de battant en acier
@@ -2380,19 +2696,19 @@ struct Application::Impl {
         // le vitrage fixe voisin : le passage de 1,30 m est intégralement dégagé,
         // exactement en face de la porte de la rame.
         if (psd_material != 0 && (psd_door_mesh != 0 || psd_door_b_mesh != 0)) {
-            // Course d'un vantail = SA PROPRE LARGEUR (la moitié de la baie, soit
-            // door_half = 0,65 m), plus 3 cm de garde : les deux vantaux réunis
-            // dégagent alors les 1,30 m de la baie, exactement la largeur de la
-            // porte de la rame en face.
-            constexpr float kLeafTravel = 0.68f;
+            // M53 — La course suit door_slide_fraction, EXACTEMENT comme les vantaux
+            // de la rame. Le M52 glissait linéairement en `psd_t`, donc le verre
+            // partait 0,6 s avant l'acier : les deux portes ne s'ouvraient pas
+            // ensemble, ce qui est précisément ce qu'on voyait depuis le quai.
+            const float psd_slide = door_slide_fraction(psd_t);
             glm::vec3 slide(0.0f);
-            if (psd_t > 0.0f) {
+            if (psd_slide > 0.0f) {
                 const double stop = train_layout().stop_offset();
                 const double nearest =
                     std::round((wagon.chainage() - stop) / kStationSpacing) * kStationSpacing;
                 glm::dvec3 pos, tangent;
                 track.sample(nearest, pos, tangent);
-                slide = glm::vec3(glm::normalize(tangent)) * (kLeafTravel * psd_t);
+                slide = glm::vec3(glm::normalize(tangent)) * (kPsdLeafTravel * psd_slide);
             }
             const glm::mat4 base = camera.relative_model(viaduct_origin);
             if (psd_door_mesh != 0) {

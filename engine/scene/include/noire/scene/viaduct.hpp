@@ -108,28 +108,62 @@ struct StationProfile {
     std::vector<double> door_centers;
     float door_half = 0.65f;      // = DOOR_HALF du gabarit => 1,30 m de passage
     float jamb_half = 0.08f;      // montant opaque, POSÉ EN DEHORS de la baie
-    float psd_height = 1.8f;      // hauteur vitrée au-dessus du quai
+    // M53 — HAUTEUR DES FAÇADES. Elles étaient à 1,80 m au-dessus du quai, soit
+    // +3,00 m au-dessus du plan de roulement : à 10 cm sous le HAUT DE PORTE de la
+    // rame (+3,10 m) et à hauteur de bandeau vitré. Vues depuis le quai comme
+    // depuis la cabine, elles habillaient la rame jusqu'aux vitres — on ne voyait
+    // plus le train, on voyait un mur.
+    //
+    // La Yamanote (E235, précisément la rame modélisée) est équipée de façades
+    // MI-HAUTEUR : 1,30 m au-dessus du quai. C'est la cote retenue, et elle n'est
+    // pas cosmétique — elle place le haut du vitrage à +2,50 m du plan de
+    // roulement, donc SOUS l'appui du bandeau vitré de la caisse (+2,25 m ... le
+    // vitrage arrive juste au-dessus) et très en dessous du toit (+3,70 m). La
+    // rame se voit à nouveau par-dessus la façade, ce qui est aussi ce qui permet
+    // au conducteur de juger son alignement à l'œil.
+    float psd_height = 1.30f;
     float psd_thickness = 0.03f;  // demi-épaisseur du vitrage
     float psd_offset = 0.0f;      // retrait de la FACE vitrée depuis le nez de quai
     double panel_max = 2.5f;      // longueur max d'un panneau fixe (tessellation)
     double sign_spacing = 25.0;   // entraxe des panneaux suspendus
-    // M52 — Repère d'arrêt : chainage RELATIF au centre de la gare. C'est la position
-    // de la CABINE quand le centre de la rame coïncide avec le centre de la gare ;
-    // l'app la calcule depuis la même géométrie de rame que `door_centers`.
+    // --- M53 : BANDE PODOTACTILE (点字ブロック) -------------------------------
+    // Bande jaune à plots qui borde tout le quai, DERRIÈRE la façade vitrée. Elle
+    // rend le nez de quai lisible d'un bout à l'autre : c'est la ligne que l'œil
+    // suit pour juger de l'alignement, et le seul élément jaune de la gare.
+    float tactile_inner = 1.72f;  // au-delà des vantaux (leaf_lat + épaisseur)
+    float tactile_width = 0.60f;
+    float tactile_rise = 0.012f;  // surépaisseur sur la dalle (jamais coplanaire)
+    // --- M52/M53 : REPÈRE D'ARRÊT ---------------------------------------------
+    // Chainage RELATIF au centre de la gare : la position de la CABINE quand le
+    // centre de la rame coïncide avec le centre de la gare. L'app la calcule depuis
+    // la même géométrie de rame que `door_centers`.
     double stop_marker_offset = 0.0;
+    float marker_half = 0.35f;    // demi-côté du losange (M53 : 0,25 -> 0,35 m)
+    // M53 — HAUTEUR DU LOSANGE. Il était à +2,00 m, c'est-à-dire DERRIÈRE la façade
+    // de quai (dont le haut est maintenant à +2,50 m) : le conducteur visait un
+    // repère à moitié caché par du verre. Il est remonté à +2,95 m, donc
+    // intégralement au-dessus de la façade et dans l'axe du pare-brise — la cabine
+    // regarde depuis +2,45 m (tête du conducteur), le losange est juste au-dessus
+    // de sa ligne d'horizon, exactement là où on va le chercher.
+    float marker_y = 2.95f;
+    float marker_lateral = 2.55f; // en bord de quai, juste derrière la bande podotactile
+    float stop_line_half = 0.09f; // demi-largeur de la ligne d'arrêt peinte sur le quai
 };
 
-// Six maillages : le béton (fusionné au viaduc), la verrière translucide (BLEND,
-// bornée : 20 m x 150 m, intrados à +7,20 m), le vitrage FIXE des façades de quai
-// (BLEND), les DEUX demi-vantaux mobiles (BLEND — les baies sont bi-parting : `a`
-// coulisse vers l'arrière, `b` vers l'avant) et la signalétique (émissif).
+// Un maillage par MATÉRIAU — c'est la seule raison de les séparer, et c'est ce qui a
+// changé au M53 : quais et structure étaient fusionnés dans le même béton, donc la
+// dalle de quai ne pouvait pas recevoir son carrelage sans le coller aussi sur les
+// piles du viaduc.
 struct StationMeshes {
-    RailMeshData concrete;
-    RailMeshData canopy;
-    RailMeshData glass;
+    RailMeshData concrete;     // structure : colonnes, piliers, montants, mâts (béton)
+    RailMeshData platform;     // dalle des quais (carrelage) — M53
+    RailMeshData tactile;      // bande podotactile jaune en bord de quai — M53
+    RailMeshData markings;     // ligne d'arrêt peinte sur le quai (émissive) — M53
+    RailMeshData canopy;       // verrière (BLEND, bornée à 20 x 150 m)
+    RailMeshData glass;        // vitrage FIXE des façades de quai (BLEND)
     RailMeshData psd_doors;    // vantaux qui coulissent vers les chainages DÉCROISSANTS
     RailMeshData psd_doors_b;  // vantaux qui coulissent vers les chainages CROISSANTS
-    RailMeshData signs;
+    RailMeshData signs;        // signalétique suspendue + repère d'arrêt (émissif)
 };
 
 [[nodiscard]] StationMeshes generate_station(const TrackSource& track, double s_center,

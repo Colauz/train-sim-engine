@@ -7,7 +7,9 @@ descendante : le moteur ne connaît pas le jeu.
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│  runtime/         Le simulateur (gameplay, scénarios, UI)      │  ← application
+│  runtime/         Le point d'entrée (main.cpp → Application)   │  ← exécutable
+├──────────────────────────────────────────────────────────────┤
+│  app              Orchestration PIMPL : gameplay, HUD, inputs  │  ← simulateur
 ├──────────────────────────────────────────────────────────────┤
 │  scene            ECS · réseau de voies · monde · IA trains    │  ← runtime moteur
 ├───────────┬───────────┬───────────┬───────────┬───────────────┤
@@ -39,7 +41,11 @@ descendante : le moteur ne connaît pas le jeu.
 - **resource** — **world streaming** tuilé et géoréférencé : I/O asynchrone,
   cache LRU, éviction, LOD de streaming, cuisson d'assets.
 - **scene** — ECS, représentation du **réseau de voies** (graphe de segments
-  et d'aiguillages), monde persistant, IA des trains, horaires.
+  et d'aiguillages), monde persistant, IA des trains, horaires ; aujourd'hui aussi la
+  génération procédurale du décor : caténaire, viaducs, gares, ville, terrain clipmap.
+- **app** — l'orchestrateur (PIMPL) : assemble tous les modules, tient l'état du
+  simulateur (Mascon, ATS, portes, caméras, météo, HUD) et pilote la boucle `core`.
+  C'est le seul module qui connaisse à la fois le moteur et les règles du jeu.
 
 ## Décisions transverses (critiques pour le ferroviaire)
 
@@ -81,5 +87,49 @@ descendante : le moteur ne connaît pas le jeu.
   + Doppler, listener sur la caméra, émetteurs sur le train ; audio ferroviaire procédural
   (joints « clac-clac » selon la vitesse, crissement selon la courbure, roulement) ;
   météo dynamique (`wetness` → brouillard de distance + assombrissement via UBO global).
-- **M7 — Adhérence météo & assets** : coupler `wetness` à μ (pluie/feuilles), pipeline
-  d'assets (modèles/textures/sons réels), éclairage.
+- **M7 — Adhérence météo & assets** *(fait)* : `wetness` couplé à μ (pluie/feuilles),
+  pipeline d'assets (`resource` : cgltf + stb), éclairage.
+- **M8 — PBR & IBL** *(fait)* : shader Cook-Torrance, tone mapping ACES, tangentes
+  géométriques, matériaux multi-textures, skybox HDR équirectangulaire → cubemap,
+  IBL complet (SH9 pour l'irradiance, spéculaire préfiltré, extraction du soleil).
+- **M9 — Voie 3D** *(fait)* : profil en I, traverses, ballast, LOD de voie, mipmaps,
+  Reverse-Z (précision jusqu'à 10 km), accotement procédural, tuiles de 500 m.
+- **M10–M12 — Terrain & végétation** *(fait)* : geo-clipmap 3D (amplitude 25 m),
+  splatting PBR herbe/craie, tuilage stochastique avec fondu, macro-variation d'albédo,
+  végétation instanciée (ombres, alpha discard, vent, wrap lighting), CSM réparées,
+  caténaires + pendules, anticrénelage par couverture analytique.
+- **M13 — Traction & frein** *(fait)* : hyperbole puissance/vitesse, frein pneumatique
+  (conduite générale), HUD Vulkan optimisé. **M13.5** : PoC FFI Rust (Corrosion) pour la
+  géométrie de voie — **−19 % de perf**, `NOIRE_USE_RUST` reste OFF.
+- **M14–M15 — Sensoriel** *(fait)* : sifflet spatialisé + Doppler natif, shader de pluie
+  procédurale, écran de chargement avec fondu, frustum culling CPU de la végétation.
+- **M16–M22 — La rame** *(fait)* : `Consist`/`CarBody` avec cinématique inverse et bogies
+  Jacobs partagés, KVB puis profil de vitesse SNCF, gare (0–400 m), ciel atmosphérique et
+  nuages, phares dynamiques, portes animées, mode arcade (`K`), intérieur avec sièges et
+  vitrages PBR.
+- **M29–M32 — Pivot Neo-Tokyo** *(fait)* : abandon du TGV pour un **métro japonais type
+  E235** (`tools/gen_metro.py`), caméra cabine FPS, viaducs et gratte-ciels procéduraux,
+  hassha melody à la fermeture des portes, diagnostics physiques.
+- **M33–M36 — Poste de conduite** *(fait)* : **Mascon** à crans (`EB`/`B8..B1`/`N`/`P1..P5`),
+  **ATS** avec délai de grâce de 10 s et réarmement `EB → N`, menu Pause (moteur audio
+  inclus), correctifs des portes.
+- **M37–M47 — Ville procédurale** *(fait, puis élagué)* : immeubles instanciés, HUD ATS,
+  lampadaires ; le réseau routier a traversé une longue série d'échecs (altitude, relief,
+  autotiling, collisions avec la voie) et a été **abandonné en M47** au profit du train,
+  des gares et des shaders.
+- **M48–M52 — Gares** *(fait)* : fenêtres aléatoires, sol unifié global et **isolation
+  mathématique des gares** (purge des routes buggées), échelle du toit et repère d'arrêt
+  corrigés, climatiseurs sur le toit de la rame, gap quai-train supprimé, alignement des
+  **portes palières (PSD)** et **logique d'arrêt de précision** (tolérance 50 cm,
+  décision verrouillée à l'appui sur `P`).
+- **M53 — Matière et arrêt à quai** *(fait)* : bibliothèque de textures PBR
+  procédurales tuilables (`tools/gen_textures.py`) appliquée au béton du viaduc, aux
+  quais, au sol de la ville, à la carrosserie, à l'intérieur de la rame et au poste de
+  conduite — avec des UV **métriques** partout (planaires par axe côté rame, en mètres
+  divisés par la période côté monde). Façades de quai ramenées à la hauteur
+  **mi-hauteur** de la Yamanote (1,30 m au-dessus du quai, donc sous la ligne de
+  caisse) et **synchronisées** avec les portes de la rame (même vitesse, même courbe de
+  coulissement, même instant de départ). Aide à l'arrêt de précision : losange
+  au-dessus des façades, ligne d'arrêt peinte, écart signé et règle graduée au pupitre.
+  Le banc d'alignement a confirmé que les baies tombaient déjà en face des portes à
+  ±1 mm : ce qui manquait n'était pas la géométrie, c'était le moyen de viser.

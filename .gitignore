@@ -29,6 +29,10 @@ _deps/
 # En-tête FFI généré par cbindgen (build.rs) — jamais versionné, toujours régénéré.
 /crates/*/generated/
 
+# Python (les outils de tools/ sont des scripts, jamais des modules installés)
+__pycache__/
+*.pyc
+
 # IDE / éditeurs
 /.vs/
 /.vscode/

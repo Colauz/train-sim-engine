@@ -30,6 +30,23 @@ parts dont le matériau précède MAT_DOOR0 : les 32 battants de porte restent l
 
 Carrosserie : ACIER INOXYDABLE BROSSÉ (métallique) + bande verte Yamanote.
 
+M53 — TEXTURES. La rame était intégralement en APLATS de couleur : une caisse
+« gris métallique », un intérieur « blanc cassé », un pupitre « gris foncé ». Un
+aplat ne porte aucune échelle et aucune matière : la carrosserie ressemblait à du
+plastique peint, et le poste de conduite à un bloc de résine. Chaque grande
+surface reçoit donc maintenant un jeu PBR complet (base color / ARM / normale)
+engendré par tools/gen_textures.py, RÉFÉRENCÉ par URI relative depuis
+assets/textures/train/ (les cartes ne sont pas embarquées : elles sont partagées
+par les trois modèles, et les dupliquer trois fois dans les .glb n'apporterait
+rien qu'un dépôt plus lourd).
+
+Corollaire indispensable : les UV. Elles étaient toutes en 0..1 PAR QUAD, donc
+chaque facette étirait une texture entière — un panneau de 4 m et une baguette de
+4 cm recevaient exactement la même image. Elles sont désormais PLANAIRES ET
+MÉTRIQUES (projection sur les deux axes dominants de la facette, divisée par
+UV_PERIOD) : deux facettes voisines partagent le même espace texture, le motif
+est continu d'un panneau à l'autre, et une tuile fait toujours un mètre.
+
 Repère caisse : x = droite, y = haut, z = arrière ; rail à y = -2.20.
 Aucune dépendance externe (stdlib seule)."""
 
@@ -71,28 +88,66 @@ WS_X, WS_Y0, WS_Y1 = 1.20, -0.20, 1.10
 # Cabine : tête conducteur (0, 0.25, -8.55), cloison à z = -8.0.
 Z_CLOISON = -8.0
 
+# --- Textures (M53) ---------------------------------------------------------------
+# Jeux PBR engendrés par tools/gen_textures.py. Chemin RELATIF au .glb, qui vit dans
+# assets/models/ — le chargeur résout les URI relatives depuis le dossier du fichier
+# (cf. resolve_image dans gltf_loader.cpp).
+TEXDIR = "../textures/train"
+UV_PERIOD = 1.0   # côté, en mètres, d'une tuile de texture. Doit valoir la période
+                  # déclarée dans gen_textures.py pour la rame, sinon l'échelle ment.
+
+
+def tex(name):
+    """Un jeu complet : base color (sRGB) + ARM + normale."""
+    return {"diff": f"{TEXDIR}/{name}_diff.png",
+            "arm": f"{TEXDIR}/{name}_arm.png",
+            "nor": f"{TEXDIR}/{name}_nor.png"}
+
+
+def relief(name):
+    """ARM + normale SANS base color : la matière (grain, rugosité, relief) vient de
+    la texture, la COULEUR reste au facteur. C'est ce qu'il faut pour une surface
+    peinte dans une teinte précise — bande verte, jupe, climatiseurs : leur teinte
+    est une identité (le vert Yamanote), pas quelque chose qu'on laisse dériver au
+    gré d'une carte. Elles gagnent le relief sans perdre leur couleur."""
+    return {"arm": f"{TEXDIR}/{name}_arm.png", "nor": f"{TEXDIR}/{name}_nor.png"}
+
+
 # --- Matériaux PBR --------------------------------------------------------------
+# Les facteurs sont des MULTIPLICATEURS de la texture (convention glTF). Quand une
+# base color est fournie, le facteur reste donc à 1 : c'est la carte qui décide de
+# l'albédo, et la remultiplier par l'ancienne teinte l'assombrirait deux fois.
 MATERIALS = [
-    # 0: acier — inoxydable brossé (carrosserie métallique)
-    {"name": "acier", "factor": [0.72, 0.74, 0.77, 1.0], "metallic": 0.90, "roughness": 0.38},
-    # 1: vitrage — verre PBR, transparence absolue (cahier des charges M30)
+    # 0: acier — inoxydable BROSSÉ. Le brossage est une variation de rugosité, pas de
+    # couleur : sans la carte ARM, un aplat métallique ne ressemblera jamais à de l'inox.
+    {"name": "acier", "factor": [1.0, 1.0, 1.0, 1.0], "metallic": 1.0, "roughness": 1.0,
+     **tex("steel")},
+    # 1: vitrage — verre PBR, transparence absolue (cahier des charges M30). Aucune
+    # texture : une vitre propre n'a pas de matière à montrer.
     {"name": "vitrage", "factor": [0.1, 0.1, 0.1, 0.3], "metallic": 0.0, "roughness": 0.02,
      "blend": True, "doubleSided": True},
-    # 2: bande — vert vif Yamanote (#6CBB5A)
-    {"name": "bande", "factor": [0.42, 0.73, 0.35, 1.0], "metallic": 0.20, "roughness": 0.40},
-    # 3: jupe — équipement sous caisse, gris foncé mat
-    {"name": "jupe", "factor": [0.16, 0.17, 0.18, 1.0], "metallic": 0.10, "roughness": 0.75},
-    # 4: interieur — mélamine claire, double face
-    {"name": "interieur", "factor": [0.80, 0.80, 0.78, 1.0], "metallic": 0.0, "roughness": 0.85,
-     "doubleSided": True},
-    # 5: banquette — moquette bleue
-    {"name": "banquette", "factor": [0.10, 0.16, 0.45, 1.0], "metallic": 0.0, "roughness": 0.95},
-    # 6: pupitre — console gris foncé mat
-    {"name": "pupitre", "factor": [0.14, 0.15, 0.17, 1.0], "metallic": 0.0, "roughness": 0.75},
-    # 7: ecran — écrans de conduite bleutés
-    {"name": "ecran", "factor": [0.05, 0.15, 0.30, 1.0], "metallic": 0.0, "roughness": 0.10},
+    # 2: bande — vert vif Yamanote (#6CBB5A), peinture sur tôle.
+    {"name": "bande", "factor": [0.42, 0.73, 0.35, 1.0], "metallic": 0.20, "roughness": 0.55,
+     **relief("panel")},
+    # 3: jupe — équipement sous caisse, gris foncé mat et grainé
+    {"name": "jupe", "factor": [0.16, 0.17, 0.18, 1.0], "metallic": 0.10, "roughness": 1.0,
+     **relief("console")},
+    # 4: interieur — panneaux de mélamine, double face
+    {"name": "interieur", "factor": [1.0, 1.0, 1.0, 1.0], "metallic": 0.0, "roughness": 1.0,
+     "doubleSided": True, **tex("panel")},
+    # 5: banquette — moquette bleue tissée
+    {"name": "banquette", "factor": [1.0, 1.0, 1.0, 1.0], "metallic": 0.0, "roughness": 1.0,
+     **tex("fabric")},
+    # 6: pupitre — console de conduite, plastique technique grainé
+    {"name": "pupitre", "factor": [1.0, 1.0, 1.0, 1.0], "metallic": 0.0, "roughness": 1.0,
+     **tex("console")},
+    # 7: ecran — écrans de conduite bleutés, LÉGÈREMENT émissifs (M53) : un écran
+    # allumé ne dépend pas de l'éclairage de la cabine, il en est une source.
+    {"name": "ecran", "factor": [0.05, 0.15, 0.30, 1.0], "metallic": 0.0, "roughness": 0.10,
+     "emissive": [0.10, 0.45, 0.85]},
     # 8: commande — manipulateur / boutons
-    {"name": "commande", "factor": [0.75, 0.20, 0.15, 1.0], "metallic": 0.40, "roughness": 0.35},
+    {"name": "commande", "factor": [0.75, 0.20, 0.15, 1.0], "metallic": 0.40, "roughness": 1.0,
+     **relief("console")},
     # 9: phare — bloc optique avant, blanc chaud ÉMISSIF HDR (M48, facteur > 1 :
     # le loader accepte les valeurs hors spec, cf. asset_types.hpp)
     {"name": "phare", "factor": [1.0, 0.95, 0.80, 1.0], "metallic": 0.0, "roughness": 0.20,
@@ -101,29 +156,46 @@ MATERIALS = [
     {"name": "feu_ar", "factor": [0.30, 0.02, 0.02, 1.0], "metallic": 0.0, "roughness": 0.30,
      "emissive": [4.0, 0.10, 0.05]},
     # 11: clim — boîtiers de climatisation de toit, gris clair mat (M48)
-    {"name": "clim", "factor": [0.70, 0.71, 0.72, 1.0], "metallic": 0.05, "roughness": 0.80},
+    {"name": "clim", "factor": [0.70, 0.71, 0.72, 1.0], "metallic": 0.05, "roughness": 1.0,
+     **relief("panel")},
     # 12: panto — pantographe, acier sombre métallique (M48)
-    {"name": "panto", "factor": [0.10, 0.10, 0.11, 1.0], "metallic": 0.85, "roughness": 0.40},
+    {"name": "panto", "factor": [0.10, 0.10, 0.11, 1.0], "metallic": 0.85, "roughness": 1.0,
+     **relief("steel")},
 ]
 MAT_ACIER, MAT_GLASS, MAT_BANDE, MAT_JUPE, MAT_INTERIOR = 0, 1, 2, 3, 4
 MAT_BENCH, MAT_PUPITRE, MAT_ECRAN, MAT_COMMANDE, MAT_PHARE = 5, 6, 7, 8, 9
 MAT_FEU_AR, MAT_CLIM, MAT_PANTO = 10, 11, 12
-# 13..28 : portes — 16 slots pour que chaque battant soit une part (= une
-# primitive) séparée ; write_glb les DÉDUPLIQUE en un seul matériau glTF.
+
+# LES INDICES SUIVANTS SE CALCULENT. Ils étaient écrits en dur (13, 29, 45...), ce
+# qui rendait l'ajout d'un matériau au milieu de la liste silencieusement destructeur :
+# l'app repère les battants de porte par leur RANG de primitive, et tout décalage les
+# aurait fait animer la mauvaise pièce.
+# 13: sol — revêtement de plancher, distinct de la mélamine des parois (M53). Un métro
+# n'a pas le même sol que ses murs, et c'est la surface qu'on regarde le plus.
+MAT_FLOOR = len(MATERIALS)
+MATERIALS.append({"name": "sol", "factor": [1.0, 1.0, 1.0, 1.0], "metallic": 0.0,
+                  "roughness": 1.0, **tex("floor")})
+# 16 slots de portes, pour que chaque battant soit une part (= une primitive) séparée ;
+# write_glb les DÉDUPLIQUE ensuite en un seul matériau glTF.
+MAT_DOOR0 = len(MATERIALS)
 for _ in range(16):
-    MATERIALS.append({"name": "porte", "factor": [0.72, 0.74, 0.77, 1.0],
-                      "metallic": 0.90, "roughness": 0.38})
-MAT_DOOR0 = 13
-# 29..44 : bande verte sur les 16 battants de porte (M36)
+    MATERIALS.append({"name": "porte", "factor": [1.0, 1.0, 1.0, 1.0],
+                      "metallic": 1.0, "roughness": 1.0, **tex("steel")})
+# Bande verte sur les 16 battants de porte (M36)
+MAT_DOOR_BANDE0 = len(MATERIALS)
 for _ in range(16):
     MATERIALS.append({"name": "bande", "factor": [0.42, 0.73, 0.35, 1.0],
-                      "metallic": 0.20, "roughness": 0.40})
-MAT_DOOR_BANDE0 = 29
-# 45..47 : bogie + 2 essieux (parts séparées, les 3 dernières du GLB bogie).
-MATERIALS.append({"name": "bogie", "factor": [0.09, 0.09, 0.10, 1.0], "metallic": 0.0, "roughness": 0.65})
+                      "metallic": 0.20, "roughness": 0.55, **relief("panel")})
+# Bogie + 2 essieux (parts séparées, les 3 dernières du GLB bogie). Ils DOIVENT rester
+# après les battants : l'app lit « les 32 dernières primitives » sur la motrice et la
+# voiture, où ces trois parts-là sont vides.
+MAT_BOGIE = len(MATERIALS)
+MATERIALS.append({"name": "bogie", "factor": [0.09, 0.09, 0.10, 1.0], "metallic": 0.0,
+                  "roughness": 1.0, **relief("console")})
+MAT_AXLE_A = len(MATERIALS)
 MATERIALS.append({"name": "essieu", "factor": [0.55, 0.55, 0.56, 1.0], "metallic": 1.0, "roughness": 0.30})
+MAT_AXLE_B = len(MATERIALS)
 MATERIALS.append({"name": "essieu", "factor": [0.55, 0.55, 0.56, 1.0], "metallic": 1.0, "roughness": 0.30})
-MAT_BOGIE, MAT_AXLE_A, MAT_AXLE_B = 45, 46, 47
 
 # Embrasures de portes (z0, z1, y0, y1). La motrice décale sa 1re porte vers
 # l'arrière (la cloison de cabine occupe z = -8.0).
@@ -163,6 +235,23 @@ def norm(a):
     return (a[0] / n, a[1] / n, a[2] / n) if n > 1e-12 else (0.0, 1.0, 0.0)
 
 
+def uv_axes(n):
+    """Axes de projection UV d'une facette, choisis par sa normale DOMINANTE.
+
+    C'est un mapping planaire par axe — la solution standard pour une géométrie
+    entièrement faite de boîtes alignées : chaque face tombe exactement sur l'un des
+    trois plans, sans distorsion, et deux faces du même plan restent solidaires. On
+    prend systématiquement +y comme axe vertical de texture quand c'est possible, pour
+    qu'un motif directionnel (le brossage de l'inox, l'armure d'une moquette) ait la
+    même orientation sur les deux flancs de la caisse."""
+    ax, ay, az = abs(n[0]), abs(n[1]), abs(n[2])
+    if ax >= ay and ax >= az:
+        return (0.0, 0.0, 1.0), (0.0, 1.0, 0.0)   # flanc : u = z (longueur), v = y
+    if ay >= az:
+        return (1.0, 0.0, 0.0), (0.0, 0.0, 1.0)   # sol / toit : u = x, v = z
+    return (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)       # face d'extrémité : u = x, v = y
+
+
 class Part:
     """Une part = un matériau = une primitive glTF."""
 
@@ -182,10 +271,24 @@ class Part:
     def add_quad(self, p0, p1, p2, p3, n=None):
         if n is None:
             n = norm(cross(sub(p1, p0), sub(p2, p0)))
-        tan = norm(sub(p1, p0))
-        tg = (tan[0], tan[1], tan[2], 1.0)
-        self.add([(p0, n, (0, 0), tg), (p1, n, (1, 0), tg),
-                  (p2, n, (1, 1), tg), (p3, n, (0, 1), tg)])
+        # UV PLANAIRES MÉTRIQUES (M53) : la facette est projetée sur les deux axes du
+        # repère caisse qui ne sont pas le sien, et la coordonnée est la cote EN
+        # MÈTRES divisée par UV_PERIOD. Conséquence directe : deux facettes coplanaires
+        # engendrées séparément (un mur découpé en dalles autour de ses ouvertures, par
+        # exemple) partagent exactement le même espace texture — le motif traverse la
+        # découpe sans couture. Les anciennes UV 0..1 par quad rendaient ça impossible :
+        # chaque dalle réétirait la texture entière sur sa propre taille.
+        u_ax, v_ax = uv_axes(n)
+        # w = sens du bitangent attendu par le shader (B = cross(N, T) * w). On veut
+        # B le long de +v, sinon la normal map est lue à l'envers sur un axe et le
+        # relief se creuse là où il devrait saillir.
+        w = 1.0 if dot(cross(n, u_ax), v_ax) >= 0.0 else -1.0
+        tg = (u_ax[0], u_ax[1], u_ax[2], w)
+        verts = []
+        for p in (p0, p1, p2, p3):
+            uv = (dot(p, u_ax) / UV_PERIOD, dot(p, v_ax) / UV_PERIOD)
+            verts.append((p, n, uv, tg))
+        self.add(verts)
 
     def add_box(self, x0, y0, z0, x1, y1, z1,
                 top=True, bot=True, front=True, back=True, left=True, right=True):
@@ -343,8 +446,11 @@ def build_interior(parts, centers=DOOR_CENTERS):
     plan des murs : aucune face coplanaire (M30.5)."""
     inner = HALF_W - WALL - 0.005
     slab = inner - 0.005  # sol/plafond rentrés de 5 mm sous les banquettes (M30.5)
-    parts[MAT_INTERIOR].add_box(-slab, IN_FLOOR - 0.015, Z_HEAD + 0.1,
-                                slab, IN_FLOOR + 0.005, Z_TAIL - 0.1)
+    # M53 : le PLANCHER a son propre matériau (revêtement vinyle moucheté). C'est la
+    # surface la plus regardée d'une voiture de métro — la laisser en mélamine blanche
+    # comme les parois, c'était perdre le seul repère de matière de l'intérieur.
+    parts[MAT_FLOOR].add_box(-slab, IN_FLOOR - 0.015, Z_HEAD + 0.1,
+                             slab, IN_FLOOR + 0.005, Z_TAIL - 0.1)
     parts[MAT_INTERIOR].add_box(-slab, IN_CEIL, Z_HEAD + 0.1,
                                 slab, IN_CEIL + 0.05, Z_TAIL - 0.1)
     # Banquettes : assise à 45 cm du sol, adossée au mur, entre les portes.
@@ -369,6 +475,28 @@ def build_interior(parts, centers=DOOR_CENTERS):
     # Barres verticales au centre de chaque embrasure (poteaux d'accès).
     for zc in centers:
         parts[MAT_INTERIOR].add_box(-0.03, IN_FLOOR, zc - 0.03, 0.03, IN_CEIL, zc + 0.03)
+
+    # M53 — BARRES DE MAINTIEN ET POIGNÉES SUSPENDUES (つり革). Un métro japonais vide
+    # de tout équipement de maintien ne ressemble pas à un métro : ces deux lignes
+    # d'accessoires au-dessus des banquettes sont ce qui donne à l'intérieur sa
+    # PROFONDEUR — sans elles, le volume est une boîte lisse où l'œil n'a rien à
+    # accrocher, quelle que soit la qualité des textures des parois.
+    for side in (-1.0, 1.0):
+        x_bar = side * (inner - 0.55)
+        # Barre longitudinale sous le plafond, d'un bout à l'autre de la voiture.
+        parts[MAT_INTERIOR].add_box(x_bar - 0.022, IN_CEIL - 0.24, Z_HEAD + 0.5,
+                                    x_bar + 0.022, IN_CEIL - 0.196, Z_TAIL - 0.5)
+        # Poignées tous les 60 cm, sauf en face des embrasures (on ne suspend rien
+        # au-dessus d'un flux de descente).
+        z = Z_HEAD + 0.9
+        while z < Z_TAIL - 0.9:
+            if all(abs(z - zc) > DOOR_HALF + 0.25 for zc in centers):
+                # Sangle plate + anneau : deux boîtes, ~30 cm de haut au total.
+                parts[MAT_INTERIOR].add_box(x_bar - 0.012, IN_CEIL - 0.50, z - 0.035,
+                                            x_bar + 0.012, IN_CEIL - 0.22, z + 0.035)
+                parts[MAT_COMMANDE].add_box(x_bar - 0.045, IN_CEIL - 0.60, z - 0.030,
+                                            x_bar + 0.045, IN_CEIL - 0.49, z + 0.030)
+            z += 0.60
 
 
 def build_end_face(parts, zend, with_windshield):
@@ -431,13 +559,32 @@ def build_cab(parts):
                 (1.05, -0.02, -9.22), (-1.05, -0.02, -9.22), (0.0, 0.7, 0.7))
     parts[MAT_PUPITRE].add_box(-1.05, -0.30, -9.22, 1.05, -0.02, -8.98,
                                top=False, bot=False)
-    # Deux écrans de conduite (vitesse / ATS) sur le panneau.
+    # M53 — CASQUETTE ANTI-REFLET au-dessus des instruments. Toutes les cabines en
+    # ont une, pour la même raison : sans elle, le pare-brise renvoie les écrans dans
+    # les yeux du conducteur. Ici elle joue en plus un rôle de composition — elle
+    # ferme le champ par le haut et donne au poste sa silhouette reconnaissable.
+    parts[MAT_PUPITRE].add_box(-1.05, -0.02, -9.30, 1.05, 0.03, -9.06)
+    # Deux écrans de conduite (vitesse / ATS) sur le panneau, avec leur encadrement.
     for x0, x1 in ((-0.45, -0.10), (0.10, 0.45)):
-        parts[MAT_ECRAN].add_box(x0, -0.24, -9.13, x1, -0.06, -9.09)
+        parts[MAT_PUPITRE].add_box(x0 - 0.025, -0.265, -9.145, x1 + 0.025, -0.035, -9.105)
+        parts[MAT_ECRAN].add_box(x0, -0.24, -9.15, x1, -0.06, -9.11)
+    # Bandeau de boutons (portes, klaxon, éclairage) sur le PLAT de la console, en
+    # avant du panneau incliné — c'est-à-dire dans la seule zone du pupitre que rien
+    # d'autre n'occupe. Les poser entre les deux écrans les aurait mis à fleur de
+    # l'encadrement : deux faces exactement coplanaires, donc du z-fighting garanti
+    # (tools/check_coplanar.py le refuse, et il a raison).
+    for i in range(4):
+        bx = 0.18 + i * 0.075
+        parts[MAT_COMMANDE].add_box(bx, -0.305, -9.44, bx + 0.045, -0.275, -9.36)
     # MANIPULATEUR UNIQUE (T-handle) à GAUCHE : traction poussé, frein tiré.
     parts[MAT_COMMANDE].add_box(-0.72, -0.30, -9.05, -0.58, -0.24, -8.85)  # embase
     parts[MAT_COMMANDE].add_box(-0.665, -0.24, -8.96, -0.635, -0.02, -8.94)  # tige
     parts[MAT_COMMANDE].add_box(-0.77, -0.04, -8.97, -0.56, 0.00, -8.93)    # barre en T
+    # M53 — Console latérale droite (radio, coupure) : le pupitre japonais est en L.
+    parts[MAT_PUPITRE].add_box(0.72, -0.30, -9.05, 1.05, -0.16, -8.72)
+    for i in range(3):
+        parts[MAT_COMMANDE].add_box(0.78 + i * 0.08, -0.16, -8.96,
+                                    0.82 + i * 0.08, -0.13, -8.86)
     # Siège conducteur (tête à (0, 0.25, -8.55)).
     parts[MAT_PUPITRE].add_box(-0.25, IN_FLOOR, -8.75, 0.25, -0.55, -8.30)   # socle
     parts[MAT_BENCH].add_box(-0.28, -0.55, -8.80, 0.28, -0.45, -8.25)        # assise
@@ -621,18 +768,38 @@ def write_glb(path, parts, node_name):
     # (le pool de descriptor sets du renderer est limité à 64 — M30.5).
     # L'animation repose sur les indices de PRIMITIVES, pas sur les matériaux.
     materials, mat_remap = [], {}
+    # Images/textures DÉDUPLIQUÉES par URI : les battants et la carrosserie partagent
+    # le même inox, il ne doit être déclaré qu'une fois (et donc décodé et téléversé
+    # qu'une fois côté moteur — le cache du chargeur est indexé par image glTF).
+    images, textures, tex_remap = [], [], {}
+
+    def tex_slot(uri):
+        if uri not in tex_remap:
+            tex_remap[uri] = len(textures)
+            images.append({"uri": uri})
+            textures.append({"source": len(images) - 1, "sampler": 0})
+        return tex_remap[uri]
 
     def mat_slot(mat_idx):
         mat_def = MATERIALS[mat_idx]
         key = (mat_def["name"], tuple(mat_def["factor"]), mat_def["metallic"],
                mat_def["roughness"], mat_def.get("blend"), mat_def.get("doubleSided"),
-               tuple(mat_def["emissive"]) if mat_def.get("emissive") else None)
+               tuple(mat_def["emissive"]) if mat_def.get("emissive") else None,
+               mat_def.get("diff"), mat_def.get("arm"), mat_def.get("nor"))
         if key not in mat_remap:
             mat_remap[key] = len(materials)
-            m = {"name": mat_def["name"],
-                 "pbrMetallicRoughness": {"baseColorFactor": mat_def["factor"],
-                                          "metallicFactor": mat_def["metallic"],
-                                          "roughnessFactor": mat_def["roughness"]}}
+            pbr = {"baseColorFactor": mat_def["factor"],
+                   "metallicFactor": mat_def["metallic"],
+                   "roughnessFactor": mat_def["roughness"]}
+            if mat_def.get("diff"):
+                pbr["baseColorTexture"] = {"index": tex_slot(mat_def["diff"])}
+            if mat_def.get("arm"):
+                # _arm = AO/roughness/metallic en R/G/B : exactement la convention
+                # glTF metallic-roughness (G = rough, B = metal). Aucun repack.
+                pbr["metallicRoughnessTexture"] = {"index": tex_slot(mat_def["arm"])}
+            m = {"name": mat_def["name"], "pbrMetallicRoughness": pbr}
+            if mat_def.get("nor"):
+                m["normalTexture"] = {"index": tex_slot(mat_def["nor"])}
             # Facteur émissif HDR (valeurs > 1 tolérées par le loader, M48).
             if mat_def.get("emissive"):
                 m["emissiveFactor"] = mat_def["emissive"]
@@ -651,6 +818,14 @@ def write_glb(path, parts, node_name):
             "scene": 0, "scenes": [{"nodes": [0]}], "nodes": [{"mesh": 0, "name": node_name}],
             "meshes": [{"primitives": primitives}], "materials": materials,
             "accessors": accessors, "bufferViews": buffer_views, "buffers": [{"byteLength": total}]}
+    if textures:
+        # Filtrage linéaire + REPEAT : les UV sont métriques, elles dépassent
+        # allègrement 1 sur une caisse de 20 m — sans REPEAT, tout serait étiré au
+        # dernier texel du bord.
+        gltf["samplers"] = [{"magFilter": 9729, "minFilter": 9987,
+                             "wrapS": 10497, "wrapT": 10497}]
+        gltf["images"] = images
+        gltf["textures"] = textures
     json_bytes = json.dumps(gltf, separators=(",", ":")).encode("utf-8")
     json_bytes += b" " * (align4(len(json_bytes)) - len(json_bytes))
     bin_pad = bytes(bin_data) + b"\x00" * (align4(total) - total)
