@@ -260,7 +260,11 @@ Ces variables sont des **leviers de mesure**, jamais des réglages de jeu.
 | `NOIRE_QUALITY=low\|medium\|high` | Niveau de qualité initial (cf. ci-dessus ; `F1` en jeu)          |
 | `NOIRE_SPEED=<km/h>`            | Vitesse initiale de la rame (défaut : 20 km/h)                     |
 | `NOIRE_PIN_CAM=1`               | Verrouille la caméra (cadrage reproductible pour les A/B à l'image) |
-| `NOIRE_PITCH=<rad>`             | Pitch de la caméra épinglée (avec `NOIRE_PIN_CAM`)                 |
+| `NOIRE_PITCH=<rad>`             | Pitch de la caméra épinglée (orbite ET cabine, avec `NOIRE_PIN_CAM`) |
+| `NOIRE_YAW=<rad>`               | Lacet de la caméra épinglée (défaut orbite : 2.30 ; cabine : 0)    |
+| `NOIRE_DIST=<m>`                | Distance de l'orbite épinglée (défaut : 38 m)                      |
+| `NOIRE_CAB=1`                   | Démarre en vue CABINE (sinon orbite ; `C` bascule en jeu)          |
+| `NOIRE_HOUR=<h>`                | Heure de départ, en heures décimales (défaut : 22 — inspecter la géométrie de jour, comparer deux runs au même éclairage) |
 | `NOIRE_STILL=1`                 | Gèle la physique, laisse courir l'horloge du vent                  |
 | `NOIRE_CREEP=<m/frame>`         | Translation caméra par frame présentée (test de précision)         |
 | `NOIRE_NOCULL=1`                | Désactive le frustum culling CPU des bâtiments                     |
@@ -292,8 +296,24 @@ python3 tools/gen_streetlamp.py  # lampadaires
 python3 tools/gen_train.py       # ancien TGV procédural (hérité, avant le pivot M30)
 python3 tools/gen_hassha_melody.py   # jingle de départ japonais
 python3 tools/gen_ats_alarm.py       # buzzer ATS
-python3 tools/check_coplanar.py      # diagnostic de coplanarité des faces
+python3 tools/check_coplanar.py assets/models/*.glb   # z-fighting : deux faces dans un même plan
+python3 tools/check_topology.py assets/models/*.glb   # trous, winding, normales inversées
 ```
+
+> **Les générateurs écrivent dans `assets/models/` par défaut** (et `gen_textures.py`
+> dans `assets/textures/`). Un chemin en argument reste possible pour produire ailleurs.
+> Avant le M56 le défaut était le répertoire COURANT : la commande du README déposait
+> les `.glb` à la racine du dépôt et le jeu continuait de charger les anciens.
+
+> Les deux `check_*.py` sont des **garde-fous à passer après toute modification de
+> géométrie**, et ils sont complémentaires :
+> `check_coplanar.py` traque les surfaces EN TROP (deux faces qui se disputent un plan,
+> donc du scintillement), `check_topology.py` les surfaces qui MANQUENT. Ce dernier rend
+> un code de sortie non nul dès qu'un triangle est cousu à l'envers — glTF impose le sens
+> trigonométrique vu de l'extérieur, et le moteur rastérise en
+> `VK_FRONT_FACE_COUNTER_CLOCKWISE` avec back-face culling : un triangle inversé est
+> purement et simplement JETÉ par le GPU. C'est ce défaut, appliqué à l'intégralité de la
+> rame, qui la rendait traversable du regard avant le M56.
 
 > `gen_textures.py` doit tourner **avant** `gen_metro.py` : la rame référence les cartes
 > d'`assets/textures/train/` par URI relative depuis ses `.glb`.

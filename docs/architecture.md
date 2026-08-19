@@ -154,3 +154,48 @@ descendante : le moteur ne connaît pas le jeu.
   gares. Une seule constante (`core::kStationSpacing`) les alimente désormais toutes
   deux. Validation par simulation : un conducteur suivant la consigne à la lettre
   depuis 90 km/h s'immobilise à 0,00 m du repère.
+- **M56 — La 3D pleine** *(fait)* : campagne de correction des **incohérences de
+  géométrie et d'échelle**, guidée par deux vérificateurs plutôt que par l'oeil.
+  - *Le winding.* `tools/gen_metro.py` énumérait les coins de ses boîtes dans le sens
+    HORAIRE : toute la rame — caisse, intérieur, bogies, pantographe, portes — était
+    cousue à l'envers du sens exigé par glTF (§3.7.2.1) et par le rastériseur
+    (`VK_FRONT_FACE_COUNTER_CLOCKWISE` + back-face culling). Le GPU jetait donc les faces
+    EXTÉRIEURES et n'affichait que l'intérieur de la paroi opposée : la caisse se
+    traversait du regard. Correction non pas coin par coin — on en aurait réintroduit une
+    à la pièce suivante — mais par une **normalisation à la sérialisation**
+    (`Part.orient()`) : si la normale géométrique d'un triangle contredit celle de ses
+    sommets, deux indices sont échangés. 2 956 triangles réorientés sur la motrice.
+    Même passe dans `gen_streetlamp.py` et pour le tronc de `gen_tree.py`.
+  - *Les trous.* Faces d'extrémité de voiture privées de leurs tranches (trois fentes de
+    10 cm ouvertes sur le vide à chaque bout, très visibles entre deux voitures) ;
+    essieux réduits à des tubes sans fond ; mât et crosse de lampadaire idem ; ampoule
+    réduite à un quad sans épaisseur ; tronc d'arbre en cône ouvert.
+  - *Le boudin de roue était du mauvais côté* : la couronne de plus grand rayon courait
+    À L'EXTÉRIEUR du champignon de rail. Roue refaite en solide de révolution à partir
+    d'un profil fermé, aux cotes UIC (back-to-back 1360 mm, boudin de 28 mm côté voie).
+  - *Le pupitre n'était pas un panneau mais une boîte percée* : un plan incliné noyé dans
+    un parallélépipède ouvert en haut et en bas, avec les deux écrans de conduite
+    ENTERRÉS dedans. Remplacé par un vrai dièdre fermé, écrans et encadrements posés sur
+    la pente dans son repère `(s, t)`.
+  - *L'échelle du signal ATS* : le « panneau » mesurait 2,00 × 1,50 m — plus grand qu'une
+    porte, et c'est l'objet auquel l'oeil compare la rame. Remplacé par une tête de
+    0,60 × 1,45 m en potence courte, portant un feu de 32 cm, émissif (un signal est une
+    lumière).
+  - *La ville était peinte en nuit* : façades à 1,6 % d'albédo linéaire — plus sombre que
+    du charbon — donc un mur noir en plein midi, avec les fenêtres allumées par-dessus.
+    L'éclairage encodé dans la matière est l'erreur qu'un moteur PBR ne pardonne pas.
+    Réflectances plausibles (25 à 45 % en sRGB), une famille de teinte par gabarit, et
+    l'albédo du vitrage ne dépend plus de l'allumage : seul l'ÉMISSIF distingue les
+    fenêtres, et il tombe désormais à 5 % (au lieu de 15 %) en plein jour. Même correction
+    pour le pupitre, à 4,5 % d'albédo, donc littéralement noir dans une cabine que rien
+    n'éclaire directement.
+  - *Le z-fighting résiduel* : les barres du pantographe partageaient toutes le plan
+    x = ±0,45 (24 paires en conflit, scintillement visible de trois quarts) et le
+    lanterneau vitré de la gare était PLANTÉ dans la dalle de toiture au lieu d'en
+    remplacer une partie. `check_coplanar.py` rend 0 sur tous les modèles utilisés.
+  - *L'outil* : `tools/check_topology.py`, pendant de `check_coplanar.py`. Là où celui-ci
+    traque les surfaces en trop, celui-là traque celles qui manquent — normales inversées,
+    arêtes frontière, winding incohérent, non-manifold — et sort en erreur sur les trois
+    derniers. Les générateurs écrivent enfin dans `assets/models/` par défaut : leur
+    ancienne sortie (le répertoire courant) faisait qu'une régénération suivie d'un
+    lancement chargeait toujours les anciens modèles.

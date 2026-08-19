@@ -31,6 +31,13 @@ const float kPi = 3.14159265359;
 // point sub-pixel => spéculaire à plusieurs milliers, scintillant d'une frame à l'autre.
 const float kMinRoughness = 0.045;
 
+// Part de l'émissif conservée EN PLEIN JOUR. Une fenêtre allumée, un néon, un lampadaire
+// existent aussi à midi — mais ils sont noyés par le soleil, on ne les VOIT pas. À 0.15
+// (l'ancienne valeur), un émissif HDR de 3.0 rendait encore 0.45 en linéaire : les
+// fenêtres des tours flambaient à 13 h, ce qui donnait à la ville son air de ne jamais
+// changer d'heure. 0.05 laisse une veilleuse plausible sans jamais dominer le soleil.
+const float kEmissiveDayFloor = 0.05;
+
 // Météo. Mouillé = un film d'eau : il lisse la surface (chute BRUTALE de la rugosité) et
 // piège la lumière par réflexion interne, ce qui assombrit l'albédo.
 const float kWetRoughnessScale = 0.15;

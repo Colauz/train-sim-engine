@@ -40,10 +40,10 @@ void main() {
                            object.pbrFactors.z);
 
     // Émissif (M31) : convention glTF (facteur * texture), modulé par la NUIT
-    // (u.skyParams.x) : les fenêtres et les néons veillent à ~15 % le jour et flambent
-    // dès que le soleil se couche. L'ACES, en aval, gère le HDR.
+    // (u.skyParams.x) : les fenêtres et les néons veillent à kEmissiveDayFloor le jour
+    // et flambent dès que le soleil se couche. L'ACES, en aval, gère le HDR.
     vec3 emissive = texture(emissiveMap, fragUV).rgb * object.emissiveFactor.rgb *
-                    mix(0.15, 1.0, u.skyParams.x);
+                    mix(kEmissiveDayFloor, 1.0, u.skyParams.x);
 
     outColor = vec4(shadeSurface(albedo, metallic, roughness, N, cameraRelPos, emissive),
                     alpha);

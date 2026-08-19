@@ -57,7 +57,7 @@ void main() {
     // Émissif (M31) : fenêtres des bâtiments instanciés, modulé par la nuit comme dans
     // mesh_textured.frag.
     vec3 emissive = texture(emissiveMap, fragUV).rgb * object.emissiveFactor.rgb *
-                    mix(0.15, 1.0, u.skyParams.x);
+                    mix(kEmissiveDayFloor, 1.0, u.skyParams.x);
     outColor = vec4(
         shadeSurfaceEx(base.rgb, metallic, roughness, N, cameraRelPos, object.pbrFactors.w,
                        emissive),

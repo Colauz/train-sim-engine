@@ -53,6 +53,7 @@ Aucune dépendance externe (stdlib seule)."""
 import struct
 import json
 import math
+import os
 import sys
 
 # --- Cotes (mètres) -------------------------------------------------------------
@@ -270,6 +271,32 @@ class Part:
     def __init__(self):
         self.positions, self.normals, self.uvs, self.tangents, self.indices = [], [], [], [], []
 
+    def orient(self):
+        """M56 — REMET TOUTES LES FACES À L'ENDROIT.
+
+        glTF impose le sens TRIGONOMÉTRIQUE vu de l'extérieur (spec 3.7.2.1), et le
+        moteur rastérise avec VK_FRONT_FACE_COUNTER_CLOCKWISE + back-face culling. Or
+        `add_box` énumérait ses coins dans le sens HORAIRE : toute la rame était donc
+        cousue à l'envers. Le GPU jetait ses faces extérieures et ne gardait que
+        l'intérieur de la paroi opposée — d'où une caisse qui se traversait du regard,
+        des banquettes flottant à travers la tôle et des roues trouées.
+
+        Plutôt que de corriger chaque énumération de coins (et de risquer d'en réintroduire
+        une à la prochaine pièce), on NORMALISE ICI, une fois pour toutes, juste avant la
+        sérialisation : si la normale géométrique d'un triangle contredit la normale de ses
+        sommets — qui, elle, a toujours été juste — on échange deux indices. C'est un
+        invariant vérifiable (cf. tools/check_topology.py), pas une convention à retenir."""
+        flipped = 0
+        for t in range(0, len(self.indices), 3):
+            ia, ib, ic = self.indices[t], self.indices[t + 1], self.indices[t + 2]
+            a, b, c = self.positions[ia], self.positions[ib], self.positions[ic]
+            g = cross(sub(b, a), sub(c, a))
+            vn = self.normals[ia]
+            if dot(g, vn) < 0.0:
+                self.indices[t + 1], self.indices[t + 2] = ic, ib
+                flipped += 1
+        return flipped
+
     def add(self, verts):
         base = len(self.positions)
         for p, n, uv, tg in verts:
@@ -402,11 +429,28 @@ def build_roof(parts, clim_z=0.0):
 
 def add_bar(part, a, b, w):
     """Barre cylindrique approchée (prisme carré de section w) entre deux points.
-    Utilisée pour le pantographe (M48)."""
+    Utilisée pour le pantographe (M48).
+
+    M56 — Toutes les barres d'un même demi-cadre partagent l'abscisse x = ±0.45 et la
+    même section : leurs flancs tombaient donc dans EXACTEMENT le même plan, et aux
+    articulations — où deux barres se recouvrent, comme dans un vrai pantographe — le
+    rastériseur n'avait aucun moyen de départager les deux surfaces. D'où 24 paires en
+    z-fighting sur le toit de la motrice, c'est-à-dire un scintillement bien visible dès
+    qu'on regarde la rame de trois quarts. On désaccorde donc la section de chaque barre
+    de 0 à 2 %% (moins d'un millimètre), de façon DÉTERMINISTE (dérivée de ses extrémités) :
+    deux barres distinctes n'ont plus jamais un flanc coplanaire, et 0,8 mm sur 4 cm ne
+    se voit pas."""
+    add_bar.count = getattr(add_bar, "count", 0) + 1
     d = norm(sub(b, a))
     ref = (0.0, 1.0, 0.0) if abs(d[1]) < 0.9 else (1.0, 0.0, 0.0)
-    u = mul(norm(cross(d, ref)), w * 0.5)
-    v = mul(norm(cross(d, norm(cross(d, ref)))), w * 0.5)
+    u_hat = norm(cross(d, ref))
+    # Décalage latéral propre à la barre : 0,3 mm par rang, 0 à 3,6 mm. Il déplace les
+    # DEUX flancs du même montant, donc il désaccorde les plans sans déformer la section.
+    off = 0.0003 * (1 + add_bar.count % 17)
+    a = (a[0] + off * u_hat[0], a[1] + off * u_hat[1], a[2] + off * u_hat[2])
+    b = (b[0] + off * u_hat[0], b[1] + off * u_hat[1], b[2] + off * u_hat[2])
+    u = mul(u_hat, w * 0.5)
+    v = mul(norm(cross(d, u_hat)), w * 0.5)
     a0 = (a[0] - u[0] - v[0], a[1] - u[1] - v[1], a[2] - u[2] - v[2])
     a1 = (a[0] + u[0] - v[0], a[1] + u[1] - v[1], a[2] + u[2] - v[2])
     a2 = (a[0] + u[0] + v[0], a[1] + u[1] + v[1], a[2] + u[2] + v[2])
@@ -515,23 +559,33 @@ def build_end_face(parts, zend, with_windshield):
     """Face d'extrémité, plaquée 10 cm VERS L'EXTÉRIEUR de la caisse : sa face
     intérieure (z = zend) est dos-à-dos avec les faces de bout des murs et du
     toit (normales opposées, jamais rasterisées ensemble) au lieu d'être
-    coplanaire avec elles (anti z-fighting, M30.5). Les faces latérales et
-    supérieures des boîtes sont SUPPRIMÉES quand elles tomberaient pile dans le
-    plan des murs latéraux ou du toit. Motrice : ÉNORME trou carré de pare-brise."""
+    coplanaire avec elles (anti z-fighting, M30.5). Motrice : ÉNORME trou carré
+    de pare-brise.
+
+    M56 — LA TRANCHE ÉTAIT OUVERTE. La plaque s'arrêtait à ROOF_Y et renonçait à
+    ses faces gauche, droite et supérieure « parce qu'elles tombent dans le plan
+    des murs » : elles y tombent, mais 10 cm PLUS LOIN en z, là où il n'y a plus
+    ni mur ni toit. Il restait donc, aux deux bouts de chaque voiture, trois
+    fentes de 10 cm ouvertes sur le vide — le regard entrait dans la caisse par
+    la tranche, et c'est ce qui se voyait le plus entre deux voitures attelées.
+    La plaque monte maintenant jusqu'au DESSUS du toit et elle est FERMÉE sur ses
+    six faces. Coplanaire avec les murs, oui ; superposée à eux, jamais (les
+    plages de z sont disjointes), donc aucun z-fighting — c'est exactement ce que
+    vérifie tools/check_coplanar.py."""
     z0, z1 = sorted((zend, zend + (-0.10 if zend < 0 else 0.10)))
+    roof_top = ROOF_Y + 0.10
     if not with_windshield:
-        parts[MAT_ACIER].add_box(-HALF_W, BODY_BOT, z0, HALF_W, ROOF_Y, z1,
-                                 top=False, left=False, right=False)
+        parts[MAT_ACIER].add_box(-HALF_W, BODY_BOT, z0, HALF_W, roof_top, z1)
         return
-    # Piliers latéraux, bande basse, bande haute : le trou est RÉEL.
-    parts[MAT_ACIER].add_box(-HALF_W, BODY_BOT, z0, -WS_X, ROOF_Y, z1,
-                             top=False, left=False)
-    parts[MAT_ACIER].add_box(WS_X, BODY_BOT, z0, HALF_W, ROOF_Y, z1,
-                             top=False, right=False)
+    # Piliers latéraux, bande basse, bande haute : le trou est RÉEL. Seules les
+    # faces qui se SUPERPOSENT vraiment à une voisine (les flancs internes des
+    # bandeaux, cachés par les piliers) restent supprimées.
+    parts[MAT_ACIER].add_box(-HALF_W, BODY_BOT, z0, -WS_X, roof_top, z1)
+    parts[MAT_ACIER].add_box(WS_X, BODY_BOT, z0, HALF_W, roof_top, z1)
     parts[MAT_ACIER].add_box(-WS_X, BODY_BOT, z0, WS_X, WS_Y0, z1,
                              left=False, right=False)
-    parts[MAT_ACIER].add_box(-WS_X, WS_Y1, z0, WS_X, ROOF_Y, z1,
-                             top=False, left=False, right=False)
+    parts[MAT_ACIER].add_box(-WS_X, WS_Y1, z0, WS_X, roof_top, z1,
+                             left=False, right=False)
     # Verre du pare-brise, à fleur de la face (z = zend), décalé de ±10 mm.
     parts[MAT_GLASS].add_box(-WS_X, WS_Y0, zend - 0.01, WS_X, WS_Y1, zend + 0.01,
                              top=False, bot=False, left=False, right=False)
@@ -555,6 +609,74 @@ def build_lights(parts):
                                       sx * 1.34 + 0.08, WS_Y0 - 0.06, lz1)
 
 
+# --- Pupitre : le plan incliné et son repère (M56) --------------------------------
+# Section du dièdre dans le plan (y, z), vue de la gauche :
+#   A = bord bas-avant (côté conducteur), B = bord haut-arrière (côté pare-brise).
+PANEL_X = 1.05
+PANEL_A = (-0.300, -8.980)      # (y, z)
+PANEL_B = (-0.020, -9.220)      # (y, z)
+PANEL_BASE_Y = -0.305           # la joue descend 5 mm DANS la console : rien de coplanaire
+
+
+def _panel_frame():
+    """(origine, axe de pente unitaire, normale sortante unitaire) dans le plan (y, z)."""
+    dy, dz = PANEL_B[0] - PANEL_A[0], PANEL_B[1] - PANEL_A[1]
+    ln = math.hypot(dy, dz)
+    sy, sz = dy / ln, dz / ln
+    # Normale perpendiculaire à la pente, choisie du côté OPPOSÉ au fond du dièdre.
+    ny, nz = -sz, sy
+    if ny * (PANEL_A[0] - PANEL_B[0]) + nz * (PANEL_A[1] - PANEL_B[1]) > 0.0:
+        ny, nz = -ny, -nz
+    return ln, (sy, sz), (ny, nz)
+
+
+PANEL_LEN, PANEL_S, PANEL_N = _panel_frame()
+
+
+def panel_point(x, s, t):
+    """Point du repère du panneau : s = 0..1 le long de la pente (de A vers B),
+    t = déport en mètres suivant la normale sortante."""
+    d = s * PANEL_LEN
+    return (x,
+            PANEL_A[0] + d * PANEL_S[0] + t * PANEL_N[0],
+            PANEL_A[1] + d * PANEL_S[1] + t * PANEL_N[1])
+
+
+def panel_slab(part, x0, x1, s0, s1, t0, t1):
+    """Pavé posé SUR la pente : rectangle (s0..s1) x (x0..x1), épaissi de t0 à t1
+    suivant la normale. Six faces, orientation rattrapée par Part.orient()."""
+    n = (0.0, PANEL_N[0], PANEL_N[1])
+    up = (0.0, PANEL_S[0], PANEL_S[1])
+    c = {(a, b, d): panel_point(x0 if a == 0 else x1, s0 if b == 0 else s1,
+                                t0 if d == 0 else t1)
+         for a in (0, 1) for b in (0, 1) for d in (0, 1)}
+    part.add_quad(c[0, 0, 1], c[1, 0, 1], c[1, 1, 1], c[0, 1, 1], n)                  # dessus
+    part.add_quad(c[0, 0, 0], c[0, 1, 0], c[1, 1, 0], c[1, 0, 0], mul(n, -1.0))       # dessous
+    part.add_quad(c[0, 1, 0], c[0, 1, 1], c[1, 1, 1], c[1, 1, 0], up)                 # haut de pente
+    part.add_quad(c[0, 0, 0], c[1, 0, 0], c[1, 0, 1], c[0, 0, 1], mul(up, -1.0))      # bas de pente
+    part.add_quad(c[1, 0, 0], c[1, 1, 0], c[1, 1, 1], c[1, 0, 1], (1.0, 0.0, 0.0))    # joue +x
+    part.add_quad(c[0, 0, 0], c[0, 0, 1], c[0, 1, 1], c[0, 1, 0], (-1.0, 0.0, 0.0))   # joue -x
+
+
+def build_panel_wedge(part):
+    """Le dièdre du panneau d'instruments : pente, fond vertical, semelle, 2 joues."""
+    ay, az = PANEL_A
+    by, bz = PANEL_B
+    for sx in (-1.0, 1.0):
+        x = sx * PANEL_X
+        part.add([((x, ay, az), (sx, 0.0, 0.0), (az, ay), (0.0, 0.0, 1.0, 1.0)),
+                  ((x, by, bz), (sx, 0.0, 0.0), (bz, by), (0.0, 0.0, 1.0, 1.0)),
+                  ((x, PANEL_BASE_Y, bz), (sx, 0.0, 0.0), (bz, PANEL_BASE_Y),
+                   (0.0, 0.0, 1.0, 1.0))])
+    n = (0.0, PANEL_N[0], PANEL_N[1])
+    part.add_quad((-PANEL_X, ay, az), (PANEL_X, ay, az),
+                  (PANEL_X, by, bz), (-PANEL_X, by, bz), n)                      # la pente
+    part.add_quad((-PANEL_X, PANEL_BASE_Y, bz), (PANEL_X, PANEL_BASE_Y, bz),
+                  (PANEL_X, by, bz), (-PANEL_X, by, bz), (0.0, 0.0, -1.0))       # le fond
+    part.add_quad((-PANEL_X, PANEL_BASE_Y, bz), (PANEL_X, PANEL_BASE_Y, bz),
+                  (PANEL_X, ay, az), (-PANEL_X, ay, az), (0.0, -1.0, 0.0))       # la semelle
+
+
 def build_cab(parts):
     """Cabine : cloison, pupitre avec manipulateur T à gauche, écrans, siège.
     Le volume entre le sol (y=-1.00), le plafond (y=1.10), la face avant et la
@@ -565,21 +687,31 @@ def build_cab(parts):
                                 HALF_W - WALL - 0.005, IN_CEIL, Z_CLOISON + 0.08)
     # Pupitre : console posée sur le sol, sous le pare-brise (fond enterré de 12 mm).
     parts[MAT_PUPITRE].add_box(-1.10, IN_FLOOR - 0.012, -9.65, 1.10, -0.30, -8.95)
-    # Panneau d'instruments incliné, face au conducteur (faces cachées omises :
-    # le fond du panneau serait coplanaire avec le dessus de la console, M30.5).
-    quad_orient(parts[MAT_PUPITRE], (-1.05, -0.30, -8.98), (1.05, -0.30, -8.98),
-                (1.05, -0.02, -9.22), (-1.05, -0.02, -9.22), (0.0, 0.7, 0.7))
-    parts[MAT_PUPITRE].add_box(-1.05, -0.30, -9.22, 1.05, -0.02, -8.98,
-                               top=False, bot=False)
+    # Panneau d'instruments incliné, face au conducteur.
+    #
+    # M56 — CE N'ÉTAIT PAS UN PANNEAU, C'ÉTAIT UNE BOÎTE PERCÉE. On empilait ici un
+    # quad incliné ET un parallélépipède plein occupant tout le volume, privé de son
+    # dessus et de son dessous. Trois conséquences, toutes visibles depuis le siège :
+    # le plan incliné était noyé dans le bloc (donc invisible), le bloc s'ouvrait vers
+    # le haut et vers le bas sur son propre vide, et les deux ÉCRANS de conduite — dont
+    # la boîte occupe z de -9,15 à -9,11, strictement à l'intérieur — étaient purement
+    # et simplement enterrés dedans.
+    #
+    # Le pupitre est désormais un vrai PRISME (dièdre) : trois faces plates, deux joues
+    # triangulaires, fermé. Les écrans et leur encadrement sont posés SUR la pente,
+    # dans son repère (s, t), donc réellement affleurants et réellement visibles.
+    build_panel_wedge(parts[MAT_PUPITRE])
     # M53 — CASQUETTE ANTI-REFLET au-dessus des instruments. Toutes les cabines en
     # ont une, pour la même raison : sans elle, le pare-brise renvoie les écrans dans
     # les yeux du conducteur. Ici elle joue en plus un rôle de composition — elle
     # ferme le champ par le haut et donne au poste sa silhouette reconnaissable.
     parts[MAT_PUPITRE].add_box(-1.05, -0.02, -9.30, 1.05, 0.03, -9.06)
-    # Deux écrans de conduite (vitesse / ATS) sur le panneau, avec leur encadrement.
+    # Deux écrans de conduite (vitesse / ATS) POSÉS SUR LA PENTE, avec leur
+    # encadrement : 8 mm de saillie pour le cadre, 12 mm pour la dalle, donc aucune
+    # face coplanaire ni avec la pente ni entre elles.
     for x0, x1 in ((-0.45, -0.10), (0.10, 0.45)):
-        parts[MAT_PUPITRE].add_box(x0 - 0.025, -0.265, -9.145, x1 + 0.025, -0.035, -9.105)
-        parts[MAT_ECRAN].add_box(x0, -0.24, -9.15, x1, -0.06, -9.11)
+        panel_slab(parts[MAT_PUPITRE], x0 - 0.025, x1 + 0.025, 0.12, 0.88, 0.0, 0.008)
+        panel_slab(parts[MAT_ECRAN], x0, x1, 0.18, 0.82, 0.004, 0.012)
     # Bandeau de boutons (portes, klaxon, éclairage) sur le PLAT de la console, en
     # avant du panneau incliné — c'est-à-dire dans la seule zone du pupitre que rien
     # d'autre n'occupe. Les poser entre les deux écrans les aurait mis à fleur de
@@ -593,7 +725,9 @@ def build_cab(parts):
     parts[MAT_COMMANDE].add_box(-0.665, -0.24, -8.96, -0.635, -0.02, -8.94)  # tige
     parts[MAT_COMMANDE].add_box(-0.77, -0.04, -8.97, -0.56, 0.00, -8.93)    # barre en T
     # M53 — Console latérale droite (radio, coupure) : le pupitre japonais est en L.
-    parts[MAT_PUPITRE].add_box(0.72, -0.30, -9.05, 1.05, -0.16, -8.72)
+    # x borné à 1,045 : la joue du dièdre est à 1,05, les deux flancs ne sont donc
+    # pas coplanaires (le z-fighting que check_coplanar.py signalait ici).
+    parts[MAT_PUPITRE].add_box(0.72, -0.30, -9.05, 1.045, -0.16, -8.72)
     for i in range(3):
         parts[MAT_COMMANDE].add_box(0.78 + i * 0.08, -0.16, -8.96,
                                     0.82 + i * 0.08, -0.13, -8.86)
@@ -669,49 +803,80 @@ def build_voiture(out):
 # ==============================================================================
 # BOGIE — origine au plan de roulement, 2 essieux en dernières primitives
 # ==============================================================================
-WHEEL_R = 0.46          # Ø 920 mm
-GAUGE_HALF = 0.7175     # 1435 mm
-FLANGE_R = 0.505
+WHEEL_R = 0.46          # rayon au cercle de roulement — Ø 920 mm (l'app cale l'essieu
+                        # à cette hauteur au-dessus du plan de roulement)
+GAUGE_HALF = 0.7175     # demi-écartement, 1435 mm entre faces internes des champignons
+FLANGE_R = 0.488        # boudin de 28 mm au-dessus du cercle de roulement (norme UIC)
+
+# M56 — LE BOUDIN ÉTAIT DU MAUVAIS CÔTÉ. L'ancien profil posait la couronne de plus
+# grand rayon À L'EXTÉRIEUR de la voie (|x| de 0,785 à 0,810, donc au-delà du champignon
+# qui s'arrête à 0,7895) : une roue ainsi taillée déraille au premier aiguillage. Le
+# boudin d'un chemin de fer court À L'INTÉRIEUR des rails, c'est lui qui tient l'essieu
+# dans la voie. Cotes remises d'aplomb sur la pratique UIC :
+#   * écartement intérieur des roues (back-to-back) 1360 mm => face interne à 0,680 ;
+#   * boudin de 32,5 mm d'épaisseur, donc de 0,680 à 0,7125 ;
+#   * table de roulement de 135 mm de large, de 0,7125 à 0,8475.
+# Le cercle de roulement (0,7125..0,8475) recouvre bien le champignon (0,7175..0,7895).
+WHEEL_BACK = 0.680      # face interne de la jante
+WHEEL_FLANGE_OUT = 0.7125   # fin du boudin / début de la table
+WHEEL_FRONT = 0.8475    # face externe de la jante
 
 
-def build_wheel(part, cx, segments=24):
-    inner = -1.0 if cx > 0.0 else 1.0
-    xo = cx + inner * 0.0675
-    xi = cx - inner * 0.0675
-    xf = xi - inner * 0.025
+def revolve(part, profile, sign, segments=24):
+    """Solide de révolution autour de l'axe x, à partir d'un PROFIL (x, r) fermé.
 
-    def pt(x, r, a):
-        return (x, r * math.sin(a), r * math.cos(a))
+    Un profil est une liste de couples (x, rayon) parcourue dans l'ordre ; entre deux
+    points consécutifs on engendre soit une couronne (même x), soit un manchon (même r),
+    soit un tronc de cône. `sign` = ±1 miroite le profil pour l'autre roue.
 
-    for j in range(segments):
-        a0 = 2.0 * math.pi * j / segments
-        a1 = 2.0 * math.pi * (j + 1) / segments
-        n0 = (0.0, math.sin(a0), math.cos(a0))
-        n1 = (0.0, math.sin(a1), math.cos(a1))
-        tg = (1.0, 0.0, 0.0, 1.0)
-        part.add([(pt(xo, WHEEL_R, a0), n0, (0, 0), tg), (pt(xi, WHEEL_R, a0), n0, (1, 0), tg),
-                  (pt(xi, WHEEL_R, a1), n1, (1, 1), tg), (pt(xo, WHEEL_R, a1), n1, (0, 1), tg)])
-        part.add([(pt(xi, FLANGE_R, a0), n0, (0, 0), tg), (pt(xf, FLANGE_R, a0), n0, (1, 0), tg),
-                  (pt(xf, FLANGE_R, a1), n1, (1, 1), tg), (pt(xi, FLANGE_R, a1), n1, (0, 1), tg)])
-        na = (-inner, 0.0, 0.0)
-        ring = [(pt(xi, WHEEL_R, a0), na, (0, 0), (0, 0, 1, 1)),
-                (pt(xi, WHEEL_R, a1), na, (1, 0), (0, 0, 1, 1)),
-                (pt(xi, FLANGE_R, a1), na, (1, 1), (0, 0, 1, 1)),
-                (pt(xi, FLANGE_R, a0), na, (0, 1), (0, 0, 1, 1))]
-        if inner < 0.0:
-            ring.reverse()
-        part.add(ring)
-        for fx, fr, nx in ((xo, WHEEL_R, inner), (xf, FLANGE_R, -inner)):
-            cen = (fx, 0.0, 0.0)
-            e0, e1 = pt(fx, fr, a0), pt(fx, fr, a1)
-            a, b = (e0, e1) if nx > 0 else (e1, e0)
-            part.add([(cen, (nx, 0, 0), (0, 0), (0, 0, 1, 1)),
-                      (a, (nx, 0, 0), (1, 0), (0, 0, 1, 1)),
-                      (b, (nx, 0, 0), (0, 1), (0, 0, 1, 1))])
+    Le point de tout ceci : un profil fermé (premier et dernier point sur l'axe, r = 0)
+    donne PAR CONSTRUCTION un volume étanche et d'orientation cohérente. L'ancienne roue
+    était assemblée à la main, morceau par morceau — d'où une couronne de boudin dont la
+    normale regardait à l'envers et des faces que le back-face culling escamotait."""
+    for k in range(len(profile) - 1):
+        x0, r0 = profile[k]
+        x1, r1 = profile[k + 1]
+        if r0 == 0.0 and r1 == 0.0:
+            continue
+        # Normale de la génératrice, dans le plan (x, r), tournée vers l'EXTÉRIEUR.
+        dx, dr = (x1 - x0) * sign, r1 - r0
+        ln = math.hypot(dx, dr) or 1.0
+        nx, nr = dr / ln, -dx / ln
+        for j in range(segments):
+            a0 = 2.0 * math.pi * j / segments
+            a1 = 2.0 * math.pi * (j + 1) / segments
+            ring = []
+            for (xx, rr), a in (((x0, r0), a0), ((x0, r0), a1), ((x1, r1), a1), ((x1, r1), a0)):
+                p = (sign * xx, rr * math.sin(a), rr * math.cos(a))
+                n = (nx, nr * math.sin(a), nr * math.cos(a))
+                ring.append((p, n, (a / (2.0 * math.pi), (xx - profile[0][0]) / 0.2),
+                             (0.0, 0.0, 1.0, 1.0)))
+            # Élimine les triangles dégénérés quand un bout du quad est sur l'axe.
+            if r0 == 0.0:
+                ring = [ring[0], ring[2], ring[3]]
+            elif r1 == 0.0:
+                ring = [ring[0], ring[1], ring[2]]
+            part.add(ring)
+
+
+def build_wheel(part, side, segments=24):
+    """Une roue monobloc : jante + boudin, profil fermé, boudin CÔTÉ VOIE."""
+    revolve(part, [
+        (WHEEL_BACK, 0.0),                  # centre de la face interne
+        (WHEEL_BACK, FLANGE_R),             # face interne de la jante
+        (WHEEL_FLANGE_OUT, FLANGE_R),       # sommet du boudin
+        (WHEEL_FLANGE_OUT, WHEEL_R),        # descente du boudin sur la table
+        (WHEEL_FRONT, WHEEL_R),             # table de roulement
+        (WHEEL_FRONT, 0.0),                 # centre de la face externe
+    ], side, segments)
 
 
 def build_axle(part, segments=12):
-    shaft_r, shaft_x = 0.085, GAUGE_HALF - 0.07
+    # M56 — L'essieu s'arrêtait 2,5 mm avant la roue ET n'avait AUCUN fond : entre les
+    # deux roues on voyait un tuyau ouvert sur le néant. Il pénètre désormais de 2 cm
+    # DANS la jante et il est BOUCHÉ — les deux fonds sont noyés dans le moyeu, donc
+    # invisibles, et aucune face n'est coplanaire avec la toile de roue.
+    shaft_r, shaft_x = 0.085, WHEEL_BACK + 0.02
     for j in range(segments):
         a0 = 2.0 * math.pi * j / segments
         a1 = 2.0 * math.pi * (j + 1) / segments
@@ -722,8 +887,20 @@ def build_axle(part, segments=12):
                   ((shaft_x, shaft_r * math.sin(a0), shaft_r * math.cos(a0)), n0, (1, 0), tg),
                   ((shaft_x, shaft_r * math.sin(a1), shaft_r * math.cos(a1)), n1, (1, 1), tg),
                   ((-shaft_x, shaft_r * math.sin(a1), shaft_r * math.cos(a1)), n1, (0, 1), tg)])
-    for cx in (-GAUGE_HALF, GAUGE_HALF):
-        build_wheel(part, cx)
+    # Fonds de l'arbre (éventail depuis le centre) : la normale sort de l'essieu.
+    for sx in (-1.0, 1.0):
+        cen = (sx * shaft_x, 0.0, 0.0)
+        nx = (sx, 0.0, 0.0)
+        for j in range(segments):
+            a0 = 2.0 * math.pi * j / segments
+            a1 = 2.0 * math.pi * (j + 1) / segments
+            e0 = (sx * shaft_x, shaft_r * math.sin(a0), shaft_r * math.cos(a0))
+            e1 = (sx * shaft_x, shaft_r * math.sin(a1), shaft_r * math.cos(a1))
+            part.add([(cen, nx, (0.5, 0.5), (0, 0, 1, 1)),
+                      (e0, nx, (0, 0), (0, 0, 1, 1)),
+                      (e1, nx, (1, 0), (0, 0, 1, 1))])
+    for side in (-1.0, 1.0):
+        build_wheel(part, side)
 
 
 def build_bogie(out):
@@ -743,6 +920,9 @@ def align4(n):
 
 def write_glb(path, parts, node_name):
     used = [(i, p) for i, p in enumerate(parts) if p.positions]
+    flipped = sum(p.orient() for _, p in used)
+    if flipped:
+        print(f"  {path} : {flipped} triangle(s) réorientés (winding glTF/CCW)")
     blocks, part_blocks = [], []
     for _, p in used:
         b = (b"".join(struct.pack("<fff", *v) for v in p.positions),
@@ -857,8 +1037,18 @@ def write_glb(path, parts, node_name):
     print(f"{path} : {nv} sommets, {len(used)} primitives, {glb_len} o ({node_name})")
 
 
+def _default_models_dir():
+    """M56 — Par défaut, on écrit DANS assets/models, pas dans le répertoire courant.
+
+    Le README documente `python3 tools/gen_metro.py` comme la façon de régénérer les
+    modèles ; avec l'ancien défaut (« . ») la commande déposait les .glb à la racine du
+    dépôt et le jeu continuait de charger les anciens. Un générateur dont la sortie par
+    défaut n'est pas l'endroit où le moteur va lire est un piège, pas une commodité."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "assets", "models")
+
+
 if __name__ == "__main__":
-    outdir = sys.argv[1] if len(sys.argv) > 1 else "."
+    outdir = sys.argv[1] if len(sys.argv) > 1 else _default_models_dir()
     build_motrice(f"{outdir}/metro_motrice.glb")
     build_voiture(f"{outdir}/metro_voiture.glb")
     build_bogie(f"{outdir}/metro_bogie.glb")

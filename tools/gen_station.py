@@ -14,7 +14,7 @@ roulement, z = le long de la voie) :
     la nuit (facteur émissif HDR, modulé par le facteur nuit du moteur).
 
 Repère : y = 0 est le PLAN DE ROULEMENT. Aucune dépendance externe (stdlib seule)."""
-import struct, json, sys
+import struct, json, os, sys
 
 MODULE_LEN = 40.0            # longueur d'un module ; l'app en pose 8 par gare
 HZ = MODULE_LEN / 2.0
@@ -145,11 +145,19 @@ def build_station(out):
         for pz in PILLAR_Z:
             build_box(parts[MAT_STEEL], cx - PILLAR_HALF, PLAT_BOTTOM, pz - PILLAR_HALF,
                       cx + PILLAR_HALF, ROOF_Y, pz + PILLAR_HALF)
-    # Toit acier : une seule dalle qui enjambe quais ET voies (caténaire à 6,60 m max :
-    # elle passe en dessous, cf. canopy_attach_height côté app).
-    build_box(parts[MAT_STEEL], -ROOF_HALF, ROOF_Y, z0, ROOF_HALF, ROOF_Y + ROOF_THICK, z1)
-    # Lanterneau vitré central au-dessus des voies : il allège le toit le jour.
-    build_box(parts[MAT_GLASS], -1.6, ROOF_Y - 0.02, z0, 1.6, ROOF_Y + ROOF_THICK + 0.02, z1)
+    # Toit acier + lanterneau vitré central au-dessus des voies (il allège le toit le
+    # jour). M56 — LE LANTERNEAU TRAVERSAIT LE TOIT. La dalle d'acier courait d'une rive
+    # à l'autre et la verrière était une seconde boîte PLANTÉE DEDANS, 2 cm plus épaisse :
+    # leurs faces de bout tombaient exactement dans le même plan, avec la même
+    # orientation, et le raccord de chaque module scintillait sur 3,2 m de large
+    # (check_coplanar.py le signalait). Un lanterneau ne se plante pas dans une toiture :
+    # il en REMPLACE une partie. La dalle est donc coupée en deux versants, et le vitrage
+    # comble l'ouverture, à fleur. Les flancs sont coplanaires — mais dos à dos (normales
+    # opposées), donc jamais rasterisés ensemble.
+    canopy_half = 1.6
+    build_box(parts[MAT_STEEL], -ROOF_HALF, ROOF_Y, z0, -canopy_half, ROOF_Y + ROOF_THICK, z1)
+    build_box(parts[MAT_STEEL], canopy_half, ROOF_Y, z0, ROOF_HALF, ROOF_Y + ROOF_THICK, z1)
+    build_box(parts[MAT_GLASS], -canopy_half, ROOF_Y, z0, canopy_half, ROOF_Y + ROOF_THICK, z1)
     # Bandeaux néon sous les rives, côté ville : la signature nocturne de la station.
     for sign in (-1.0, 1.0):
         x0, x1 = sign * (ROOF_HALF - 0.30), sign * ROOF_HALF
@@ -159,6 +167,17 @@ def build_station(out):
     write_glb(out, parts, "station_module")
 
 
+def _default_models_dir():
+    """M56 — Par défaut, on écrit DANS assets/models, pas dans le répertoire courant.
+
+    Le README documente `python3 tools/gen_metro.py` comme la façon de régénérer les
+    modèles ; avec l'ancien défaut (« . ») la commande déposait les .glb à la racine du
+    dépôt et le jeu continuait de charger les anciens. Un générateur dont la sortie par
+    défaut n'est pas l'endroit où le moteur va lire est un piège, pas une commodité."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "assets", "models")
+
+
 if __name__ == "__main__":
-    out = sys.argv[1] if len(sys.argv) > 1 else "station.glb"
+    out = sys.argv[1] if len(sys.argv) > 1 else os.path.join(_default_models_dir(),
+                                                             "station.glb")
     build_station(out)

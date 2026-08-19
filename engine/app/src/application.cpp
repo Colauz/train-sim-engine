@@ -756,7 +756,8 @@ struct Application::Impl {
         Orbit,
         Cab
     };
-    CameraMode camera_mode = CameraMode::Orbit;
+    CameraMode camera_mode =
+        std::getenv("NOIRE_CAB") != nullptr ? CameraMode::Cab : CameraMode::Orbit;
     bool prev_c_down = false;
     float cab_yaw = 0.0f;
     float cab_pitch = -0.18f;
@@ -776,7 +777,13 @@ struct Application::Impl {
     // M31 : la simulation démarre à 22 h — Neo-Tokyo se joue de nuit, fenêtres et néons
     // allumés. day_cycle_speed = rapport de compression temporelle :
     // 1 s réelle = 60 s simulées => une journée complète en ~24 min de jeu.
-    double day_time = 22.0 * 3600.0;
+    // NOIRE_HOUR=<heure décimale> force l'heure de départ : c'est un levier de mesure
+    // (inspecter la géométrie en plein jour, comparer deux runs au même éclairage),
+    // pas un réglage de jeu — le défaut reste 22 h.
+    double day_time = [] {
+        const char* h = std::getenv("NOIRE_HOUR");
+        return (h != nullptr ? std::atof(h) : 22.0) * 3600.0;
+    }();
     double day_cycle_speed = 60.0;
 
     // --- Phares (M21) -------------------------------------------------------
@@ -947,10 +954,28 @@ struct Application::Impl {
         {
             std::vector<render::MeshVertex> mast_v, panel_v;
             std::vector<std::uint32_t> mast_i, panel_i;
+            // M56 — LES COTES DU SIGNAL. Le « panneau » mesurait 2,00 m de large sur
+            // 1,50 m de haut, déporté de 2 m au-dessus de la voie : une plaque de couleur
+            // unie plus grande qu'une porte, qui écrasait tout ce qui l'entourait et
+            // trahissait l'échelle de la scène entière (c'est le premier objet auquel
+            // l'oeil compare la rame). Un signal lumineux japonais, c'est une tête de
+            // ~0,60 x 1,45 m portant des feux de 25 à 30 cm, en potence courte le long
+            // du mât. On modélise donc vraiment ça : mât + potence + tête noire (dans le
+            // maillage du MÂT, gris sombre) et, seul élément teinté par l'aspect, LE FEU.
+            //
             // Mât : poteau carré, du sol (2 m sous le rail) à 5 m au-dessus.
             append_box(mast_v, mast_i, glm::vec3(0.0f, 1.5f, 0.0f), glm::vec3(0.10f, 3.5f, 0.10f));
-            // Panneau : plaque large déportée vers la voie (−x), face au sens de circulation.
-            append_box(panel_v, panel_i, glm::vec3(-1.0f, 4.2f, 0.0f), glm::vec3(1.0f, 0.75f, 0.10f));
+            // Potence courte vers la voie (−x), puis tête de signal noire.
+            append_box(mast_v, mast_i, glm::vec3(-0.28f, 4.30f, 0.0f),
+                       glm::vec3(0.28f, 0.045f, 0.045f));
+            append_box(mast_v, mast_i, glm::vec3(-0.56f, 4.30f, 0.0f),
+                       glm::vec3(0.30f, 0.72f, 0.05f));
+            // LE FEU : 32 cm, en saillie de 3 cm de part et d'autre de la tête (le signal
+            // se lit dans les deux sens de marche). C'est lui, et lui seul, que l'aspect
+            // colore — et il est ÉMISSIF : un feu de signalisation est une lumière, pas
+            // une gommette, et c'est ce qui le rend lisible à 200 m comme dans la vraie vie.
+            append_box(panel_v, panel_i, glm::vec3(-0.56f, 4.30f, 0.0f),
+                       glm::vec3(0.16f, 0.16f, 0.08f));
             sign_mast_mesh = renderer.create_mesh_indexed(mast_v, mast_i);
             sign_panel_mesh = renderer.create_mesh_indexed(panel_v, panel_i);
         }
@@ -971,6 +996,9 @@ struct Application::Impl {
         for (int t = 0; t < 5; ++t) {
             render::MaterialDesc d;
             d.base_color_factor = glm::vec4(tier_colors[t], 1.0f);
+            // Émissif HDR : le feu est une SOURCE. Le facteur nuit du shader le fait
+            // veiller le jour et flamber la nuit, comme les néons de la ville.
+            d.emissive_factor = tier_colors[t] * 4.0f;
             d.metallic_factor = 0.0f;
             d.roughness_factor = 0.40f;
             tier_material[static_cast<std::size_t>(t)] = renderer.create_material(d);
@@ -1327,10 +1355,16 @@ struct Application::Impl {
         // configs est fausse. Ça a invalidé une campagne de mesures entière le 2026-07-16.
         static const bool pinned = std::getenv("NOIRE_PIN_CAM") != nullptr;
         if (pinned) {
-            orbit_yaw = 2.30f;
+            const char* y = std::getenv("NOIRE_YAW");
+            orbit_yaw = y != nullptr ? static_cast<float>(std::atof(y)) : 2.30f;
             const char* p = std::getenv("NOIRE_PITCH");
             orbit_pitch = p != nullptr ? static_cast<float>(std::atof(p)) : 0.32f;
-            orbit_distance = 38.0f;
+            const char* dd = std::getenv("NOIRE_DIST");
+            orbit_distance = dd != nullptr ? static_cast<float>(std::atof(dd)) : 38.0f;
+            // La caméra CABINE se cadre avec les mêmes leviers : sans ça, NOIRE_CAB=1
+            // regarde toujours droit devant et le pupitre reste hors champ.
+            cab_yaw = y != nullptr ? static_cast<float>(std::atof(y)) : 0.0f;
+            cab_pitch = p != nullptr ? static_cast<float>(std::atof(p)) : 0.0f;
             window.consume_cursor_delta();  // vidange, sinon elle s'accumule
             return;
         }

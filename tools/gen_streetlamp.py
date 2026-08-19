@@ -10,6 +10,7 @@ Composants :
 import struct
 import json
 import math
+import os
 import sys
 
 MATERIALS = [
@@ -25,6 +26,22 @@ MAT_MAT, MAT_BULB = 0, 1
 class Part:
     def __init__(self):
         self.positions, self.normals, self.uvs, self.tangents, self.indices = [], [], [], [], []
+
+    def orient(self):
+        """M56 — Remet toutes les faces à l'endroit (sens trigonométrique vu de
+        l'extérieur, comme l'exige glTF et comme le rastérise le moteur). `add_box`
+        énumérait ses coins dans le sens horaire : le lampadaire était cousu à l'envers.
+        Invisible tant que le pipeline instancié ne cullait pas, mais faux — et le jour
+        où il cullera, le poteau disparaîtra. Même correctif que dans gen_metro.py."""
+        for t in range(0, len(self.indices), 3):
+            ia, ib, ic = self.indices[t], self.indices[t + 1], self.indices[t + 2]
+            a, b, c = (self.positions[i] for i in (ia, ib, ic))
+            gx = (b[1] - a[1]) * (c[2] - a[2]) - (b[2] - a[2]) * (c[1] - a[1])
+            gy = (b[2] - a[2]) * (c[0] - a[0]) - (b[0] - a[0]) * (c[2] - a[2])
+            gz = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+            n = self.normals[ia]
+            if gx * n[0] + gy * n[1] + gz * n[2] < 0.0:
+                self.indices[t + 1], self.indices[t + 2] = ic, ib
 
     def add_quad(self, p0, p1, p2, p3, n=None):
         if n is None:
@@ -91,6 +108,21 @@ class Part:
             self.tangents.extend([tg, tg, tg, tg])
             self.indices.extend([base, base + 1, base + 2, base, base + 2, base + 3])
 
+            # M56 — LES DEUX BOUTS. Le mât et la crosse étaient des TUBES OUVERTS : le
+            # haut du poteau montrait un trou noir dès qu'on le regardait d'en haut (et
+            # la caméra du jeu survole la voie), et la crosse ouvrait sur le vide à ses
+            # deux raccords. Un éventail par extrémité suffit à les fermer.
+            for (cx, cy, cz), sign in (((x0, y0, z0), -1.0), ((x1, y1, z1), 1.0)):
+                nn = (dir_v[0] * sign, dir_v[1] * sign, dir_v[2] * sign)
+                e0 = (cx + r * n0[0], cy + r * n0[1], cz + r * n0[2])
+                e1 = (cx + r * n1[0], cy + r * n1[1], cz + r * n1[2])
+                b2 = len(self.positions)
+                self.positions.extend([(cx, cy, cz), e0, e1])
+                self.normals.extend([nn, nn, nn])
+                self.uvs.extend([(0.5, 0.5), (0, 0), (1, 0)])
+                self.tangents.extend([tg, tg, tg])
+                self.indices.extend([b2, b2 + 1, b2 + 2])
+
 
 def build_streetlamp():
     parts = [Part() for _ in MATERIALS]
@@ -100,12 +132,11 @@ def build_streetlamp():
     parts[MAT_MAT].add_cylinder(0.0, 5.9, 0.0, 1.4, 6.1, 0.0, 0.045, segs=8)
     # Boîtier luminaire
     parts[MAT_MAT].add_box(1.25, 6.02, -0.12, 1.55, 6.15, 0.12)
-    # Ampoule émissive sodium
-    parts[MAT_BULB].add_quad(
-        (1.28, 6.01, -0.09), (1.52, 6.01, -0.09),
-        (1.52, 6.01, 0.09), (1.28, 6.01, 0.09),
-        (0.0, -1.0, 0.0)
-    )
+    # Ampoule émissive sodium. M56 : c'était UN SEUL QUAD horizontal — une source de
+    # lumière sans épaisseur, qui s'évanouissait dès qu'on la regardait de profil et qui
+    # n'existait pas du tout par-dessus. C'est maintenant une vasque de 3 cm d'épaisseur,
+    # débordant de 5 mm sous le boîtier (donc jamais coplanaire avec lui).
+    parts[MAT_BULB].add_box(1.28, 5.985, -0.09, 1.52, 6.015, 0.09)
     return parts
 
 
@@ -115,6 +146,8 @@ def align4(n):
 
 def write_glb(path, parts):
     used = [(i, p) for i, p in enumerate(parts) if p.positions]
+    for _, p in used:
+        p.orient()
     blocks, part_blocks = [], []
     for _, p in used:
         b = (b"".join(struct.pack("<fff", *v) for v in p.positions),
@@ -182,7 +215,17 @@ def write_glb(path, parts):
     print(f"{path} : {nv} sommets, {len(used)} primitives, {glb_len} o (streetlamp)")
 
 
+def _default_models_dir():
+    """M56 — Par défaut, on écrit DANS assets/models, pas dans le répertoire courant.
+
+    Le README documente `python3 tools/gen_metro.py` comme la façon de régénérer les
+    modèles ; avec l'ancien défaut (« . ») la commande déposait les .glb à la racine du
+    dépôt et le jeu continuait de charger les anciens. Un générateur dont la sortie par
+    défaut n'est pas l'endroit où le moteur va lire est un piège, pas une commodité."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "assets", "models")
+
+
 if __name__ == "__main__":
-    outdir = sys.argv[1] if len(sys.argv) > 1 else "."
+    outdir = sys.argv[1] if len(sys.argv) > 1 else _default_models_dir()
     parts = build_streetlamp()
     write_glb(f"{outdir}/streetlamp.glb", parts)

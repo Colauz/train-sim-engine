@@ -10,7 +10,7 @@ là où une vraie ramure en demanderait des dizaines de milliers.
 Le repère est celui du monde : y = haut, origine au PIED du tronc (le semis pose donc
 l'arbre directement sur Terrain::height, sans offset).
 Aucune dépendance externe (struct/json/zlib/math de la stdlib)."""
-import struct, json, zlib, math, sys, random
+import struct, json, zlib, math, os, sys, random
 
 # --- Cotes d'un arbre de haie champenoise -------------------------------------
 HEIGHT = 7.2          # hauteur totale
@@ -120,6 +120,37 @@ class Part:
             self.tangents.append(tg)
         self.indices.extend([base, base + 1, base + 2, base, base + 2, base + 3])
 
+    def add_tri(self, verts):
+        base = len(self.positions)
+        for p, n, uv, tg in verts:
+            self.positions.append(p)
+            self.normals.append(n)
+            self.uvs.append(uv)
+            self.tangents.append(tg)
+        self.indices.extend([base, base + 1, base + 2])
+
+    def orient(self):
+        """M56 — Remet les faces dans le sens trigonométrique vu de l'extérieur.
+
+        Le tronc était intégralement cousu à l'envers : ses quads tournaient dans le sens
+        des aiguilles d'une montre vu du dehors, donc sa normale géométrique pointait vers
+        l'AXE. Ça ne se voyait pas — le pipeline instancié ne culle pas, pour que les
+        cartes de feuillage restent visibles des deux côtés — mais c'était faux, et un
+        maillage faux finit toujours par se voir le jour où le pipeline change.
+
+        À N'APPLIQUER QU'AU TRONC : les normales des cartes de feuillage sont
+        délibérément « gonflées » vers le haut (cf. build_cards) et ne décrivent pas le
+        plan du quad ; les orienter d'après elles n'aurait aucun sens."""
+        for t in range(0, len(self.indices), 3):
+            ia, ib, ic = self.indices[t], self.indices[t + 1], self.indices[t + 2]
+            a, b, c = (self.positions[i] for i in (ia, ib, ic))
+            gx = (b[1] - a[1]) * (c[2] - a[2]) - (b[2] - a[2]) * (c[1] - a[1])
+            gy = (b[2] - a[2]) * (c[0] - a[0]) - (b[0] - a[0]) * (c[2] - a[2])
+            gz = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+            n = self.normals[ia]
+            if gx * n[0] + gy * n[1] + gz * n[2] < 0.0:
+                self.indices[t + 1], self.indices[t + 2] = ic, ib
+
 
 def build_trunk(part):
     """Tronc : cône tronqué à section polygonale, qui s'affine vers le haut. Normales
@@ -140,6 +171,19 @@ def build_trunk(part):
         u0, u1 = i / TRUNK_SEGMENTS, (i + 1) / TRUNK_SEGMENTS
         part.add_quad([(a, n0, (u0, 0.0), tg), (b, n1, (u1, 0.0), tg),
                        (c, n1, (u1, 1.0), tg), (d, n0, (u0, 1.0), tg)])
+    # M56 — Les deux bouts. Le tronc était un cône OUVERT en haut comme en bas : le
+    # bas est enterré, mais le haut débouchait dans le feuillage, et un arbre planté
+    # sur une pente montrait le sien. Deux éventails ferment le volume.
+    for y, radius, ny in ((0.0, TRUNK_R, -1.0), (top_y, top_r, 1.0)):
+        cen = (0.0, y, 0.0)
+        n = (0.0, ny, 0.0)
+        tg = (1.0, 0.0, 0.0, 1.0)
+        for i in range(TRUNK_SEGMENTS):
+            (c0, s0), (c1, s1) = ring[i], ring[i + 1]
+            e0 = (c0 * radius, y, s0 * radius)
+            e1 = (c1 * radius, y, s1 * radius)
+            part.add_tri([(cen, n, (0.5, 0.5), tg), (e0, n, (0.0, 0.0), tg),
+                          (e1, n, (1.0, 0.0), tg)])
 
 
 def build_cards(part):
@@ -173,13 +217,17 @@ def build_cards(part):
     # Le plan coiffant.
     hw = CARD_W * 0.42
     top = HEIGHT - 1.5
-    pts = [(-hw, top, -hw), (hw, top - 0.25, -hw), (hw, top, hw), (-hw, top + 0.25, hw)]
+    # M56 — L'ordre des coins donnait une normale géométrique VERS LE BAS alors que le
+    # plan coiffant est là pour être vu d'en haut (c'est même sa seule raison d'être).
+    # Sens inversé : la carte regarde enfin le ciel.
+    pts = [(-hw, top, -hw), (-hw, top + 0.25, hw), (hw, top, hw), (hw, top - 0.25, -hw)]
     uvs = [(0.0, 1.0), (1.0, 1.0), (1.0, 0.0), (0.0, 0.0)]
     part.add_quad([(pts[k], (0.0, 1.0, 0.0), uvs[k], (1.0, 0.0, 0.0, 1.0)) for k in range(4)])
 
 
 parts = [Part(), Part()]
 build_trunk(parts[MAT_BARK])
+parts[MAT_BARK].orient()
 build_cards(parts[MAT_LEAF])
 png = make_foliage(TEX)
 
@@ -263,7 +311,18 @@ json_bytes = json.dumps(gltf, separators=(",", ":")).encode("utf-8")
 json_bytes += b" " * (align4(len(json_bytes)) - len(json_bytes))
 bin_pad = bytes(bin_data) + b"\x00" * (align4(total) - total)
 
-out = sys.argv[1] if len(sys.argv) > 1 else "tree.glb"
+def _default_models_dir():
+    """M56 — Par défaut, on écrit DANS assets/models, pas dans le répertoire courant.
+
+    Le README documente `python3 tools/gen_metro.py` comme la façon de régénérer les
+    modèles ; avec l'ancien défaut (« . ») la commande déposait les .glb à la racine du
+    dépôt et le jeu continuait de charger les anciens. Un générateur dont la sortie par
+    défaut n'est pas l'endroit où le moteur va lire est un piège, pas une commodité."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "assets", "models")
+
+
+out = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
+    _default_models_dir(), "tree.glb")
 glb_len = 12 + 8 + len(json_bytes) + 8 + len(bin_pad)
 with open(out, "wb") as f:
     f.write(struct.pack("<III", 0x46546C67, 2, glb_len))

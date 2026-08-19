@@ -9,7 +9,7 @@ La loco est découpée en PRIMITIVES par matériau (M8 étape 5) : l'app itère 
 model->primitives et lie le descriptor set du matériau de chacune, donc une primitive
 par matériau suffit à faire cohabiter acier, peinture et verre sur le même maillage.
 Aucune dépendance externe (struct/json/zlib de la stdlib)."""
-import struct, json, zlib, sys
+import struct, json, zlib, os, sys
 
 # --- Matériaux PBR (metallic-roughness glTF) ----------------------------------
 # Rappel de convention, qui dicte tout ce qui suit :
@@ -202,7 +202,18 @@ json_bytes = json.dumps(gltf, separators=(",", ":")).encode("utf-8")
 json_bytes += b" " * (align4(len(json_bytes)) - len(json_bytes))       # pad espaces
 bin_pad = bytes(bin_data) + b"\x00" * (align4(total) - total)
 
-out = sys.argv[1] if len(sys.argv) > 1 else "train.glb"
+def _default_models_dir():
+    """M56 — Par défaut, on écrit DANS assets/models, pas dans le répertoire courant.
+
+    Le README documente `python3 tools/gen_metro.py` comme la façon de régénérer les
+    modèles ; avec l'ancien défaut (« . ») la commande déposait les .glb à la racine du
+    dépôt et le jeu continuait de charger les anciens. Un générateur dont la sortie par
+    défaut n'est pas l'endroit où le moteur va lire est un piège, pas une commodité."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "assets", "models")
+
+
+out = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
+    _default_models_dir(), "train.glb")
 glb_len = 12 + 8 + len(json_bytes) + 8 + len(bin_pad)
 with open(out, "wb") as f:
     f.write(struct.pack("<III", 0x46546C67, 2, glb_len))            # header glTF

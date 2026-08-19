@@ -67,7 +67,29 @@ def png_encode(w, h, rgba):
     return sig + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(bytes(raw), 9)) + chunk(b"IEND", b"")
 
 
-def make_facades(seed, cols_max, floors, tex_w, tex_h):
+# M56 — LES FAÇADES ÉTAIENT PEINTES EN NUIT.
+#
+# Le béton était engendré à (34, 37, 44) et le vitrage éteint à (22, 26, 34) : en sRGB
+# c'est 13 % et 10 %, soit un albédo LINÉAIRE de 1,6 % — plus sombre que du charbon
+# (0,04) et six fois plus sombre que l'enrobé de la chaussée. Conséquence : la ville
+# restait un mur NOIR en plein midi, avec ses fenêtres allumées par-dessus. C'était
+# l'incohérence la plus voyante du jeu.
+#
+# Le piège est classique : on règle un albédo à l'oeil sur une scène de nuit, et on
+# encode l'ÉCLAIRAGE dans la MATIÈRE. Un moteur PBR ne le pardonne pas — c'est
+# l'éclairage qui doit faire la nuit, l'albédo décrit ce que la surface renvoie, point.
+# Les valeurs ci-dessous sont donc des réflectances plausibles de bâtiment (25 à 45 %
+# en sRGB), et la nuit reste noire parce que le soleil est sous l'horizon.
+FACADES = {
+    # (béton, vitrage éteint) — une famille par gabarit, pour que la ville ne soit pas
+    # monochrome : les trois textures sont les seules du jeu, la variété vient d'elles.
+    "tower": ((122, 132, 146), (78, 94, 112)),   # tour de bureaux, verre teinté bleu
+    "block": ((168, 164, 156), (86, 92, 100)),   # immeuble courant, béton clair
+    "slab":  ((140, 138, 134), (74, 80, 88)),    # barre basse, béton gris
+}
+
+
+def make_facades(seed, cols_max, floors, tex_w, tex_h, palette):
     """Deux textures tex_w x tex_h : (base color, émissive). La grille fait cols_max x
     floors cellules couvrant la façade entière ; chaque cellule est une fenêtre entourée
     de béton, tirée indépendamment. Semis figé : reproductible à l'identique."""
@@ -93,14 +115,15 @@ def make_facades(seed, cols_max, floors, tex_w, tex_h):
                     color = (200, 225, 255)   # blanc froid (bureaux)
                 lit[(c, f)] = color
 
-    # Béton de façade : gris-bleu sombre, légèrement nuancé par bandes d'étage.
+    # Béton de façade, nuancé par bandes d'étage (les nez de dalle d'un immeuble ne
+    # renvoient pas la lumière comme ses allèges).
+    concrete, glass = palette
     for y in range(tex_h):
         for x in range(tex_w):
             o = (y * tex_w + x) * 4
-            shade = 0.9 + 0.2 * ((y // ch) % 2)
-            base[o] = min(255, int(34 * shade))
-            base[o + 1] = min(255, int(37 * shade))
-            base[o + 2] = min(255, int(44 * shade))
+            shade = 0.92 + 0.16 * ((y // ch) % 2)
+            for k in range(3):
+                base[o + k] = min(255, int(concrete[k] * shade))
             base[o + 3] = 255
 
     # Les fenêtres : rectangle centré dans la cellule (marges = l'embrasure béton).
@@ -113,14 +136,13 @@ def make_facades(seed, cols_max, floors, tex_w, tex_h):
             for y in range(y0, y1):
                 for x in range(x0, x1):
                     o = (y * tex_w + x) * 4
-                    # Fenêtre éteinte : vitre sombre à peine plus claire que le béton.
-                    base[o], base[o + 1], base[o + 2] = 22, 26, 34
+                    # Le vitrage a le MÊME albédo qu'il soit allumé ou non : de jour, une
+                    # fenêtre derrière laquelle brûle un néon ressemble à n'importe quelle
+                    # autre fenêtre. C'est l'ÉMISSIF, et lui seul, qui les distingue la
+                    # nuit — sinon la ville garderait à midi le damier de son éclairage
+                    # nocturne, ce qui était exactement le défaut d'avant.
+                    base[o], base[o + 1], base[o + 2] = glass
                     if glow:
-                        # Fenêtre allumée : l'albédo suit aussi (jour), mais c'est
-                        # l'ÉMISSIF qui porte la lumière la nuit.
-                        base[o] = min(255, glow[0] // 3)
-                        base[o + 1] = min(255, glow[1] // 3)
-                        base[o + 2] = min(255, glow[2] // 3)
                         emis[o], emis[o + 1], emis[o + 2] = glow
                         emis[o + 3] = 255
     return png_encode(tex_w, tex_h, bytes(base)), png_encode(tex_w, tex_h, bytes(emis))
@@ -255,7 +277,8 @@ def build(variant, out):
     build_tower(part, sx, sy, sz, cols_max, floors)
     # Graine par variante : deux gabarits n'ont pas la même carte de fenêtres allumées.
     seed = {"tower": 20260728, "block": 20260729, "slab": 20260730}[variant]
-    base_png, emis_png = make_facades(seed, cols_max, floors, tex_w, tex_h)
+    base_png, emis_png = make_facades(seed, cols_max, floors, tex_w, tex_h,
+                                      FACADES[variant])
     write_glb(out, part, (base_png, emis_png), variant, tex_w, tex_h)
 
 

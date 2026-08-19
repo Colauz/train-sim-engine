@@ -499,10 +499,19 @@ def make_fabric(outdir):
 
 
 def make_console(outdir):
-    """Pupitre de conduite : plastique technique grainé, gris très sombre mat.
+    """Pupitre de conduite : plastique technique grainé, gris foncé mat.
 
     Un pupitre en aplat noir avale toute la lumière et devient une silhouette :
-    le grain est ce qui lui rend son volume sous la lumière rasante de la cabine."""
+    le grain est ce qui lui rend son volume sous la lumière rasante de la cabine.
+
+    M56 — L'albédo était à 0,045 en LINÉAIRE, soit 4,5 % de réflectance : plus sombre
+    que de l'enrobé neuf, et à peine au-dessus du noir de four. Dans une cabine que
+    rien n'éclaire directement (le toit de la rame la met à l'ombre, il ne reste que
+    l'ambiante du ciel), ça donnait un pupitre littéralement NOIR en plein midi — la
+    moitié basse de la vue de conduite ne montrait plus rien du tout. Un plastique
+    technique gris foncé, c'est 10 à 15 % : on se cale à 0,115, et le poste redevient
+    lisible sans cesser d'être sombre. Les amplitudes de grain suivent le même
+    facteur, sinon le relief s'effacerait sous l'albédo."""
     size = TRAIN_SIZE
     grain = white(size, 10001)
     n_fine = fbm(size, 64, 2, 10002)
@@ -510,8 +519,8 @@ def make_console(outdir):
 
     a_r, a_g, a_b, ao, rough, metal, height = [], [], [], [], [], [], []
     for i in range(size * size):
-        v = 0.045 + (n_broad[i] - 0.5) * 0.012 + (n_fine[i] - 0.5) * 0.010
-        v += (grain[i] - 0.5) * 0.008
+        v = 0.115 + (n_broad[i] - 0.5) * 0.031 + (n_fine[i] - 0.5) * 0.026
+        v += (grain[i] - 0.5) * 0.020
         a_r.append(v)
         a_g.append(v * 1.02)
         a_b.append(v * 1.05)
