@@ -2,6 +2,7 @@
 #extension GL_GOOGLE_include_directive : require
 
 #include "common/global_ubo.glsl"
+#include "common/sky.glsl"
 
 // set = 1 : la cubemap HDR d'environnement (R16G16B16A16_SFLOAT + chaîne de mips).
 // Le mip 0 est le ciel net ; les mips suivants serviront de niveaux de rugosité à
@@ -29,12 +30,12 @@ void main() {
     // et on veut de toute façon le niveau le plus net.
     vec3 sky = textureLod(envMap, normalize(viewDir), 0.0).rgb;
 
-    // Cycle Jour/Nuit (M21) : u.skyParams.x = facteur nuit (0 = jour, 1 = nuit).
+    // Cycle Jour/Nuit (M21, gain partagé depuis le M57) : u.skyParams.x = facteur nuit.
     // On multiplie EN HDR : l'ACES comprime les hautes lumières, donc assombrir avant
     // le tone-mapping donne une nuit plus naturelle (le disque solaire disparaît vite).
-    // La racine carrée ralentit le début du crépuscule pour un coucher plus progressif.
-    float nightFactor = u.skyParams.x;
-    sky *= (1.0 - sqrt(nightFactor));
+    // Le gain vient de common/sky.glsl — le MÊME fichier que celui dont pbr.glsl tire
+    // l'ambiante, faute de quoi le ciel qu'on voit et le ciel qui éclaire divergent.
+    sky *= skyRadianceGain(u.skyParams.x);
 
     // Le contenu de la cubemap est de la RADIANCE HDR brute (valeurs > 1 courantes, le
     // disque solaire monte à plusieurs milliers) : sans tone mapping tout le ciel

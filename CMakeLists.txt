@@ -47,8 +47,18 @@ endif()
 add_subdirectory(engine)    # la bibliothèque « noire::engine »
 add_subdirectory(runtime)   # l'exécutable du simulateur
 
+# M57 — Les deux options ci-dessous CASSAIENT le configure : `tools/` ne contient que
+# des scripts Python et `tests/` était vide, donc `add_subdirectory` échouait sur un
+# CMakeLists.txt introuvable. Une option de build qui casse le build n'est pas une
+# option, c'est un piège — le README devait d'ailleurs prévenir de ne pas y toucher.
+# La garde rend l'échec impossible : s'il n'y a rien à construire, on le DIT.
 if(NOIRE_BUILD_TOOLS)
-    add_subdirectory(tools)
+    if(EXISTS ${CMAKE_SOURCE_DIR}/tools/CMakeLists.txt)
+        add_subdirectory(tools)
+    else()
+        message(STATUS "NOIRE_BUILD_TOOLS=ON mais tools/ ne contient que des scripts "
+                       "Python (aucune cible CMake) — rien à construire.")
+    endif()
 endif()
 
 if(NOIRE_BUILD_TESTS)

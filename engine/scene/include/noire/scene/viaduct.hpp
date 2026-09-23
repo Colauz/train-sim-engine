@@ -126,6 +126,24 @@ struct StationProfile {
     float psd_offset = 0.0f;      // retrait de la FACE vitrée depuis le nez de quai
     double panel_max = 2.5f;      // longueur max d'un panneau fixe (tessellation)
     double sign_spacing = 25.0;   // entraxe des panneaux suspendus
+    // --- M57 : ÉCLAIRAGE DE QUAI ---------------------------------------------
+    // Tant que le cycle jour/nuit était décoratif (l'ambiante IBL ne suivait pas le
+    // soleil), une gare restait éclairée à 2 h du matin par un ciel de midi et la
+    // question ne se posait pas. Depuis que la nuit est une vraie nuit, elle se pose
+    // frontalement : sans luminaires, le quai devient NOIR, et l'on demande au
+    // conducteur un arrêt à 50 cm sur un repère qu'il ne voit pas. Toute gare réelle
+    // est éclairée ; celle-ci l'est donc aussi, par une file de tubes sous
+    // l'intrados de la verrière, au-dessus de l'axe de chaque quai.
+    //
+    // Ils partent dans le maillage `signs` — donc dans le matériau émissif blanc
+    // chaud DÉJÀ utilisé par la signalétique suspendue : aucun matériau de plus,
+    // aucun draw call de plus, et la même veilleuse de jour que les néons de la
+    // ville (kEmissiveDayFloor).
+    double lamp_spacing = 6.0;      // entraxe des tubes le long du quai (m)
+    float lamp_half_length = 1.10f; // demi-longueur d'un tube (2,20 m)
+    float lamp_half_width = 0.13f;
+    float lamp_half_height = 0.05f;
+    float lamp_drop = 0.12f;        // retombée sous l'intrados de la verrière
     // --- M53 : BANDE PODOTACTILE (点字ブロック) -------------------------------
     // Bande jaune à plots qui borde tout le quai, DERRIÈRE la façade vitrée. Elle
     // rend le nez de quai lisible d'un bout à l'autre : c'est la ligne que l'œil

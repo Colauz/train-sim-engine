@@ -1,6 +1,7 @@
 #include "noire/physics/consist.hpp"
 
 #include <algorithm>
+#include <cmath>
 
 namespace noire::physics {
 
@@ -75,7 +76,26 @@ void Consist::update(double dt) {
     // marge. L'urgence reste verrouillée (ats_active_ = true) jusqu'à ce que le conducteur
     // réarme le système à l'arrêt (0 km/h) via le Mascon (EB -> N).
     current_limit_kmh_ = limits_.limit_kmh(loco_.chainage());
-    const double speed_kmh = loco_.speed() * 3.6;
+    // M57 — VALEUR ABSOLUE. Une survitesse est un excès de VITESSE, pas un excès de
+    // vitesse algébrique : avec la vitesse signée, une rame qui dévalait sa rampe en
+    // marche arrière comparait un nombre négatif à une limite positive et n'était donc
+    // jamais en survitesse, quelle que soit l'allure atteinte. L'anti-recul (M57) rend
+    // le cas improbable ; le rendre IMPOSSIBLE à surveiller serait un trou de sécurité
+    // resté ouvert par accident.
+    const double speed_kmh = std::abs(loco_.speed()) * 3.6;
+    // M57 — La MARGE est enfin appliquée. `ats_margin_kmh` était réglée (5 km/h dans
+    // l'app), documentée dans l'en-tête (« dépasser la limite de plus de ats_margin_kmh
+    // arme le freinage d'urgence ») et lue par personne : l'avertissement se levait au
+    // km/h près sur la limite. Deux conséquences, toutes deux visibles en jeu — le
+    // carillon ATS se déclenchait pour un dépassement d'un demi-km/h en sortie de
+    // courbe, et l'aide à la conduite (DrivingAdvisor), qui vise « limite − 2 km/h »
+    // EN SUPPOSANT la marge, conseillait une consigne à 2 km/h d'un déclenchement au
+    // lieu des 7 attendus.
+    // Exception : une zone à 0 km/h est un signal d'ARRÊT (aspect R). Un arrêt absolu ne
+    // se tolère pas « à 5 km/h près » — le moindre mouvement le franchit.
+    const double trip_kmh = (current_limit_kmh_ > 0.0)
+                                ? current_limit_kmh_ + config_.ats_margin_kmh
+                                : 0.0;
 
     // --- Délai de Grâce ATS 10s (M34) ---
     if (!ats_isolated_) {
@@ -83,7 +103,7 @@ void Consist::update(double dt) {
             // Phase 3 : Arrêt d'urgence déjà verrouillé (latched) -> en attente d'acquittement à 0 km/h
             ats_warning_ = false;
             ats_warning_timer_ = 0.0;
-        } else if (speed_kmh > current_limit_kmh_) {
+        } else if (speed_kmh > trip_kmh) {
             // Phase 1 : Avertissement (Warning)
             ats_warning_ = true;
             ats_warning_timer_ += dt;

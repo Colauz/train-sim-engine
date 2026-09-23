@@ -777,8 +777,8 @@ bool Renderer::create_command_objects() {
 }
 
 bool Renderer::create_sync_objects() {
-    image_available_.resize(kFramesInFlight);
-    in_flight_.resize(kFramesInFlight);
+    image_available_.resize(static_cast<std::size_t>(kFramesInFlight));
+    in_flight_.resize(static_cast<std::size_t>(kFramesInFlight));
 
     VkSemaphoreCreateInfo sem{};
     sem.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
@@ -786,7 +786,7 @@ bool Renderer::create_sync_objects() {
     fence.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     fence.flags = VK_FENCE_CREATE_SIGNALED_BIT;
 
-    for (int i = 0; i < kFramesInFlight; ++i) {
+    for (std::size_t i = 0; i < image_available_.size(); ++i) {
         if (vkCreateSemaphore(context_.device(), &sem, nullptr, &image_available_[i]) != VK_SUCCESS ||
             vkCreateFence(context_.device(), &fence, nullptr, &in_flight_[i]) != VK_SUCCESS) {
             log::error("Vulkan : création des objets de synchro (frame) échouée");
@@ -797,16 +797,26 @@ bool Renderer::create_sync_objects() {
 }
 
 bool Renderer::create_present_semaphores() {
-    for (VkSemaphore s : render_finished_) {
-        if (s != VK_NULL_HANDLE) {
-            vkDestroySemaphore(context_.device(), s, nullptr);
-        }
+    // M57 — On ne DÉTRUIT jamais ces sémaphores en cours de route, on ne fait qu'en
+    // AJOUTER. Chacun est attendu par un vkQueuePresentKHR, et aucune primitive ne dit
+    // quand une présentation a fini de le consommer : vkDeviceWaitIdle (cf.
+    // recreate_swapchain) couvre les soumissions, PAS les présentations. Les détruire à
+    // chaque recréation de la swapchain — il y en a plusieurs au démarrage, le temps que
+    // la fenêtre prenne sa taille — c'était détruire un objet peut-être encore attendu :
+    // comportement indéfini, et 20 VUID-vkDestroySemaphore-semaphore-05149 par
+    // lancement. Réutiliser un sémaphore dont l'attente a été soumise est en revanche
+    // légal — c'est ce que fait déjà chaque frame. Les surnuméraires (si la swapchain
+    // perd des images) restent simplement inutilisés jusqu'au shutdown.
+    const std::size_t first_new = render_finished_.size();
+    if (first_new >= swapchain_.image_count()) {
+        return true;
     }
-    render_finished_.assign(swapchain_.image_count(), VK_NULL_HANDLE);
+    render_finished_.resize(swapchain_.image_count(), VK_NULL_HANDLE);
 
     VkSemaphoreCreateInfo sem{};
     sem.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-    for (VkSemaphore& s : render_finished_) {
+    for (std::size_t i = first_new; i < render_finished_.size(); ++i) {
+        VkSemaphore& s = render_finished_[i];
         if (vkCreateSemaphore(context_.device(), &sem, nullptr, &s) != VK_SUCCESS) {
             log::error("Vulkan : création des sémaphores de présentation échouée");
             return false;

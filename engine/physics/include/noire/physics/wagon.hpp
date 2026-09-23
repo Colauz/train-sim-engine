@@ -96,6 +96,11 @@ public:
     [[nodiscard]] double grade_percent() const { return grade_percent_; }
     [[nodiscard]] bool slipping() const { return slipping_; }
     [[nodiscard]] bool immobilized() const { return immobilized_; }
+    // M57 — true tant que l'ANTI-RECUL tient la rame : la pente la pousserait en arrière
+    // et le frein de maintien s'y oppose. Ce n'est pas une panne, c'est un dispositif qui
+    // travaille — le pupitre l'affiche pour que le conducteur sache POURQUOI sa rame ne
+    // bouge pas alors que son manipulateur est au neutre.
+    [[nodiscard]] bool rollback_hold() const { return rollback_hold_; }
     [[nodiscard]] const WagonConfig& config() const { return config_; }
     [[nodiscard]] const AirBrake& air_brake() const { return air_brake_; }
 
@@ -112,6 +117,7 @@ private:
 
     bool slipping_ = false;
     bool immobilized_ = false;
+    bool rollback_hold_ = false;
     double tractive_effort_ = 0.0;
     double grade_percent_ = 0.0;
 

@@ -13,6 +13,7 @@
 #define NOIRE_PBR_GLSL
 
 #include "common/global_ubo.glsl"
+#include "common/sky.glsl"
 
 // set 0, binding 1 : les cascades d'ombre. sampler2DShadow => la comparaison de
 // profondeur est faite par le MATÉRIEL, et le filtrage LINEAR interpole les 4 résultats
@@ -258,9 +259,13 @@ vec3 shadeSurfaceEx(vec3 albedo, float metallic, float roughness, vec3 N, vec3 c
 
     // --- Ambiante : IBL ---
     float envMips = float(textureQueryLevels(envMap) - 1);
+    // M57 — Le CYCLE JOUR/NUIT s'applique ici aussi, et c'est tout l'objet du correctif :
+    // la cubemap et ses SH viennent d'un HDRI de plein jour, figé au chargement. Sans ce
+    // gain, toute surface gardait son ambiante de midi sous un ciel devenu noir.
+    vec3 ambientGain = ambientIrradianceGain(u.skyParams.x);
     // Les SH d'ordre 2 font du ringing et peuvent devenir négatives : une irradiance
     // négative n'a aucun sens physique.
-    vec3 irradiance = max(shIrradiance(N), vec3(0.0));
+    vec3 irradiance = max(shIrradiance(N), vec3(0.0)) * ambientGain;
     vec3 Famb = fresnelSchlickRoughness(NdotV, F0, roughness);
     vec3 kDamb = (vec3(1.0) - Famb) * (1.0 - metallic);
     // E est une IRRADIANCE : le 1/PI du lambert s'applique bel et bien ici, contrairement
@@ -268,7 +273,7 @@ vec3 shadeSurfaceEx(vec3 albedo, float metallic, float roughness, vec3 N, vec3 c
     vec3 ambientDiffuse = kDamb * albedo * irradiance / kPi;
 
     vec3 R = reflect(-V, N);
-    vec3 prefiltered = textureLod(envMap, R, roughness * envMips).rgb;
+    vec3 prefiltered = textureLod(envMap, R, roughness * envMips).rgb * ambientGain;
     vec2 ab = envBRDFApprox(NdotV, roughness);
     vec3 ambientSpecular = prefiltered * (F0 * ab.x + ab.y);
 
@@ -327,7 +332,11 @@ vec3 shadeSurfaceEx(vec3 albedo, float metallic, float roughness, vec3 N, vec3 c
     // la skybox passée au MÊME ACES, le mélange en HDR linéaire est sans raccord.
     float dist = length(cameraRelPos);
     float fog = clamp(1.0 - exp(-u.fogColorDensity.a * dist), 0.0, 1.0);
-    vec3 fogColor = textureLod(envMap, normalize(cameraRelPos), envMips * 0.5).rgb;
+    // Le brouillard prend le gain du CIEL, pas celui de l'ambiante : ce qu'on voit au
+    // loin, c'est littéralement le ciel à travers la brume. Sans lui, sous la pluie de
+    // nuit (densité x125), l'horizon s'éclaircissait en un voile de plein jour.
+    vec3 fogColor = textureLod(envMap, normalize(cameraRelPos), envMips * 0.5).rgb *
+                    skyRadianceGain(u.skyParams.x);
     color = mix(color, fogColor, fog);
 
     // Aucune correction gamma manuelle : la swapchain est en VK_FORMAT_B8G8R8A8_SRGB, le

@@ -3,13 +3,14 @@
 Moteur de jeu **from scratch** dédié à la **simulation ferroviaire hyper-réaliste**
 (nom de code *Noire*, d'après `projet_noire`).
 
-État actuel (**M53**) : une ligne de **métro japonais** (rame type E235) roulant dans un
+État actuel (**M57**) : une ligne de **métro japonais** (rame type E235) roulant dans un
 environnement urbain procédural « Neo-Tokyo » — voie infinie streamée, terrain
-geo-clipmap, gares avec quais carrelés, bande podotactile et **portes palières (PSD)
-mi-hauteur** synchronisées avec la rame, caténaires, viaducs, immeubles instanciés,
-PBR + IBL + ombres cascadées, textures procédurales sur toutes les surfaces bâties et
-sur la rame, audio spatialisé, météo dynamique, **ATS** (contrôle de vitesse), **Mascon**
-à crans et **arrêt de précision** assisté au pupitre.
+geo-clipmap, gares avec quais carrelés, bande podotactile, **éclairage de quai** et
+**portes palières (PSD) mi-hauteur** synchronisées avec la rame, caténaires, viaducs,
+immeubles instanciés, PBR + IBL + ombres cascadées, **cycle jour/nuit qui éclaire
+vraiment**, textures procédurales sur toutes les surfaces bâties et sur la rame, audio
+spatialisé, météo dynamique, **ATS** (contrôle de vitesse, avec sa marge), **anti-recul**,
+**Mascon** à crans et **arrêt de précision** assisté au pupitre.
 
 ---
 
@@ -128,8 +129,30 @@ Pour le réarmer : **arrêt complet** → Mascon sur `EB` → Mascon sur `N`.
 
 `HEURE` · `VITESSE` · `ATS <aspect> <limite>` (G / YG / Y / R) · `MASCON` ·
 `CG` (pression de conduite générale, 5 bar = desserré) · `PENTE` · `METEO` ·
-`FPS / GPU ms`, plus les témoins `IMMOBILISE`, `ATS ISOLE`, `ATS SURVITESSE`,
-`URGENCE`, `PATINAGE`.
+`FPS / GPU ms`, plus les témoins `IMMOBILISE`, `ANTI-RECUL`, `ATS ISOLE`,
+`ATS SURVITESSE`, `URGENCE`, `PATINAGE`.
+
+### `ANTI-RECUL` : pourquoi la rame ne part pas en arrière (M57)
+
+Aucun inverseur n'est modélisé : cette rame ne circule **que vers l'avant**. Une vitesse
+négative n'est donc jamais une manœuvre, c'est une dérive — mascon au neutre, frein
+desserré, et la rampe qui reprend la rame. Le matériel réel a exactement ce dispositif
+(*転動防止*, prévention du roulement) : dès que le sens s'inverse sans commande, le frein
+de maintien serre et **tient** la rame. Le témoin bleu `ANTI-RECUL (PENTE)` s'allume tant
+qu'il travaille, et la rame repart normalement dès le premier cran de traction.
+
+Sans lui — et c'était le cas jusqu'au M56 — une rame laissée au neutre sur la rampe de
+1,1 % accélérait indéfiniment vers l'arrière (−6,5 km/h au bout de 17 s, et toujours en
+train de prendre de la vitesse) : elle quittait sa gare à reculons, le compteur affichait
+un nombre négatif et l'ATS, qui comparait une vitesse **signée** à une limite positive,
+ne la voyait jamais en survitesse.
+
+### La marge de l'ATS (M57)
+
+L'ATS tolère **5 km/h** au-dessus de la limite affichée avant d'armer son avertissement
+(`ats_margin_kmh`) — sauf sur un aspect `R`, où l'arrêt est absolu et le moindre
+mouvement le franchit. La consigne d'aide à la conduite vise 2 km/h **sous** la limite :
+il reste donc 7 km/h entre « je suis la consigne » et « l'ATS s'énerve ».
 
 ### Aide à la conduite : quelle vitesse, à quel moment (M55)
 
@@ -184,6 +207,44 @@ que les portes de la rame (même vitesse, même courbe, même instant).
 
 ---
 
+## 🌃 Le cycle jour/nuit (M21, réellement branché au M57)
+
+L'heure court à 60× (une journée simulée en 24 min) et se lit au pupitre. `NOIRE_HOUR`
+fixe l'heure de départ ; le défaut est **22 h**, donc de nuit.
+
+Jusqu'au M56, ce cycle était **décoratif sur toute la géométrie**. Le ciel, lui,
+s'assombrissait bien — mais l'ambiante image-based, elle, ne suivait pas : la cubemap
+HDR et ses harmoniques sphériques viennent d'un HDRI de *plein jour*, figé au
+chargement, et rien ne les modulait. Résultat : à 2 h du matin, sous un ciel noir, les
+quais, la verrière, le viaduc et les rails restaient éclairés par un soleil de midi.
+Mesuré au pixel sur le banc épinglé, une dalle de quai rendait **(114, 131, 150) à 13 h
+et (114, 131, 150) à 2 h** — rigoureusement identique.
+
+Le gain vit désormais dans **un seul fichier**, `engine/render/shaders/common/sky.glsl`,
+que `skybox.frag` et `common/pbr.glsl` incluent tous les deux — le ciel qu'on voit et le
+ciel qui éclaire ne peuvent plus diverger. Il porte **deux** grandeurs, parce que ce sont
+deux choses différentes :
+
+| Gain                      | Ce qu'il module                              | Plancher de nuit |
+| ------------------------- | --------------------------------------------- | ---------------- |
+| `skyRadianceGain`         | la skybox **et** la couleur du brouillard      | ~2 % (bleu nuit) |
+| `ambientIrradianceGain`   | l'irradiance SH + l'environnement préfiltré    | ~26 %            |
+
+Pourquoi l'ambiante ne tombe pas aussi bas que le ciel : dans une ville de cette
+densité, la lumière ambiante nocturne **ne vient pas du ciel, elle vient de la ville** —
+façades allumées, enseignes, éclairage public, le tout renvoyé par le bitume et la
+brume. C'est exactement pour cette raison qu'on ne voit pas les étoiles à Tokyo.
+
+**Éclairage de quai (M57).** Corollaire immédiat : dès que la nuit est une vraie nuit,
+une gare sans luminaires devient noire — et l'on demanderait au conducteur un arrêt à
+50 cm sur un repère qu'il ne voit pas. Une file de tubes court donc sous l'intrados de
+la verrière, au-dessus de l'axe de chaque quai. Ils partent dans le maillage `signs`,
+donc dans le matériau émissif **déjà** utilisé par la signalétique suspendue : aucun
+matériau de plus, **aucun draw call de plus**, et la même veilleuse de jour que les néons
+de la ville.
+
+---
+
 ## 🐌 Ça rame ? Les niveaux de qualité
 
 Trois presets, choisis au lancement par `NOIRE_QUALITY` ou cyclés en jeu par **`F1`**
@@ -215,6 +276,16 @@ iGPU, 1280×720), avant/après M54 :
 | GPU (ms)        | 3,0  | 2,6  | 2,3  | 1,8  |
 | draw calls      | 868  | 410  | 402  | 365  |
 
+> ⚠️ **Ces chiffres sont ceux du M54 et ne se comparent plus à aujourd'hui** — deux fois
+> plutôt qu'une. D'abord le M56 : en remettant à l'endroit un winding inversé, il a rendu
+> RASTÉRISÉE toute la géométrie que le GPU jetait gratuitement jusque-là (la rame
+> entière, entre autres). Le temps de la passe scène a plus que triplé, et c'est le prix
+> normal de la correction, pas une régression. Ensuite le M57 : jusqu'à lui, le banc ne
+> *tenait pas* — la rame dérivait en arrière pendant la mesure, donc deux runs ne
+> cadraient jamais la même scène (c'est exactement le défaut que l'anti-recul corrige).
+> Toute campagne chiffrée doit donc repartir d'un relevé neuf, et les niveaux de qualité
+> re-arbitrés sur ce relevé-là. Le protocole, lui, n'a pas changé.
+
 ### Lire la télémétrie
 
 Une ligne par seconde sur la sortie standard, avec la **ventilation** du temps :
@@ -237,8 +308,48 @@ cmake --preset debug -DNOIRE_WARNINGS_AS_ERRORS=ON
 | ------------------------- | :----: | ----------------------------------------------------------- |
 | `NOIRE_WARNINGS_AS_ERRORS` |  OFF  | Traite les warnings comme des erreurs                        |
 | `NOIRE_USE_RUST`          |  OFF   | PoC M13.5 : génération de la voie déléguée à un crate Rust via Corrosion (**kill switch** : à OFF, aucune trace de Rust dans le build) |
-| `NOIRE_BUILD_TESTS`       |  OFF   | ⚠️ `tests/` ne contient pas encore de `CMakeLists.txt` — activer casse le configure |
-| `NOIRE_BUILD_TOOLS`       |  OFF   | ⚠️ idem pour `tools/` (les outils y sont des scripts Python, pas des cibles CMake) |
+| `NOIRE_BUILD_TESTS`       |  OFF   | Compile `noire-tests` et l'enregistre auprès de CTest (cf. ci-dessous)  |
+| `NOIRE_BUILD_TOOLS`       |  OFF   | Sans effet : `tools/` ne contient que des scripts Python. Le configure le **dit** au lieu d'échouer (M57) |
+
+### 🧪 Tests
+
+```bash
+cmake --preset debug -DNOIRE_BUILD_TESTS=ON
+cmake --build build/debug -j$(nproc)
+ctest --test-dir build/debug --output-on-failure
+
+# ou directement, avec un filtre sur le nom du cas :
+./build/debug/bin/noire-tests anti_recul
+```
+
+Le périmètre est assumé : **uniquement les modules sans contexte graphique** — `core`
+(profil de vitesse, aide à la conduite) et `physics` (frein pneumatique, dynamique
+longitudinale, ATS). Ce sont aussi les seuls dont le comportement se vérifie par un
+*nombre* : « la rame s'immobilise à moins de 50 cm de son repère » est une assertion,
+« la gare a l'air juste » n'en est pas une. Pour le rendu, les garde-fous restent
+`tools/check_topology.py`, `tools/check_coplanar.py` et la capture comparative.
+
+Trois cas méritent d'être cités, parce qu'ils verrouillent des affirmations que ce README
+faisait sans filet :
+
+| Cas                                             | Ce qu'il empêche de casser                        |
+| ----------------------------------------------- | -------------------------------------------------- |
+| `suivre_la_consigne_arrete_la_rame_sur_le_repere` | Un conducteur qui suit la consigne **dépasse** son repère (enveloppe devenue trop optimiste) |
+| `anti_recul_tient_la_rame_sur_la_rampe`          | La rame repart en arrière, et le banc de mesure redevient inexploitable |
+| `ats_respecte_sa_marge`                          | La marge ATS redevient un réglage que personne ne lit |
+
+Le premier de ces cas a échoué dès son premier lancement : l'aide conseillait un cran
+trop faible (B2 là où il fallait B6) et le conducteur de test passait son repère de
+**74 m**. Corrigé au M57 ; il s'immobilise désormais à 0,42 m en deçà.
+
+La cote **fine** de l'arrêt (les « 0,00 m » cités plus haut) n'est volontairement pas
+assertée : elle dépend autant du modèle de conducteur que de l'aide elle-même. Ce qui
+est asserté, c'est le sens de l'erreur — jamais de dépassement — et il se lit en jeu sur
+la règle graduée du pupitre.
+
+Aucune dépendance de test n'est récupérée : le micro-framework tient en 60 lignes
+(`tests/check.hpp`), pour la même raison que le reste du projet n'embarque que ce qui
+paie sa place.
 
 ### Le chemin Rust (PoC M13.5)
 

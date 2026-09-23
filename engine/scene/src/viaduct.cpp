@@ -489,6 +489,35 @@ StationMeshes generate_station(const TrackSource& track, double s_center,
         }
     }
 
+    // M57 — ÉCLAIRAGE DE QUAI. Même trame que les panneaux suspendus, mais serrée
+    // (6 m au lieu de 25) et posée sous l'intrados : c'est une file continue de
+    // luminaires, pas une signalétique ponctuelle. Symétrique par la même boucle sur
+    // `sign` que tout le reste de la gare — un quai ne peut pas être éclairé sans que
+    // l'autre le soit.
+    if (profile.lamp_spacing > 0.0) {
+        const long l0 = static_cast<long>(std::ceil(s0 / profile.lamp_spacing));
+        const long l1 = static_cast<long>(std::floor(s1 / profile.lamp_spacing));
+        const float lamp_y = roof - profile.roof_thickness - profile.lamp_drop -
+                             profile.lamp_half_height;
+        for (long k = l0; k <= l1; ++k) {
+            const double s = static_cast<double>(k) * profile.lamp_spacing;
+            glm::dvec3 pos_world;
+            glm::dvec3 tangent;
+            track.sample(s, pos_world, tangent);
+            const glm::vec3 forward = glm::vec3(glm::normalize(tangent));
+            const glm::vec3 right = glm::normalize(glm::cross(forward, world_up));
+            for (const float sign : {-1.0f, 1.0f}) {
+                const glm::vec3 mid = glm::vec3(pos_world - origin) +
+                                      right * (sign * ((in + out_w) * 0.5f)) +
+                                      glm::vec3(0.0f, lamp_y, 0.0f);
+                add_box(meshes.signs, mid, right, forward, glm::vec3(0.0f, 1.0f, 0.0f),
+                        glm::vec3(profile.lamp_half_width, profile.lamp_half_height,
+                                  profile.lamp_half_length),
+                        uv_period);
+            }
+        }
+    }
+
     // --- REPÈRE D'ARRÊT (停止位置目標) ----------------------------------------
     // M52 avait corrigé sa POSITION : le losange est au chainage EXACT de la cabine
     // quand le centre de la rame coïncide avec celui de la gare, c'est-à-dire au

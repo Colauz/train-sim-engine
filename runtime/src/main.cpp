@@ -3,7 +3,7 @@
 // Le runtime ne connaît NI Vulkan NI GLFW NI l'audio : il lance l'Application.
 int main() {
     noire::ApplicationConfig config;
-    config.title = "Noire Engine — M6 : Audio spatialisé & météo dynamique";
+    config.title = "Noire Engine — Neo-Tokyo Line";
     config.width = 1280;
     config.height = 720;
     config.simulation_hz = 120.0;

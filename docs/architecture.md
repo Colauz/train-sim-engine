@@ -199,3 +199,64 @@ descendante : le moteur ne connaît pas le jeu.
     derniers. Les générateurs écrivent enfin dans `assets/models/` par défaut : leur
     ancienne sortie (le répertoire courant) faisait qu'une régénération suivie d'un
     lancement chargeait toujours les anciens modèles.
+- **M57 — Ce qui était réglé mais pas branché** *(fait)* : campagne de correction de
+  paramètres **déclarés, documentés, et lus par personne**, plus le filet qui manquait
+  pour les tenir.
+  - *La rame reculait indéfiniment.* Mascon au neutre, frein desserré, rampe de 1,1 % :
+    la gravité (0,108 m/s²) l'emportait sans partage sur Davis (0,006 m/s²) et rien ne
+    bornait la dérive — −6,5 km/h au bout de 17 s, et toujours en accélération. Le banc
+    `NOIRE_SPEED=0` en devenait inexploitable (deux runs ne cadrent pas la même scène) et
+    une rame arrêtée en gare quittait son quai à reculons. **Anti-recul** modélisé comme
+    sur le matériel réel (*転動防止*) : le sens ne peut pas s'inverser sans commande, le
+    frein de maintien tient, et l'état est PUBLIÉ (`Wagon::rollback_hold()`) — donc
+    affichable au pupitre, ce qu'un clamp muet n'aurait pas permis.
+  - *`ats_margin_kmh` n'était lue nulle part.* Réglée à 5 km/h dans l'app, documentée
+    dans l'en-tête de `ConsistConfig`, et `consist.cpp` comparait la vitesse à la limite
+    **nue**. L'ATS s'armait pour un demi-km/h de dépassement, et `DrivingAdvisor` — qui
+    vise « limite − 2 km/h » EN SUPPOSANT la marge — plaçait sa consigne à 2 km/h d'un
+    déclenchement au lieu des 7 annoncés. La marge s'applique, sauf sur aspect `R` où
+    l'arrêt est absolu.
+  - *L'ATS comparait une vitesse SIGNÉE à une limite positive* : une rame lancée en
+    marche arrière n'était jamais en survitesse, à n'importe quelle allure. Valeur
+    absolue. Le compteur du pupitre aussi — « −4 KM/H » n'existe sur aucun pupitre.
+  - *Le cycle jour/nuit n'éclairait rien.* `skybox.frag` assombrissait bien son
+    échantillon ; `pbr.glsl` n'assombrissait rien. La cubemap et ses SH viennent d'un
+    HDRI de plein jour figé au chargement, si bien qu'à 2 h du matin, sous un ciel noir,
+    quais et verrière restaient éclairés par un soleil de midi — mesuré au pixel :
+    (114, 131, 150) à 13 h **et** à 2 h. Le gain vit désormais dans un fichier partagé,
+    `shaders/common/sky.glsl`, inclus par les deux : le ciel qu'on voit et le ciel qui
+    éclaire ne peuvent plus diverger. Deux gains distincts — la radiance du ciel (qui
+    porte aussi la couleur du brouillard) tombe à ~2 %, l'irradiance ambiante à ~26 %,
+    parce que la lumière ambiante nocturne d'une ville pareille vient de la VILLE et non
+    du ciel. Corollaire immédiat et traité : **éclairage de quai**, une file de tubes
+    sous l'intrados de la verrière, versée dans le maillage `signs` — donc dans un
+    matériau émissif existant, sans un draw call de plus.
+  - *Deux fautes d'entrée.* Les raccourcis `1`/`2`/`3` du menu Pause étaient les seuls
+    lus en NIVEAU et non sur front : maintenir `2` une demi-seconde basculait le plein
+    écran soixante fois, chaque bascule recréant la swapchain. Et la capture du curseur
+    était reprise à la sortie de pause **seulement en vue cabine**, alors que
+    l'initialisation capturait sans condition : après une simple pause, la caméra
+    orbitale se retrouvait avec un curseur libre butant sur les bords de l'écran.
+  - *Le filet.* `tests/` existait, vide, et `NOIRE_BUILD_TESTS=ON` cassait le configure —
+    une option de build qui casse le build n'est pas une option. Une suite couvre
+    désormais les modules sans contexte graphique (profil de vitesse, frein pneumatique,
+    dynamique longitudinale, ATS, aide à la conduite), dont deux cas qui verrouillent des
+    affirmations que le README faisait jusqu'ici sans filet : l'anti-recul tient la rame,
+    et un conducteur suivant la consigne s'immobilise dans la tolérance de son repère.
+    Micro-framework maison de 60 lignes — aucune dépendance de test récupérée.
+  - *Ce que le filet a attrapé dès son premier lancement.* D'abord lui-même : `add_test`
+    visait l'OUTPUT_NAME `noire-tests` au lieu de la cible `noire_tests`, et `ctest`
+    rapportait « Not Run » sans jamais jouer un cas. Puis, la suite enfin exécutée, le
+    cas en boucle fermée a échoué — **74 m** de dépassement du repère. `DrivingAdvisor`
+    calculait le cran vers la consigne d'ICI, `sqrt(v_c² + 2.a.d)`, si bien que
+    l'expression se réduisait au seul surplus au-delà de `service_decel` : B2 conseillé
+    là où il fallait B6. Le cran vise désormais la vitesse DE LA CONTRAINTE (0 au repère,
+    la limite au panneau) ; le même conducteur s'immobilise à 0,42 m en deçà.
+  - *Sémaphores de présentation détruits en vol.* Chaque recréation de la swapchain
+    (redimensionnement, bascule plein écran) détruisait les `render_finished_`, alors que
+    `vkDeviceWaitIdle` ne couvre pas les présentations : comportement indéfini, signalé
+    par la validation (VUID-vkDestroySemaphore-semaphore-05149). On n'en crée plus que
+    s'il en manque ; ils ne sont détruits qu'au shutdown.
+  - *Police du pupitre incomplète.* `(`, `)`, `>` n'existaient pas : « -> FREINER » et
+    la procédure de réarmement « EB -> N » s'affichaient amputées de leur flèche.
+    Glyphes ajoutés (plus `<`, `=`, `!`).

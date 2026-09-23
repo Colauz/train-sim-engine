@@ -16,7 +16,7 @@
 // l'équivalent exact d'un échantillonnage `nearest` sur un atlas — mais sans atlas, sans
 // sampler, sans set, et dessinable dès la première frame.
 //
-// Le prix : la police est en CAPITALES seulement (43 glyphes saisis à la main). Pour un
+// Le prix : la police est en CAPITALES seulement (49 glyphes saisis à la main). Pour un
 // afficheur de cabine, ce n'est pas une limite — c'est le registre juste.
 namespace noire::render::font {
 
@@ -90,6 +90,17 @@ inline constexpr GlyphArt kArt[] = {
     {'+', {"     ", "  #  ", "  #  ", "#####", "  #  ", "  #  ", "     "}},
     {'/', {"    #", "    #", "   # ", "  #  ", " #   ", "#    ", "#    "}},
     {'%', {"##  #", "##  #", "   # ", "  #  ", " #   ", "#  ##", "#  ##"}},
+    // M57 — Glyphes que le pupitre employait SANS qu'ils existent : un caractère absent
+    // rend 0, donc un blanc. « -> FREINER B4 » s'affichait « -  FREINER B4 », et la
+    // procédure de réarmement « (REARMER: EB -> N) » devenait « REARMER: EB -  N » —
+    // l'instruction même dont le conducteur a besoin, ATS en urgence, amputée de sa
+    // flèche.
+    {'(', {"   # ", "  #  ", " #   ", " #   ", " #   ", "  #  ", "   # "}},
+    {')', {" #   ", "  #  ", "   # ", "   # ", "   # ", "  #  ", " #   "}},
+    {'>', {" #   ", "  #  ", "   # ", "    #", "   # ", "  #  ", " #   "}},
+    {'<', {"   # ", "  #  ", " #   ", "#    ", " #   ", "  #  ", "   # "}},
+    {'=', {"     ", "     ", "#####", "     ", "#####", "     ", "     "}},
+    {'!', {"  #  ", "  #  ", "  #  ", "  #  ", "  #  ", "     ", "  #  "}},
 };
 
 // Bit i = texel (i % 5, i / 5), origine en haut à gauche. Le fragment refait exactement

@@ -749,6 +749,9 @@ struct Application::Impl {
     bool prev_up_down = false;
     bool prev_down_down = false;
     bool prev_enter_down = false;
+    bool prev_num1_down = false;
+    bool prev_num2_down = false;
+    bool prev_num3_down = false;
     int pause_menu_selected = 0;  // 0: Reprendre, 1: Plein Écran, 2: Quitter
 
     // Caméra (M23) : Orbite (externe) ou Cabine (FPS poste de conduite), bascule sur C.
@@ -1153,7 +1156,12 @@ struct Application::Impl {
         const bool esc_down = window.is_key_down(Key::Escape);
         if (esc_down && !prev_esc_down) {
             is_paused = !is_paused;
-            window.set_cursor_captured(!is_paused && camera_mode == CameraMode::Cab);
+            // M57 — La capture ne dépend QUE de la pause. Les deux caméras pilotent à la
+            // souris (l'orbite tourne, la cabine regarde) et l'initialisation capturait
+            // d'ailleurs sans condition : ne relâcher/reprendre qu'en vue CABINE laissait
+            // l'orbite, après une simple pause, avec un curseur libre qui butait sur les
+            // bords de l'écran — la caméra ne répondait plus qu'à moitié.
+            window.set_cursor_captured(!is_paused);
             if (is_paused) {
                 audio.pause();
             } else {
@@ -1206,18 +1214,28 @@ struct Application::Impl {
             }
             prev_enter_down = enter_down;
 
-            if (window.is_key_down(Key::Num1)) {
+            // M57 — FRONTS MONTANTS, comme partout ailleurs dans ce fichier. Ces trois
+            // raccourcis étaient les seuls à être lus en NIVEAU : maintenir « 2 » une
+            // demi-seconde basculait le plein écran soixante fois, chaque bascule
+            // détruisant et recréant la swapchain. La touche était inutilisable.
+            const bool n1 = window.is_key_down(Key::Num1);
+            const bool n2 = window.is_key_down(Key::Num2);
+            const bool n3 = window.is_key_down(Key::Num3);
+            if (n1 && !prev_num1_down) {
                 resume_requested = true;
-            } else if (window.is_key_down(Key::Num2)) {
+            } else if (n2 && !prev_num2_down) {
                 window.toggle_fullscreen();
-            } else if (window.is_key_down(Key::Num3)) {
+            } else if (n3 && !prev_num3_down) {
                 window.request_close();
             }
+            prev_num1_down = n1;
+            prev_num2_down = n2;
+            prev_num3_down = n3;
 
             if (resume_requested) {
                 is_paused = false;
                 audio.resume();
-                window.set_cursor_captured(camera_mode == CameraMode::Cab);
+                window.set_cursor_captured(true);
                 log::info("Jeu : REPRISE");
             }
             return; // Bloque la prise d'input du simulateur pendant la pause
@@ -1365,7 +1383,11 @@ struct Application::Impl {
             // regarde toujours droit devant et le pupitre reste hors champ.
             cab_yaw = y != nullptr ? static_cast<float>(std::atof(y)) : 0.0f;
             cab_pitch = p != nullptr ? static_cast<float>(std::atof(p)) : 0.0f;
-            window.consume_cursor_delta();  // vidange, sinon elle s'accumule
+            // Vidange : sans elle le delta s'accumule et saute à la première frame non
+            // épinglée. La valeur est délibérément jetée — `[[maybe_unused]]` le dit au
+            // compilateur, que le [[nodiscard]] de consume_cursor_delta() faisait sinon
+            // avertir à chaque build.
+            [[maybe_unused]] const platform::CursorDelta drained = window.consume_cursor_delta();
             return;
         }
         const platform::CursorDelta d = window.consume_cursor_delta();
@@ -1542,7 +1564,11 @@ struct Application::Impl {
         const int sim_hour   = static_cast<int>(day_time / 3600.0) % 24;
         const int sim_minute = static_cast<int>(day_time / 60.0) % 60;
         lines.emplace_back(std::format("HEURE    {:02d}:{:02d}", sim_hour, sim_minute), label);
-        lines.emplace_back(std::format("VITESSE  {: >5.0f} KM/H", wagon.speed() * 3.6), value);
+        // M57 — VALEUR ABSOLUE. Un indicateur de vitesse affiche une vitesse, jamais une
+        // vitesse algébrique : « -4 KM/H » n'existe sur aucun pupitre. Le SENS, lui, se
+        // dit ailleurs, et seulement quand il y a quelque chose à dire (cf. ANTI-RECUL).
+        lines.emplace_back(std::format("VITESSE  {: >5.0f} KM/H", std::abs(wagon.speed()) * 3.6),
+                           value);
         // Aspect ATS (M30) : G/YG/Y/R déduit de la limite courante, en couleur.
         const double limit = consist.current_limit_kmh();
         const bool over_limit = wagon.speed() * 3.6 > limit;
@@ -1650,6 +1676,14 @@ struct Application::Impl {
         const glm::vec4 green_notice{0.15f, 0.90f, 0.25f, 1.0f};
         if (consist.immobilized()) {
             lines.emplace_back("IMMOBILISE", green_notice);
+        }
+        // M57 — L'anti-recul se DIT. Une rame au neutre sur une rampe est tenue par un
+        // dispositif, pas par la physique : sans témoin, le conducteur voit une rame qui
+        // ne bouge pas et ne sait pas si c'est normal, ni que la pente la reprendra dès
+        // qu'il aura desserré. Le dire, c'est la différence entre un simulateur et une
+        // maquette.
+        if (wagon.rollback_hold()) {
+            lines.emplace_back("ANTI-RECUL (PENTE)", glm::vec4{0.45f, 0.65f, 1.0f, 1.0f});
         }
 
         // M53 — Verdict de l'arrêt, à l'arrêt seulement. C'est LE retour qui manquait :
@@ -2429,7 +2463,7 @@ struct Application::Impl {
         // varie du simple au double (préemption, fréquences de l'iGPU).
         {
             ++perf_frames;
-            perf_gpu_sum += renderer.last_gpu_ms();
+            perf_gpu_sum += static_cast<double>(renderer.last_gpu_ms());
             const double el = std::chrono::duration<double>(now - perf_t0).count();
             if (el >= 1.0) {
                 perf_fps = perf_frames / el;

@@ -42,6 +42,9 @@ DrivingAdvice DrivingAdvisor::advise(const SpeedLimits& limits, double chainage,
     // sous-freinait chaque fois qu'un abaissement de limite, plus proche, dominait.
     // 50 m par défaut : une limite déjà en vigueur ici se corrige tout de suite.
     double binding_distance = 50.0;
+    // Vitesse à tenir AU DROIT de cette contrainte (m/s) — pas la consigne d'ici, qui
+    // n'en est que la projection par l'enveloppe. Cf. le calcul du cran, plus bas.
+    double binding_speed_ms = target_kmh * kKmhToMs;
 
     // --- Contrainte 2 : chaque limite PLUS BASSE à venir ----------------------
     // On ne retient que les abaissements : une zone plus rapide devant ne contraint
@@ -59,12 +62,12 @@ DrivingAdvice DrivingAdvisor::advise(const SpeedLimits& limits, double chainage,
         if (zone_kmh >= advice.limit_kmh) {
             continue;  // pas un abaissement
         }
-        const double allowed_kmh =
-            approach_speed(std::max(0.0, zone_kmh - config_.limit_margin_kmh) * kKmhToMs,
-                           distance, a) * kMsToKmh;
+        const double zone_target_ms = std::max(0.0, zone_kmh - config_.limit_margin_kmh) * kKmhToMs;
+        const double allowed_kmh = approach_speed(zone_target_ms, distance, a) * kMsToKmh;
         if (allowed_kmh < target_kmh) {
             target_kmh = allowed_kmh;
             binding_distance = distance;
+            binding_speed_ms = zone_target_ms;
         }
     }
 
@@ -85,6 +88,7 @@ DrivingAdvice DrivingAdvisor::advise(const SpeedLimits& limits, double chainage,
         if (allowed_kmh < target_kmh) {
             target_kmh = allowed_kmh;
             binding_distance = std::max(1.0, advice.stop_distance);
+            binding_speed_ms = 0.0;
         }
 
         // « À quel moment freiner » : la distance de freinage nécessaire à la vitesse
@@ -106,8 +110,17 @@ DrivingAdvice DrivingAdvisor::advise(const SpeedLimits& limits, double chainage,
     if (speed_ms > target_ms + 0.05) {
         // Résorber l'excès sur la distance de la contrainte QUI DOMINE — celle qui a
         // fixé la consigne, et pas une autre.
-        const double needed =
-            (speed_ms * speed_ms - target_ms * target_ms) / (2.0 * binding_distance);
+        //
+        // M57 — vers la vitesse DE LA CONTRAINTE (0 au repère, la limite au panneau),
+        // et non vers la consigne d'ici. La première version prenait `target_ms`, qui
+        // vaut sqrt(v_c² + 2.a.d) : l'expression se réduisait alors à
+        // (v² - v_c²)/(2d) - a, c'est-à-dire au seul SURPLUS au-delà de `service_decel`,
+        // comme si ces 0,75 m/s² étaient fournis d'office. À 85 km/h et 300 m du
+        // repère, l'aide affichait B2 là où il fallait B6 ; un conducteur qui la
+        // suivait à la lettre passait son repère de 74 m (cas
+        // suivre_la_consigne_arrete_la_rame_sur_le_repere).
+        const double needed = (speed_ms * speed_ms - binding_speed_ms * binding_speed_ms) /
+                              (2.0 * binding_distance);
         // La pente et la résistance à l'avancement travaillent déjà pour nous : le
         // frein ne doit fournir que le complément. Sans cette soustraction, l'aide
         // sur-freine systématiquement en rampe montante.

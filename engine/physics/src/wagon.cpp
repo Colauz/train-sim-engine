@@ -125,6 +125,29 @@ void Wagon::update(double dt) {
         velocity_ = std::min(0.0, velocity_ + dv);
     }
 
+    // --- ANTI-RECUL (M57) -----------------------------------------------------
+    // Aucun inverseur n'est modélisé : cette rame ne circule QUE vers l'avant. Une
+    // vitesse négative n'est donc jamais une manoeuvre — c'est une DÉRIVE : mascon au
+    // neutre, frein desserré, et la rampe qui reprend la rame. Sans garde-fou elle
+    // accélère indéfiniment, car rien ne s'y oppose : les 800 N de Davis ne pèsent pas
+    // contre les 0,108 m/s² d'une rampe de 1,1 %. Une minute plus tard la rame a quitté
+    // sa gare à reculons à 25 km/h, l'ATS ne la voit pas (il compare une vitesse SIGNÉE
+    // à une limite positive) et le compteur affiche un nombre qu'aucun pupitre réel
+    // n'affiche.
+    //
+    // Le dispositif existe sur le matériel : c'est le 転動防止 (prévention du roulement)
+    // des EMU japonaises — dès que le sens s'inverse sans commande, le frein de maintien
+    // serre et TIENT la rame. On le modélise comme tel, et non par un clamp muet : la
+    // vitesse est ramenée à zéro ET l'état est publié, pour que le pupitre puisse le
+    // dire. La gravité continue de pousser à chaque pas, le maintien continue de tenir —
+    // exactement comme un frein de stationnement.
+    if (velocity_ < 0.0) {
+        velocity_ = 0.0;
+        rollback_hold_ = true;
+    } else if (velocity_ > 0.0) {
+        rollback_hold_ = false;
+    }
+
     // M23 : Zero-Speed Clamp (fix sécurité portes). Si le freinage est actif et que la
     // vitesse passe sous 0.1 m/s (~0.36 km/h), forcer la vitesse exactement à 0.0 m/s.
     // M32 : UNIQUEMENT si aucune traction n'est appliquée — sinon la propulsion du pas
@@ -138,6 +161,13 @@ void Wagon::update(double dt) {
         immobilized_ = true;
     } else {
         immobilized_ = false;
+    }
+    // Une rame tenue par son anti-recul est immobilisée au même titre qu'une rame tenue
+    // par son frein : c'est la même vitesse nulle et le même effort qui la maintient.
+    // Sans cette ligne, le pupitre annoncerait « non immobilisé » sur une rame qui ne
+    // bouge pas d'un millimètre, et refuserait l'ouverture des portes.
+    if (rollback_hold_) {
+        immobilized_ = true;
     }
 
     // --- Avance du chainage : dx = (v · dt) / (ds/dx). Aucune borne : voie infinie. ---
